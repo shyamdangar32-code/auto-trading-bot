@@ -4,5 +4,7 @@ yfinance==0.2.41
 requests==2.31.0
 ta==0.11.0
 kiteconnect==5.0.1
-pyotp
+pyotp==2.9.0
 PyYAML==6.0.1
+matplotlib==3.8.2
+pytest==7.4.4
