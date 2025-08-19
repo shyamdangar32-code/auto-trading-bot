@@ -1,4 +1,4 @@
-name: daily-trade-run
+name: daily-trade-run 
 on:
   schedule:
     - cron: '20 10 * * 1-5'   # 10:20 UTC ≈ 15:50 IST, Mon–Fri
