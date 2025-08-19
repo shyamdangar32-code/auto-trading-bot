@@ -1,7 +1,7 @@
 # Core configuration (safe to edit)
-symbol: "^NSEI"         # or "RELIANCE.NS", etc.
-interval: "1d"          # 1d,1h,30m,15m,5m
-lookback: "1y"          # 60d,6mo,1y,5y
+symbol: "RELIANCE.NS"    # change from ^NSEI to any valid NSE stock
+interval: "1d"
+lookback: "1y"
 tz: "Asia/Kolkata"
 
 # Strategy
