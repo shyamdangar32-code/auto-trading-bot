@@ -5,3 +5,4 @@ requests==2.31.0
 ta==0.11.0
 kiteconnect==5.0.1
 pyotp
+PyYAML==6.0.1
