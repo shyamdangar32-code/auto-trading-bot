@@ -1,5 +1,5 @@
 # Core configuration (safe to edit)
-symbol: "RELIANCE.NS"    # change from ^NSEI to any valid NSE stock
+symbol: "RELIANCE.BO"    # change from ^NSEI to any valid NSE stock
 interval: "1d"
 lookback: "1y"
 tz: "Asia/Kolkata"
