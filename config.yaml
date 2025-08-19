@@ -1,8 +1,12 @@
-# Core configuration (safe to edit)
-symbol: "RELIANCE.BO"    # change from ^NSEI to any valid NSE stock
+symbol: "^NSEI"
 interval: "1d"
 lookback: "1y"
 tz: "Asia/Kolkata"
+
+# ---- add these ----
+zerodha_enabled: true
+zerodha_instrument_token: 256265   # NIFTY 50 token (works as a reliable fallback)
+# --------------------
 
 # Strategy
 ema_fast: 21
