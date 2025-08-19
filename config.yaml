@@ -1,0 +1,28 @@
+# Core configuration (safe to edit)
+symbol: "^NSEI"         # or "RELIANCE.NS", etc.
+interval: "1d"          # 1d,1h,30m,15m,5m
+lookback: "1y"          # 60d,6mo,1y,5y
+tz: "Asia/Kolkata"
+
+# Strategy
+ema_fast: 21
+ema_slow: 50
+rsi_len: 14
+rsi_buy: 30
+rsi_sell: 70
+adx_len: 14
+atr_len: 14
+
+# Risk / position sizing
+stop_atr_mult: 2.0
+take_atr_mult: 3.0
+capital_rs: 100000
+order_qty: 1
+
+# Modes
+send_only_signals: true
+paper_trading: true
+live_trading: false
+
+# Output dir (reports are committed here)
+out_dir: "reports"
