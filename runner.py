@@ -1,6 +1,7 @@
 import os, json, yaml
 from datetime import datetime
 import pandas as pd
+from bot.config import get_cfg
 
 from bot.utils import ensure_dir, save_json, load_json, send_telegram
 from bot.data_io import yahoo_prices
@@ -8,7 +9,7 @@ from bot.indicators import add_indicators
 from bot.strategy import build_signals
 from bot.backtest import backtest
 
-CFG = yaml.safe_load(open("config.yaml", "r"))
+CFG = get_cfg()
 OUT = CFG.get("out_dir", "reports")
 ensure_dir(OUT)
 
