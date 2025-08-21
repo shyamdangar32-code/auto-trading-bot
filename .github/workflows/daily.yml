@@ -11,6 +11,9 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      # 👇 CHANGE THIS if your script is somewhere else
+      SCRIPT_PATH: tools/refresh_zerodha_token.py
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,15 +28,39 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # --- NEW: get a fresh Zerodha access_token and expose it as env ---
-      - name: Refresh Zerodha access token
+      # Try to refresh the token if a request_token is provided.
+      # Doesn't fail the job even if refresh fails.
+      - name: Refresh Zerodha access token (best effort)
+        id: refresh
+        continue-on-error: true
         env:
-          ZERODHA_API_KEY:     ${{ secrets.ZERODHA_API_KEY }}
-          ZERODHA_API_SECRET:  ${{ secrets.ZERODHA_API_SECRET }}
+          ZERODHA_API_KEY:       ${{ secrets.ZERODHA_API_KEY }}
+          ZERODHA_API_SECRET:    ${{ secrets.ZERODHA_API_SECRET }}
           ZERODHA_REQUEST_TOKEN: ${{ secrets.ZERODHA_REQUEST_TOKEN }}
         run: |
-          python tools/refresh_zerodha_token.py
-          echo "ZERODHA_ACCESS_TOKEN=$(cat zerodha_access_token.txt)" >> $GITHUB_ENV
+          if [ -n "${ZERODHA_REQUEST_TOKEN}" ]; then
+            if [ -f "${SCRIPT_PATH}" ]; then
+              echo "Running ${SCRIPT_PATH}"
+              python "${SCRIPT_PATH}"
+            else
+              echo "❌ Script not found at ${SCRIPT_PATH}"
+              exit 1
+            fi
+          else
+            echo "ℹ️ No ZERODHA_REQUEST_TOKEN secret set; skipping refresh."
+            exit 0
+          fi
+
+      # Pick token: prefer fresh token file, else fall back to the stored secret
+      - name: Select token (fresh file or secret)
+        run: |
+          if [ -f zerodha_access_token.txt ]; then
+            echo "Using freshly generated token from file."
+            echo "ZERODHA_ACCESS_TOKEN=$(cat zerodha_access_token.txt)" >> $GITHUB_ENV
+          else
+            echo "Using ZERODHA_ACCESS_TOKEN from repo secrets."
+            echo "ZERODHA_ACCESS_TOKEN=${{ secrets.ZERODHA_ACCESS_TOKEN }}" >> $GITHUB_ENV
+          fi
 
       - name: Run strategy (paper; Zerodha on; Yahoo fallback via code)
         env:
