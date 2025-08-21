@@ -11,80 +11,45 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
-      # 1) Checkout
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 2) Python
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # 3) Cache pip (BIG speed-up on repeats)
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      # 4) Install deps (prefer wheels, no unnecessary upgrades)
       - name: Install deps
         run: |
-          pip install --prefer-binary --no-input -r requirements.txt
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      # 5) (Optional) Refresh Zerodha access token if you provided a REQUEST token
-      #    Looks for the helper script in either ./tools/ or repo root.
       - name: Refresh Zerodha access token
-        if: ${{ secrets.ZERODHA_REQUEST_TOKEN != '' }}
         env:
-          ZERODHA_API_KEY:       ${{ secrets.ZERODHA_API_KEY }}
-          ZERODHA_API_SECRET:    ${{ secrets.ZERODHA_API_SECRET }}
+          ZERODHA_API_KEY:     ${{ secrets.ZERODHA_API_KEY }}
+          ZERODHA_API_SECRET:  ${{ secrets.ZERODHA_API_SECRET }}
           ZERODHA_REQUEST_TOKEN: ${{ secrets.ZERODHA_REQUEST_TOKEN }}
         run: |
-          set -e
-          SCRIPT=""
-          if [ -f "tools/refresh_zerodha_token.py" ]; then
-            SCRIPT="tools/refresh_zerodha_token.py"
-          elif [ -f "refresh_zerodha_token.py" ]; then
-            SCRIPT="refresh_zerodha_token.py"
+          if [ -n "$ZERODHA_REQUEST_TOKEN" ]; then
+            python tools/refresh_zerodha_token.py
+            echo "ZERODHA_ACCESS_TOKEN=$(cat zerodha_access_token.txt)" >> $GITHUB_ENV
           else
-            echo "❌ refresh_zerodha_token.py not found (checked ./tools/ and ./)"
-            exit 1
+            echo "Skipping token refresh (no request token provided)"
           fi
 
-          python "$SCRIPT"
-          echo "ZERODHA_ACCESS_TOKEN=$(cat zerodha_access_token.txt)" >> $GITHUB_ENV
-          echo "✅ Zerodha access token exported to env."
-
-      # 6) Run your strategy (uses Zerodha if keys+token present; your code falls back to Yahoo)
-      - name: Run strategy
+      - name: Run strategy (paper; Zerodha on; Yahoo fallback via code)
         env:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
           ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
           ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
-          # From step 5 (only set if request token was provided and refresh succeeded)
           ZERODHA_ACCESS_TOKEN: ${{ env.ZERODHA_ACCESS_TOKEN }}
         run: |
           python runner.py --out_dir "./reports"
 
-      # 7) Upload reports (so you can download signals / json / csv from the job)
       - name: Upload reports as artifact
         uses: actions/upload-artifact@v4
         with:
           name: reports
           path: reports/*
-
-      # 8) (Optional) Commit reports back to the repo
-      # - name: Commit reports
-      #   run: |
-      #     git config user.name  "quant-bot"
-      #     git config user.email "bot@users.noreply.github.com"
-      #     git add reports/*.json reports/*.csv || true
-      #     git diff --cached --quiet || git commit -m "auto: daily run"
-      #     git push
