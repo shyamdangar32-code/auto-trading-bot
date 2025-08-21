@@ -5,8 +5,8 @@ tz: "Asia/Kolkata"
 
 # ---- add these ----
 zerodha_enabled: true
-zerodha_instrument_token: 256265   # NIFTY 50 token (works as a reliable fallback)
-# --------------------
+zerodha_instrument_token: 256265   # NIFTY 50
+# -------------------
 
 # Strategy
 ema_fast: 21
