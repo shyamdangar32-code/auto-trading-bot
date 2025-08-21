@@ -3,7 +3,7 @@ name: daily-trade-run
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "20 10 * * 1-5"  # 10:20 UTC ≈ 15:50 IST
+    - cron: "20 10 * * 1-5"     # 10:20 UTC, Mon-Fri
 
 permissions:
   contents: write
@@ -25,21 +25,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run strategy (paper; Yahoo; Zerodha off)
+      - name: Run strategy (paper; Yahoo fallback; Zerodha on)
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          ZERODHA_API_KEY:    ${{ secrets.ZERODHA_API_KEY }}
-          ZERODHA_API_SECRET: ${{ secrets.ZERODHA_API_SECRET }}
-          ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
+          ZERODHA_API_KEY:     ${{ secrets.ZERODHA_API_KEY }}
+          ZERODHA_API_SECRET:  ${{ secrets.ZERODHA_API_SECRET }}
+          ZERODHA_ACCESS_TOKEN:${{ secrets.ZERODHA_ACCESS_TOKEN }}
         run: |
           python runner.py \
-            --symbol "RELIANCE.NS" \
+            --symbol "^NSEI" \
             --interval 1d \
             --lookback 1y \
             --paper_trading true \
             --live_trading false \
-            --zerodha_enabled false \
+            --zerodha_enabled true \
             --send_only_signals true \
             --out_dir "./reports"
 
@@ -48,12 +48,3 @@ jobs:
         with:
           name: reports
           path: reports/*
-
-      # OPTIONAL: commit reports back to repo (uncomment to use)
-      # - name: Commit reports to repo
-      #   run: |
-      #     git config user.name  "quant-bot"
-      #     git config user.email "bot@users.noreply.github.com"
-      #     git add reports/*.json reports/*.csv || true
-      #     git diff --cached --quiet || git commit -m "auto: daily run"
-      #     git push
