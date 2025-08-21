@@ -3,7 +3,7 @@ name: daily-trade-run
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "20 10 * * 1-5"     # 10:20 UTC, Mon-Fri
+    - cron: "20 10 * * 1-5"  # 10:20 UTC, Mon–Fri
 
 permissions:
   contents: write
@@ -25,22 +25,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run strategy (paper; Yahoo fallback; Zerodha on)
+      # --- NEW: get a fresh Zerodha access_token and expose it as env ---
+      - name: Refresh Zerodha access token
         env:
-          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
           ZERODHA_API_KEY:     ${{ secrets.ZERODHA_API_KEY }}
           ZERODHA_API_SECRET:  ${{ secrets.ZERODHA_API_SECRET }}
-          ZERODHA_ACCESS_TOKEN:${{ secrets.ZERODHA_ACCESS_TOKEN }}
+          ZERODHA_REQUEST_TOKEN: ${{ secrets.ZERODHA_REQUEST_TOKEN }}
+        run: |
+          python tools/refresh_zerodha_token.py
+          echo "ZERODHA_ACCESS_TOKEN=$(cat zerodha_access_token.txt)" >> $GITHUB_ENV
+
+      - name: Run strategy (paper; Zerodha on; Yahoo fallback via code)
+        env:
+          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+          ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
+          ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
+          ZERODHA_ACCESS_TOKEN: ${{ env.ZERODHA_ACCESS_TOKEN }}
         run: |
           python runner.py \
-            --symbol "^NSEI" \
-            --interval 1d \
-            --lookback 1y \
-            --paper_trading true \
-            --live_trading false \
-            --zerodha_enabled true \
-            --send_only_signals true \
             --out_dir "./reports"
 
       - name: Upload reports as artifact
