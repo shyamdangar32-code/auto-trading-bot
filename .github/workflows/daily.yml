@@ -41,16 +41,32 @@ jobs:
 
       # No request-token refresh step anymore (fully automatic)
 
-      - name: Telegram test ping
+      - name: Telegram diagnostics (temp)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          curl -s -X POST \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_CHAT_ID}" \
-            -d text="✅ Telegram test from GitHub Actions: $(date -u +'%Y-%m-%d %H:%M:%SZ')"
-          echo "If you don't see a message, make sure you started the bot in Telegram by sending /start."
+          set -eux
+          TURL="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
+
+          echo "Token prefix: ${TELEGRAM_BOT_TOKEN:0:7}***"
+          echo "CHAT_ID: ${TELEGRAM_CHAT_ID}"
+
+          echo "1) getMe -> checks token"
+          curl -s "$TURL/getMe" | tee me.json
+
+          echo "2) getUpdates -> send /start to your bot first"
+          curl -s "$TURL/getUpdates" | tee updates.json
+
+          echo "3) sendMessage -> tries your current CHAT_ID"
+          RESP=$(curl -s -w "\n%{http_code}" -X POST "$TURL/sendMessage" \
+            -d chat_id="$TELEGRAM_CHAT_ID" \
+            -d text="✅ Test from GitHub Actions $(date -u +'%Y-%m-%d %H:%M:%SZ')")
+          BODY=$(echo "$RESP" | head -n1)
+          CODE=$(echo "$RESP" | tail -n1)
+          echo "HTTP: $CODE"
+          echo "$BODY"
+          test "$CODE" = "200" || (echo "sendMessage failed"; exit 1)
 
       - name: Run strategy (Zerodha first; graceful Yahoo fallback)
         env:
