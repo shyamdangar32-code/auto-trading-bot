@@ -41,6 +41,17 @@ jobs:
 
       # No request-token refresh step anymore (fully automatic)
 
+      - name: Telegram test ping
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -s -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="✅ Telegram test from GitHub Actions: $(date -u +'%Y-%m-%d %H:%M:%SZ')"
+          echo "If you don't see a message, make sure you started the bot in Telegram by sending /start."
+
       - name: Run strategy (Zerodha first; graceful Yahoo fallback)
         env:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
