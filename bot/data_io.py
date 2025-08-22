@@ -19,8 +19,10 @@ except Exception:
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Ensure we end up with numeric Close and a Date column even if yfinance
-    returns MultiIndex columns like 'Close|^NSEI'.
+    Normalize yfinance/Zerodha frames:
+    - flatten multi-index columns
+    - ensure numeric Close
+    - ensure we have a Date column
     """
     df = df.copy()
     if isinstance(df.columns, pd.MultiIndex):
@@ -31,18 +33,15 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     # Find any variant of Close
     close_col: Optional[str] = None
 
-    # 1) exact 'Close'
     for c in df.columns:
         if c.lower() == "close":
             close_col = c
             break
-    # 2) prefix 'Close|...'
     if close_col is None:
         for c in df.columns:
             if c.lower().startswith("close|"):
                 close_col = c
                 break
-    # 3) safety: split by '|' and check first token
     if close_col is None:
         for c in df.columns:
             parts = c.split("|")
@@ -65,8 +64,15 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 def yahoo_prices(symbol: str, period: str, interval: str, retries: int = 3, delay: int = 5) -> pd.DataFrame:
     """
     Robust Yahoo downloader with retries + normalization.
-    Example: yahoo_prices("^NSEI", "1y", "1d")
+    Substitutes symbols that are flaky on Yahoo (e.g., ^NSEI) with a
+    configurable fallback via YAHOO_FALLBACK_SYMBOL (default: RELIANCE.NS).
     """
+    # Substitute when Yahoo is known to be flaky for an index symbol
+    original_symbol = symbol
+    if symbol.upper() in {"^NSEI", "NIFTY"}:
+        symbol = os.environ.get("YAHOO_FALLBACK_SYMBOL", "RELIANCE.NS")
+        print(f"ℹ️ Yahoo: substituting {original_symbol} -> {symbol}")
+
     last_err = None
     print(f"🟡 Downloading from Yahoo Finance… symbol={symbol} period={period} interval={interval}")
     for i in range(1, retries + 1):
@@ -105,21 +111,19 @@ def _parse_period_days(period: str) -> int:
         return int(period[:-2]) * 30
     if period.endswith("d"):
         return int(period[:-1])
-    # defaults
     if period in {"6mo", "1y", "5y"}:
         return {"6mo": 180, "1y": 365, "5y": 1825}[period]
     return 365
 
 def _map_interval(interval: str) -> str:
     """Map Yahoo-style intervals to Zerodha intervals."""
-    m = {
+    return {
         "1d": "day",
         "1h": "60minute",
         "30m": "30minute",
         "15m": "15minute",
         "5m": "5minute",
-    }
-    return m.get(interval, "day")
+    }.get(interval, "day")
 
 def _get_kite():
     if not _kite_available:
@@ -172,16 +176,18 @@ def zerodha_prices(instrument_token: int, period: str, interval: str) -> pd.Data
 
 # ------------------------- Orchestrator -------------------------
 
-def prices(symbol: str,
-           period: str,
-           interval: str,
-           zerodha_enabled: bool = False,
-           zerodha_instrument_token: Optional[int] = None) -> pd.DataFrame:
+def prices(
+    symbol: str,
+    period: str,
+    interval: str,
+    zerodha_enabled: bool = False,
+    zerodha_instrument_token: Optional[int] = None,
+) -> pd.DataFrame:
     """
     Unified entry point:
       - If zerodha_enabled and instrument token present: try Zerodha first,
         fallback to Yahoo.
-      - Otherwise: Yahoo only (old behavior).
+      - Otherwise: Yahoo only.
     """
     if zerodha_enabled and zerodha_instrument_token:
         try:
@@ -189,5 +195,6 @@ def prices(symbol: str,
         except Exception as ze:
             print(f"🟠 Zerodha failed: {ze} — falling back to Yahoo.")
             # fall through to Yahoo
+
     # Yahoo path
     return yahoo_prices(symbol, period, interval)
