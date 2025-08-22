@@ -1,20 +1,16 @@
 # =========================
-# Quant Bot — Base Config
+# Quant Bot — Zerodha-only
 # =========================
 
 # ---- Data / timeframe ----
-symbol: "NIFTYBEES.NS"     # Yahoo symbol for NIFTYBEES ETF (tracks NIFTY50)
-interval: "1d"             # '1d','1h','15m','5m'
+symbol: "NIFTYBEES.NS"      # not used for Yahoo, kept only for log clarity
+interval: "1d"
 lookback: "1y"
 tz: "Asia/Kolkata"
 
-# ---- Zerodha switch ----
-# If you have a valid ACCESS_TOKEN in env, you can keep this true.
-# If you want to force Yahoo in Colab, set false.
+# ---- Zerodha ----
 zerodha_enabled: true
-# Optional Zerodha instrument token for NIFTYBEES (fill if you know it).
-# If left null, code can still fetch via Yahoo; Zerodha path requires token.
-zerodha_instrument_token: null
+zerodha_instrument_token: 256265   # NIFTY 50 index
 
 # ---- Strategy params ----
 ema_fast: 21
@@ -26,32 +22,31 @@ adx_len: 14
 atr_len: 14
 
 # ---- Risk / sizing ----
+capital_rs: 10000
+order_qty: 1
 stop_atr_mult: 2.0
 take_atr_mult: 3.0
-capital_rs: 100000
-order_qty: 1
 
 # ---- Modes ----
-send_only_signals: true   # send alerts only
-paper_trading: true
-live_trading: false       # flip to true ONLY when you’re ready
+send_only_signals: true
+paper_trading: true     # ✅ default tomorrow = paper
+live_trading: false
 
 # ---- Output ----
 out_dir: "reports"
 
-# ---- Trading defaults (for future live-trade module) ----
-# These don’t place orders yet in runner.py, but we store them for later.
+# ---- Optional: Telegram (normally via GitHub Secrets) ----
+telegram_bot_token: ""
+telegram_chat_id: ""
+
+# ---- Optional: Zerodha creds (normally via GitHub Secrets) ----
+zerodha_api_key: ""
+zerodha_api_secret: ""
+zerodha_access_token: ""
+
+# ---- Trading defaults (future live mode) ----
 trade:
   exchange: "NSE"
   product: "CNC"
   order_type: "MARKET"
   qty: 1
-
-# ---- Optional: Telegram (normally set via GitHub Secrets / env) ----
-telegram_bot_token: ""
-telegram_chat_id: ""
-
-# ---- Optional: Zerodha creds (normally set via GitHub Secrets / env) ----
-zerodha_api_key: ""
-zerodha_api_secret: ""
-zerodha_access_token: ""
