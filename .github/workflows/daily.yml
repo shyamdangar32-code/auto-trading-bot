@@ -3,7 +3,7 @@ name: daily-trade-run
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "45 3 * * 1-5"   # 03:45 UTC = 09:15 IST, Mon–Fri
+    - cron: "20 10 * * 1-5"   # 10:20 UTC, Mon–Fri
 
 concurrency:
   group: daily-trade-run-${{ github.ref }}
@@ -18,13 +18,11 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -41,34 +39,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install --prefer-binary -r requirements.txt
 
-      - name: Refresh Zerodha access token
-        env:
-          ZERODHA_API_KEY:       ${{ secrets.ZERODHA_API_KEY }}
-          ZERODHA_API_SECRET:    ${{ secrets.ZERODHA_API_SECRET }}
-          ZERODHA_REQUEST_TOKEN: ${{ secrets.ZERODHA_REQUEST_TOKEN }}
-        run: |
-          if [ -n "$ZERODHA_REQUEST_TOKEN" ]; then
-            python tools/refresh_zerodha_token.py
-            TOKEN="$(cat zerodha_access_token.txt)"
-            echo "::add-mask::$TOKEN"
-            echo "ZERODHA_ACCESS_TOKEN=$TOKEN" >> $GITHUB_ENV
-            echo "✅ Token refreshed."
-          else
-            echo "ℹ️ Skipping token refresh (no request token provided)."
-          fi
+      # No request-token refresh step anymore (fully automatic)
 
-      - name: Run strategy (paper; Zerodha first; Yahoo fallback)
+      - name: Run strategy (Zerodha first; graceful Yahoo fallback)
         env:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
           ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
           ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
-          ZERODHA_ACCESS_TOKEN: ${{ env.ZERODHA_ACCESS_TOKEN }}
+          ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+          # Optional: fallback symbol to use ONLY when Yahoo is needed
+          YAHOO_FALLBACK_SYMBOL: "RELIANCE.NS"
         run: |
           python runner.py --out_dir "./reports"
 
-      - name: Upload reports
-        if: always()          # upload even if the job failed
+      - name: Upload reports as artifact
         uses: actions/upload-artifact@v4
         with:
           name: reports
