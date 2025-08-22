@@ -1,13 +1,12 @@
 # runner.py
 import os
-import json
 from datetime import datetime
 
 import pandas as pd
 
 from bot.config import get_cfg
 from bot.utils import ensure_dir, save_json, load_json, send_telegram
-from bot.data_io import prices          # unified (Zerodha-first, Yahoo fallback)
+from bot.data_io import prices          # Zerodha-first, Yahoo fallback
 from bot.indicators import add_indicators
 from bot.strategy import build_signals
 from bot.backtest import backtest
@@ -31,14 +30,24 @@ def status_line(last_row: pd.Series, label: str) -> str:
 # ---------- main workflow ----------
 
 def main():
-    # 1) Load prices (Zerodha if enabled, else Yahoo)
-    df = prices(
-        symbol=CFG["symbol"],
-        period=CFG["lookback"],
-        interval=CFG["interval"],
-        zerodha_enabled=bool(CFG.get("zerodha_enabled", False)),
-        zerodha_instrument_token=CFG.get("zerodha_instrument_token"),
-    )
+    # 1) Load prices (Zerodha if enabled, else Yahoo). If both fail, notify & exit gracefully.
+    try:
+        df = prices(
+            symbol=CFG["symbol"],
+            period=CFG["lookback"],
+            interval=CFG["interval"],
+            zerodha_enabled=bool(CFG.get("zerodha_enabled", False)),
+            zerodha_instrument_token=CFG.get("zerodha_instrument_token"),
+        )
+    except Exception as e:
+        msg = f"❗ Data fetch failed: {e}. No trading today. If using Zerodha, refresh ACCESS_TOKEN."
+        print(msg)
+        send_telegram(msg)
+        ensure_dir(OUT)
+        save_json({"timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+                   "error": str(e),
+                   "config": CFG}, f"{OUT}/latest.json")
+        return
 
     # 2) Features & signals
     df = add_indicators(df, CFG)
