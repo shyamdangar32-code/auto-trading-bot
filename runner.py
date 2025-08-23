@@ -1,13 +1,12 @@
-# runner.py
-import os
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+# runner.py  — Zerodha-only + clear "yesterday" alert if requested
 
+import os
+from datetime import datetime
 import pandas as pd
 
 from bot.config import get_cfg
 from bot.utils import ensure_dir, save_json, load_json, send_telegram
-from bot.data_io import prices
+from bot.data_io import zerodha_prices         # <-- Zerodha only
 from bot.indicators import add_indicators
 from bot.strategy import build_signals
 from bot.backtest import backtest
@@ -18,57 +17,68 @@ CFG = get_cfg()                          # loads config.yaml + env overrides
 OUT = CFG.get("out_dir", "reports")
 ensure_dir(OUT)
 
+# safety defaults
 if not str(CFG.get("symbol", "")).strip():
     CFG["symbol"] = "NIFTYBEES.NS"
 
+TZ = CFG.get("tz", "Asia/Kolkata")
+
 
 # --------------- helpers ---------------
-def status_line(last_row: pd.Series, label: str) -> str:
+def _status_line(last_row: pd.Series, label: str) -> str:
     dt = str(last_row.get("Date", ""))[:19]
     px = float(last_row["Close"])
     return f"📢 {CFG['symbol']} | {dt} | Signal: {label} | Price: {px:.2f}"
 
-def apply_cutoff_if_needed(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Limit data to 'yesterday' (India time) or to an explicit cutoff date
-    so we can simulate yesterday’s market in paper mode.
-    """
-    tz_name = CFG.get("tz", "Asia/Kolkata")
 
-    # explicit date takes priority if provided
-    cutoff_cfg = str(CFG.get("paper_trade_cutoff", "")).strip()
-    if cutoff_cfg:
-        cutoff_date = pd.to_datetime(cutoff_cfg).date()
-    elif bool(CFG.get("simulate_yesterday_only", False)):
-        # compute yesterday in local exchange time
-        now_local = datetime.now(ZoneInfo(tz_name))
-        cutoff_date = (now_local.date() - timedelta(days=1))
+def _apply_paper_cutoff(df: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
+    """
+    If simulate_yesterday_only or paper_trade_cutoff is set, trim the dataframe
+    to candles <= that local date (end of day). Returns (df_trimmed, note).
+    """
+    cutoff_note = None
+    sim_yday = bool(CFG.get("simulate_yesterday_only", False))
+    cutoff_str = CFG.get("paper_trade_cutoff", "")
+
+    if not sim_yday and not cutoff_str:
+        return df, cutoff_note
+
+    if cutoff_str:
+        # Specific date
+        cutoff_local = pd.Timestamp(f"{cutoff_str} 23:59:59", tz=TZ)
+        cutoff_note = f"🧪 Paper-trade cutoff -> using data up to {cutoff_str} ({TZ})"
     else:
-        return df  # no cutoff requested
+        # Yesterday (local)
+        now_local = pd.Timestamp.now(tz=TZ)
+        yday = (now_local - pd.Timedelta(days=1)).normalize() + pd.Timedelta(hours=23, minutes=59, seconds=59)
+        cutoff_local = yday
+        cutoff_note = f"🧪 Paper-trade cutoff -> using data up to {yday.date()} ({TZ})"
 
-    # ensure Date is datetime, then filter by date <= cutoff_date
-    dts = pd.to_datetime(df["Date"])
-    df = df[dts.dt.date <= cutoff_date].copy()
-    if df.empty:
-        raise RuntimeError(f"No rows on or before cutoff {cutoff_date}.")
-    print(f"🧪 Paper-trade cutoff active -> using data up to {cutoff_date} ({tz_name}) "
-          f"→ {len(df)} rows kept.")
-    return df
+    # Make df['Date'] timezone-aware in local tz for a clean compare
+    dates = df["Date"]
+    if dates.dt.tz is None:
+        dates_local = dates.dt.tz_localize(TZ)
+    else:
+        dates_local = dates.dt.tz_convert(TZ)
+
+    kept = df[dates_local <= cutoff_local].copy()
+    print(f"{cutoff_note} -> {len(kept)} rows kept.")
+
+    return kept, cutoff_note
 
 
 # --------------- main workflow ---------------
 def main():
-    # 1) Data (Zerodha first; your token must be valid)
-    df = prices(
-        symbol=CFG["symbol"],
-        period=CFG["lookback"],
-        interval=CFG["interval"],
-        zerodha_enabled=bool(CFG.get("zerodha_enabled", False)),
-        zerodha_instrument_token=CFG.get("zerodha_instrument_token"),
-    )
+    # ---- guard rails for Zerodha-only run
+    token = CFG.get("zerodha_instrument_token")
+    if not token:
+        raise RuntimeError("Missing zerodha_instrument_token in config.yaml")
 
-    # 1b) apply “yesterday only” (or explicit cutoff date)
-    df = apply_cutoff_if_needed(df)
+    # 1) Data (Zerodha only)
+    df = zerodha_prices(int(token), CFG["lookback"], CFG["interval"])
+
+    # Optional: trim to yesterday / specific date for paper test
+    df, cutoff_note = _apply_paper_cutoff(df)
 
     # 2) Features & signals
     df = add_indicators(df, CFG)
@@ -94,16 +104,28 @@ def main():
     save_json(payload, latest_json_path)
     df.tail(250).to_csv(f"{OUT}/latest_signals.csv", index=False)
 
-    # 4) Logs + optional Telegram alert
+    # 4) Logs
     label = str(last.get("label", ""))
     print("📊 Backtest:", metrics)
-    print(status_line(last, label))
+    if cutoff_note:
+        print(cutoff_note)
+    print(_status_line(last, label))
 
-    # In “yesterday” simulation we still keep the normal rule:
-    # only alert when the label changed and isn’t HOLD.
-    if label and (label != prev_label) and (label != "HOLD"):
-        msg = status_line(last, label) + \
-              f"\nPnL (sum): {metrics['total_PnL']} | Trades: {metrics['n_trades']} | Win rate: {metrics['win_rate']:.1f}%"
+    # 5) Telegram alert
+    #    - Always send if a cutoff is active (to show the yesterday result clearly)
+    #    - Otherwise: only when signal changes and not HOLD (old behaviour)
+    always_send = bool(cutoff_note)
+    changed = (label and (label != prev_label) and (label != "HOLD"))
+
+    if always_send or changed:
+        header = "🧪 Yesterday (paper backtest)" if cutoff_note else "🔔 Signal update"
+        wr = metrics.get("win_rate")
+        wr_txt = f"{wr:.1f}%" if isinstance(wr, (int, float)) else str(wr)
+        msg = (
+            f"{header}\n"
+            f"{_status_line(last, label)}\n"
+            f"PnL(sum): {metrics['total_PnL']} | Trades: {metrics['n_trades']} | Win rate: {wr_txt}"
+        )
         send_telegram(msg)
     else:
         print("ℹ️ No alert sent (unchanged or HOLD).")
