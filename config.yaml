@@ -10,7 +10,7 @@ tz: "Asia/Kolkata"
 
 # ---- Zerodha switch ----
 zerodha_enabled: true
-zerodha_instrument_token: null   # fill if you have it; otherwise Zerodha still works via symbol mapping inside code
+zerodha_instrument_token: 256265   # fill if you have it; otherwise Zerodha still works via symbol mapping inside code
 
 # ---- Strategy params ----
 ema_fast: 21
