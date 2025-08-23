@@ -3,7 +3,8 @@ name: daily-trade-run
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "20 10 * * 1-5"   # 10:20 UTC, Mon–Fri
+    # Runs at 06:30 UTC (12:00 IST), Mon–Fri — gives you time to paste files now
+    - cron: "30 6 * * 1-5"
 
 concurrency:
   group: daily-trade-run-${{ github.ref }}
@@ -39,43 +40,28 @@ jobs:
           python -m pip install --upgrade pip
           pip install --prefer-binary -r requirements.txt
 
-      # No request-token refresh step anymore (fully automatic)
-
-      - name: Telegram diagnostics (temp)
+      - name: Telegram diagnostics (once)
+        if: ${{ always() }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -eux
           TURL="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
-
-          echo "Token prefix: ${TELEGRAM_BOT_TOKEN:0:7}***"
-          echo "CHAT_ID: ${TELEGRAM_CHAT_ID}"
-
-          echo "1) getMe -> checks token"
-          curl -s "$TURL/getMe" | tee me.json
-
-          echo "2) getUpdates -> send /start to your bot first"
-          curl -s "$TURL/getUpdates" | tee updates.json
-
-          echo "3) sendMessage -> tries your current CHAT_ID"
-          RESP=$(curl -s -w "\n%{http_code}" -X POST "$TURL/sendMessage" \
+          echo "1) getMe"; curl -s "$TURL/getMe" | tee me.json >/dev/null
+          echo "2) sendMessage test"
+          curl -s -X POST "$TURL/sendMessage" \
             -d chat_id="$TELEGRAM_CHAT_ID" \
-            -d text="✅ Test from GitHub Actions $(date -u +'%Y-%m-%d %H:%M:%SZ')")
-          BODY=$(echo "$RESP" | head -n1)
-          CODE=$(echo "$RESP" | tail -n1)
-          echo "HTTP: $CODE"
-          echo "$BODY"
-          test "$CODE" = "200" || (echo "sendMessage failed"; exit 1)
+            -d text="✅ Test from GitHub Actions $(date -u +'%Y-%m-%dT%H:%M:%SZ')" | tee send.json >/dev/null
+          echo "Done"
 
-      - name: Run strategy (Zerodha first; graceful Yahoo fallback)
+      - name: Run strategy (paper; Zerodha first)
         env:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
           ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
           ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
           ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
-          # Optional: fallback symbol to use ONLY when Yahoo is needed
           YAHOO_FALLBACK_SYMBOL: "RELIANCE.NS"
         run: |
           python runner.py --out_dir "./reports"
