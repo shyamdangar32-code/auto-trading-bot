@@ -1,18 +1,16 @@
 # =========================
-# Quant Bot — Zerodha Only
+# Quant Bot — Base Config
 # =========================
 
 # ---- Data / timeframe ----
-symbol: "^NSEI"            # not used for Zerodha fetch, kept for logs
-interval: "1d"             # '1d','1h','15m','5m'
+symbol: "NIFTYBEES.NS"
+interval: "1d"
 lookback: "1y"
 tz: "Asia/Kolkata"
 
-# ---- Zerodha ONLY ----
+# ---- Zerodha switch ----
 zerodha_enabled: true
-# NIFTY index instrument token (Spot index candles via Zerodha historical API)
-# Use your chosen token here. Example below for NIFTY 50 spot:
-zerodha_instrument_token: 256265
+zerodha_instrument_token: null   # fill if you have it; otherwise Zerodha still works via symbol mapping inside code
 
 # ---- Strategy params ----
 ema_fast: 21
@@ -23,32 +21,31 @@ rsi_sell: 70
 adx_len: 14
 atr_len: 14
 
-# ---- Risk / sizing (paper only today) ----
+# ---- Risk / sizing ----
 stop_atr_mult: 2.0
 take_atr_mult: 3.0
 capital_rs: 100000
 order_qty: 1
 
 # ---- Modes ----
-send_only_signals: true     # send alerts only
-paper_trading: true         # <-- stays paper for today
+send_only_signals: true
+paper_trading: true
 live_trading: false
 
 # ---- Output ----
 out_dir: "reports"
 
-# ---- (future) live defaults ----
-trade:
-  exchange: "NSE"
-  product: "CNC"
-  order_type: "MARKET"
-  qty: 1
+# ---- Simulation control ----
+# If true, runner will ONLY use candles up to “yesterday” (India time).
+simulate_yesterday_only: true
+# Optional alternative: instead of yesterday, you can hard-set a date.
+# paper_trade_cutoff: "2025-08-21"   # YYYY-MM-DD  (leave commented for “yesterday”)
 
-# ---- Telegram (populated by GitHub Secrets at runtime) ----
+# ---- Telegram (secrets normally set in Actions) ----
 telegram_bot_token: ""
 telegram_chat_id: ""
 
-# ---- Zerodha creds (populated by GitHub Secrets at runtime) ----
+# ---- Zerodha creds (secrets normally set in Actions) ----
 zerodha_api_key: ""
 zerodha_api_secret: ""
 zerodha_access_token: ""
