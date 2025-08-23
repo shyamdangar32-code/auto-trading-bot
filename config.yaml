@@ -1,16 +1,18 @@
 # =========================
-# Quant Bot — Zerodha-only
+# Quant Bot — Config (Zerodha only, paper trading)
 # =========================
 
 # ---- Data / timeframe ----
-symbol: "NIFTYBEES.NS"      # not used for Yahoo, kept only for log clarity
-interval: "1d"
+# We’ll fetch NIFTY50 via Zerodha (instrument_token below).
+symbol: "^NSEI"
+interval: "1d"           # '1d','1h','15m','5m'
 lookback: "1y"
 tz: "Asia/Kolkata"
 
-# ---- Zerodha ----
+# ---- Zerodha switch ----
 zerodha_enabled: true
-zerodha_instrument_token: 256265   # NIFTY 50 index
+# NIFTY 50 index instrument token (works with your runs)
+zerodha_instrument_token: 256265
 
 # ---- Strategy params ----
 ema_fast: 21
@@ -21,32 +23,32 @@ rsi_sell: 70
 adx_len: 14
 atr_len: 14
 
-# ---- Risk / sizing ----
-capital_rs: 10000
-order_qty: 1
+# ---- Risk / sizing (paper only) ----
 stop_atr_mult: 2.0
 take_atr_mult: 3.0
+capital_rs: 1000        # paper budget (does NOT touch real funds)
+order_qty: 1
 
 # ---- Modes ----
-send_only_signals: true
-paper_trading: true     # ✅ default tomorrow = paper
-live_trading: false
+send_only_signals: true   # alerts only
+paper_trading: true
+live_trading: false       # keep false (no real orders)
 
 # ---- Output ----
 out_dir: "reports"
 
-# ---- Optional: Telegram (normally via GitHub Secrets) ----
-telegram_bot_token: ""
-telegram_chat_id: ""
-
-# ---- Optional: Zerodha creds (normally via GitHub Secrets) ----
-zerodha_api_key: ""
-zerodha_api_secret: ""
-zerodha_access_token: ""
-
-# ---- Trading defaults (future live mode) ----
+# ---- Trading defaults (for future live-trade module) ----
 trade:
   exchange: "NSE"
   product: "CNC"
   order_type: "MARKET"
   qty: 1
+
+# ---- Optional: Telegram (use GitHub Secrets in Actions) ----
+telegram_bot_token: ""
+telegram_chat_id: ""
+
+# ---- Optional: Zerodha creds (use GitHub Secrets in Actions) ----
+zerodha_api_key: ""
+zerodha_api_secret: ""
+zerodha_access_token: ""
