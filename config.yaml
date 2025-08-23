@@ -2,15 +2,15 @@
 # Quant Bot — Base Config
 # =========================
 
-# ---- Data / timeframe ----
-symbol: "NIFTYBEES.NS"
-interval: "1d"
-lookback: "5d"             # just fetch a few days, enough to cover yesterday
+# ---- Data / timeframe (label only; Zerodha supplies candles) ----
+symbol: "^NSEI"            # used for messages only
+interval: "1d"             # '1d','1h','15m','5m'
+lookback: "1y"
 tz: "Asia/Kolkata"
 
-# ---- Zerodha switch ----
+# ---- Zerodha (we use ONLY Zerodha; no Yahoo fallback) ----
 zerodha_enabled: true
-zerodha_instrument_token: 256265
+zerodha_instrument_token: 256265   # NIFTY 50 index
 
 # ---- Strategy params ----
 ema_fast: 21
@@ -24,7 +24,7 @@ atr_len: 14
 # ---- Risk / sizing ----
 stop_atr_mult: 2.0
 take_atr_mult: 3.0
-capital_rs: 100000
+capital_rs: 100000   # used by backtest stats only (no live orders yet)
 order_qty: 1
 
 # ---- Modes ----
@@ -35,17 +35,18 @@ live_trading: false
 # ---- Output ----
 out_dir: "reports"
 
-# ---- Simulation control ----
-# This ensures the runner cuts off and evaluates ONLY yesterday (India time).
-simulate_yesterday_only: true
-# Optional: instead of yesterday, you can hard-set a date.
-# paper_trade_cutoff: "2025-08-22"   # YYYY-MM-DD
+# ---- Simulation control (for “yesterday-only” paper test) ----
+simulate_yesterday_only: false
+# paper_trade_cutoff: "2025-08-21"   # optional YYYY-MM-DD (IST). If set, use <= this date.
 
-# ---- Telegram (set in GitHub Secrets) ----
+# ---- Research (for later, if you run the research workflow) ----
+research_lookback: "2y"
+
+# ---- Telegram (normally set via GitHub Secrets / env) ----
 telegram_bot_token: ""
 telegram_chat_id: ""
 
-# ---- Zerodha creds (set in GitHub Secrets) ----
+# ---- Zerodha creds (ALWAYS come via GitHub Secrets / env in Actions) ----
 zerodha_api_key: ""
 zerodha_api_secret: ""
 zerodha_access_token: ""
