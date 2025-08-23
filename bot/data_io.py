@@ -5,17 +5,14 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
-# Zerodha
-try:
-    from kiteconnect import KiteConnect
-    _kite_available = True
-except Exception:
-    _kite_available = False
+# Zerodha only (no Yahoo fallback)
+from kiteconnect import KiteConnect
 
 
-# ------------------------- Zerodha helpers -------------------------
+# ------------------------- helpers -------------------------
 
 def _parse_period_days(period: str) -> int:
+    """Convert lookback like '1y','6mo','30d' -> days."""
     p = period.strip().lower()
     if p.endswith("y"):
         return int(p[:-1]) * 365
@@ -23,47 +20,45 @@ def _parse_period_days(period: str) -> int:
         return int(p[:-2]) * 30
     if p.endswith("d"):
         return int(p[:-1])
-    if p in {"6mo", "1y", "5y"}:
-        return {"6mo": 180, "1y": 365, "5y": 1825}[p]
-    return 365
+    return 365  # default
 
 def _map_interval(interval: str) -> str:
-    """Map our intervals to Zerodha intervals."""
+    """Map our interval names to Zerodha intervals."""
     return {
         "1d": "day",
         "1h": "60minute",
         "30m": "30minute",
         "15m": "15minute",
-        "5m":  "5minute",
+        "5m": "5minute",
     }.get(interval, "day")
 
-def _get_kite_or_raise() -> KiteConnect:
-    if not _kite_available:
-        raise RuntimeError("kiteconnect package not available")
+def _get_kite() -> KiteConnect:
     api_key = os.getenv("ZERODHA_API_KEY", "").strip()
     access  = os.getenv("ZERODHA_ACCESS_TOKEN", "").strip()
     if not api_key or not access:
-        raise RuntimeError("ZERODHA_API_KEY or ZERODHA_ACCESS_TOKEN missing in env")
+        raise RuntimeError("ZERODHA_API_KEY / ZERODHA_ACCESS_TOKEN not set")
+
     kite = KiteConnect(api_key=api_key)
     kite.set_access_token(access)
-    # quick validation
     try:
-        _ = kite.profile()
+        kite.profile()  # quick check
+        print("✅ Zerodha token OK.")
     except Exception as e:
         raise RuntimeError(f"Zerodha token problem: {e}")
     return kite
 
-# ------------------------- Zerodha prices -------------------------
+
+# ------------------------- Zerodha download -------------------------
 
 def zerodha_prices(instrument_token: int, period: str, interval: str) -> pd.DataFrame:
-    kite = _get_kite_or_raise()
+    kite = _get_kite()
 
     days = _parse_period_days(period)
     to_dt = datetime.now()
     from_dt = to_dt - timedelta(days=days)
     tf = _map_interval(interval)
 
-    print(f"🟢 Downloading from Zerodha… token={instrument_token} {tf} {from_dt:%Y-%m-%d}->{to_dt:%Y-%m-%d}")
+    print(f"🟢 Zerodha: token={instrument_token} {tf} {from_dt:%Y-%m-%d}->{to_dt:%Y-%m-%d}")
     candles = kite.historical_data(
         instrument_token=int(instrument_token),
         from_date=from_dt,
@@ -73,32 +68,34 @@ def zerodha_prices(instrument_token: int, period: str, interval: str) -> pd.Data
     if not candles:
         raise RuntimeError("Zerodha returned no candles")
 
-    d = pd.DataFrame(candles)
-    d.rename(columns={
+    df = pd.DataFrame(candles)
+    # standardize column names
+    df.rename(columns={
         "date": "Date", "open": "Open", "high": "High",
         "low": "Low", "close": "Close", "volume": "Volume"
     }, inplace=True)
-    d["Date"] = pd.to_datetime(d["Date"])
-    d = d.dropna(subset=["Close"])
-    print(f"✅ Zerodha OK: {len(d)} rows")
-    return d
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.dropna(subset=["Close"])
+    print(f"✅ Zerodha OK: {len(df)} rows")
+    return df
 
 
-# ------------------------- Public entry point (Zerodha only) -------------------------
+# ------------------------- unified entry -------------------------
 
 def prices(
     symbol: str,
     period: str,
     interval: str,
-    zerodha_enabled: bool = False,
+    zerodha_enabled: bool = True,
     zerodha_instrument_token: Optional[int] = None,
 ) -> pd.DataFrame:
     """
-    Zerodha-only fetch. We require: zerodha_enabled=True and a valid instrument token.
+    Zerodha-only pipeline. We require instrument_token when enabled.
     """
     if not zerodha_enabled:
-        raise RuntimeError("Zerodha is required (zerodha_enabled=false)")
+        raise RuntimeError("Zerodha disabled in config, and Yahoo fallback is removed by request.")
+
     if not zerodha_instrument_token:
-        raise RuntimeError("Missing zerodha_instrument_token in config.yaml")
+        raise RuntimeError("Missing `zerodha_instrument_token` in config.yaml")
 
     return zerodha_prices(int(zerodha_instrument_token), period, interval)
