@@ -5,12 +5,12 @@
 # ---- Data / timeframe ----
 symbol: "NIFTYBEES.NS"
 interval: "1d"
-lookback: "1y"
+lookback: "5d"             # just fetch a few days, enough to cover yesterday
 tz: "Asia/Kolkata"
 
 # ---- Zerodha switch ----
 zerodha_enabled: true
-zerodha_instrument_token: 256265   # fill if you have it; otherwise Zerodha still works via symbol mapping inside code
+zerodha_instrument_token: 256265
 
 # ---- Strategy params ----
 ema_fast: 21
@@ -36,16 +36,16 @@ live_trading: false
 out_dir: "reports"
 
 # ---- Simulation control ----
-# If true, runner will ONLY use candles up to “yesterday” (India time).
+# This ensures the runner cuts off and evaluates ONLY yesterday (India time).
 simulate_yesterday_only: true
-# Optional alternative: instead of yesterday, you can hard-set a date.
-# paper_trade_cutoff: "2025-08-21"   # YYYY-MM-DD  (leave commented for “yesterday”)
+# Optional: instead of yesterday, you can hard-set a date.
+# paper_trade_cutoff: "2025-08-22"   # YYYY-MM-DD
 
-# ---- Telegram (secrets normally set in Actions) ----
+# ---- Telegram (set in GitHub Secrets) ----
 telegram_bot_token: ""
 telegram_chat_id: ""
 
-# ---- Zerodha creds (secrets normally set in Actions) ----
+# ---- Zerodha creds (set in GitHub Secrets) ----
 zerodha_api_key: ""
 zerodha_api_secret: ""
 zerodha_access_token: ""
