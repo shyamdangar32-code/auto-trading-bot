@@ -1,5 +1,8 @@
 # runner.py
-from datetime import datetime
+import os
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 
 from bot.config import get_cfg
@@ -15,33 +18,57 @@ CFG = get_cfg()                          # loads config.yaml + env overrides
 OUT = CFG.get("out_dir", "reports")
 ensure_dir(OUT)
 
-# --------------- pretty printer ---------------
+if not str(CFG.get("symbol", "")).strip():
+    CFG["symbol"] = "NIFTYBEES.NS"
+
+
+# --------------- helpers ---------------
 def status_line(last_row: pd.Series, label: str) -> str:
     dt = str(last_row.get("Date", ""))[:19]
     px = float(last_row["Close"])
     return f"📢 {CFG['symbol']} | {dt} | Signal: {label} | Price: {px:.2f}"
 
+def apply_cutoff_if_needed(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Limit data to 'yesterday' (India time) or to an explicit cutoff date
+    so we can simulate yesterday’s market in paper mode.
+    """
+    tz_name = CFG.get("tz", "Asia/Kolkata")
+
+    # explicit date takes priority if provided
+    cutoff_cfg = str(CFG.get("paper_trade_cutoff", "")).strip()
+    if cutoff_cfg:
+        cutoff_date = pd.to_datetime(cutoff_cfg).date()
+    elif bool(CFG.get("simulate_yesterday_only", False)):
+        # compute yesterday in local exchange time
+        now_local = datetime.now(ZoneInfo(tz_name))
+        cutoff_date = (now_local.date() - timedelta(days=1))
+    else:
+        return df  # no cutoff requested
+
+    # ensure Date is datetime, then filter by date <= cutoff_date
+    dts = pd.to_datetime(df["Date"])
+    df = df[dts.dt.date <= cutoff_date].copy()
+    if df.empty:
+        raise RuntimeError(f"No rows on or before cutoff {cutoff_date}.")
+    print(f"🧪 Paper-trade cutoff active -> using data up to {cutoff_date} ({tz_name}) "
+          f"→ {len(df)} rows kept.")
+    return df
+
 
 # --------------- main workflow ---------------
 def main():
-    try:
-        # 1) Data (Zerodha only)
-        df = prices(
-            symbol=CFG["symbol"],
-            period=CFG["lookback"],
-            interval=CFG["interval"],
-            zerodha_enabled=bool(CFG.get("zerodha_enabled", False)),
-            zerodha_instrument_token=CFG.get("zerodha_instrument_token"),
-        )
-    except Exception as e:
-        # Token invalid / env missing / any fetch issue -> notify & exit gracefully
-        msg = f"❗ Data fetch failed: {e}\n(If using Zerodha, refresh ACCESS_TOKEN.)"
-        print(msg)
-        send_telegram(msg)
-        # write a tiny heartbeat so artifacts exist
-        save_json({"timestamp": datetime.utcnow().isoformat(timespec="seconds")+"Z",
-                   "error": str(e)}, f"{OUT}/latest.json")
-        return
+    # 1) Data (Zerodha first; your token must be valid)
+    df = prices(
+        symbol=CFG["symbol"],
+        period=CFG["lookback"],
+        interval=CFG["interval"],
+        zerodha_enabled=bool(CFG.get("zerodha_enabled", False)),
+        zerodha_instrument_token=CFG.get("zerodha_instrument_token"),
+    )
+
+    # 1b) apply “yesterday only” (or explicit cutoff date)
+    df = apply_cutoff_if_needed(df)
 
     # 2) Features & signals
     df = add_indicators(df, CFG)
@@ -72,10 +99,11 @@ def main():
     print("📊 Backtest:", metrics)
     print(status_line(last, label))
 
+    # In “yesterday” simulation we still keep the normal rule:
+    # only alert when the label changed and isn’t HOLD.
     if label and (label != prev_label) and (label != "HOLD"):
-        msg = (f"📅 {payload['timestamp']}\n" +
-               status_line(last, label) +
-               f"\nPnL(sum): {metrics['total_PnL']} | Trades: {metrics['n_trades']} | Win rate: {metrics['win_rate']:.1f}%")
+        msg = status_line(last, label) + \
+              f"\nPnL (sum): {metrics['total_PnL']} | Trades: {metrics['n_trades']} | Win rate: {metrics['win_rate']:.1f}%"
         send_telegram(msg)
     else:
         print("ℹ️ No alert sent (unchanged or HOLD).")
