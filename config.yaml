@@ -1,17 +1,17 @@
 # =========================
-# Quant Bot — Config (Zerodha only, paper trading)
+# Quant Bot — Zerodha Only
 # =========================
 
 # ---- Data / timeframe ----
-# We’ll fetch NIFTY50 via Zerodha (instrument_token below).
-symbol: "^NSEI"
-interval: "1d"           # '1d','1h','15m','5m'
+symbol: "^NSEI"            # not used for Zerodha fetch, kept for logs
+interval: "1d"             # '1d','1h','15m','5m'
 lookback: "1y"
 tz: "Asia/Kolkata"
 
-# ---- Zerodha switch ----
+# ---- Zerodha ONLY ----
 zerodha_enabled: true
-# NIFTY 50 index instrument token (works with your runs)
+# NIFTY index instrument token (Spot index candles via Zerodha historical API)
+# Use your chosen token here. Example below for NIFTY 50 spot:
 zerodha_instrument_token: 256265
 
 # ---- Strategy params ----
@@ -23,32 +23,32 @@ rsi_sell: 70
 adx_len: 14
 atr_len: 14
 
-# ---- Risk / sizing (paper only) ----
+# ---- Risk / sizing (paper only today) ----
 stop_atr_mult: 2.0
 take_atr_mult: 3.0
-capital_rs: 1000        # paper budget (does NOT touch real funds)
+capital_rs: 100000
 order_qty: 1
 
 # ---- Modes ----
-send_only_signals: true   # alerts only
-paper_trading: true
-live_trading: false       # keep false (no real orders)
+send_only_signals: true     # send alerts only
+paper_trading: true         # <-- stays paper for today
+live_trading: false
 
 # ---- Output ----
 out_dir: "reports"
 
-# ---- Trading defaults (for future live-trade module) ----
+# ---- (future) live defaults ----
 trade:
   exchange: "NSE"
   product: "CNC"
   order_type: "MARKET"
   qty: 1
 
-# ---- Optional: Telegram (use GitHub Secrets in Actions) ----
+# ---- Telegram (populated by GitHub Secrets at runtime) ----
 telegram_bot_token: ""
 telegram_chat_id: ""
 
-# ---- Optional: Zerodha creds (use GitHub Secrets in Actions) ----
+# ---- Zerodha creds (populated by GitHub Secrets at runtime) ----
 zerodha_api_key: ""
 zerodha_api_secret: ""
 zerodha_access_token: ""
