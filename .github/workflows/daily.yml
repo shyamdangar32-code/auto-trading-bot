@@ -3,7 +3,8 @@ name: daily-trade-run
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "20 03 * * 1-5"   # 08:50 IST daily (Mon–Fri)  -> adjust if you prefer
+    # 09:20 IST (03:50 UTC) – adjust if you want a different time
+    - cron: "50 3 * * 1-5"
 
 concurrency:
   group: daily-trade-run-${{ github.ref }}
@@ -39,12 +40,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install --prefer-binary -r requirements.txt
 
-      - name: Run strategy (Zerodha only; paper mode)
+      # NOTE: No Yahoo, no token refresh here. Zerodha only.
+      # Put a fresh ACCESS_TOKEN in repo Secrets every morning if needed.
+
+      - name: Run strategy (Zerodha only)
         env:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
           ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
-          ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}   # not used here but kept
+          ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}   # not used in runner, kept for consistency
           ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
         run: |
           python runner.py --out_dir "./reports"
