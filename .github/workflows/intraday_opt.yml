@@ -7,6 +7,14 @@ jobs:
   run:
     runs-on: ubuntu-latest
 
+    # Secrets flow into env here
+    env:
+      TZ: Asia/Kolkata
+      ZERODHA_API_KEY: ${{ secrets.ZERODHA_API_KEY }}
+      ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,41 +37,58 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Optional helper: inject secrets into config.yaml if those fields are blank
+      # (Optional) Fill blank fields in config.yaml from env (telegram, etc.)
       - name: Put envs into config.yaml at runtime if fields are blank
+        shell: bash
         run: |
           python - <<'PY'
           import os, yaml
-          path = "config.yaml"
-          with open(path) as f:
-            cfg = yaml.safe_load(f) or {}
+          p = "config.yaml"
+          with open(p, "r", encoding="utf-8") as f:
+              cfg = yaml.safe_load(f)
 
-          cfg.setdefault("tz", "Asia/Kolkata")
-          cfg.setdefault("zerodha_enabled", True)
-          cfg.setdefault("intraday_options", {})
+          # Telegram wiring if left empty in YAML
+          tbot = os.getenv("TELEGRAM_BOT_TOKEN") or ""
+          tchat = os.getenv("TELEGRAM_CHAT_ID") or ""
 
-          # Only fill if empty in YAML
-          if not cfg.get("telegram_bot_token"):
-            cfg["telegram_bot_token"] = os.getenv("TELEGRAM_BOT_TOKEN","")
-          if not cfg.get("telegram_chat_id"):
-            cfg["telegram_chat_id"] = os.getenv("TELEGRAM_CHAT_ID","")
+          # config.yaml (as you shared) has telegram under intraday_options
+          io = cfg.get("intraday_options", {}) or {}
+          if not io.get("telegram_bot_token"):
+              io["telegram_bot_token"] = tbot
+          if not io.get("telegram_chat_id"):
+              io["telegram_chat_id"] = tchat
+          cfg["intraday_options"] = io
 
-          with open(path, "w") as f:
-            yaml.safe_dump(cfg, f, default_flow_style=False)
+          with open(p, "w", encoding="utf-8") as f:
+              yaml.safe_dump(cfg, f)   # NOTE: no sort_keys here
+          print("config.yaml updated ✓")
           PY
 
-      - name: Run intraday options (paper)
-        env:
-          ZERODHA_API_KEY: ${{ secrets.ZERODHA_API_KEY }}
-          ZERODHA_API_SECRET: ${{ secrets.ZERODHA_API_SECRET }}
-          ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      # 🔎 Fingerprint the secrets (safe: only lengths and 3-char head/tail)
+      - name: Fingerprint envs (safe)
         run: |
-          python runner_intraday_options.py --out_dir "./reports"
+          python - <<'PY'
+          import os
+          def snip(label, s):
+              s = (s or "").strip("\r\n")
+              print(f"{label}: len={len(s)}, head={s[:3]!r}, tail={s[-3:]!r}")
+          snip("API", os.getenv("ZERODHA_API_KEY"))
+          snip("TOK", os.getenv("ZERODHA_ACCESS_TOKEN"))
+          PY
 
+      # ✅ Preflight the same pair before the main run
+      - name: Preflight Zerodha credentials
+        run: python verify_kite.py
+
+      # ▶️ Main intraday options (paper) runner
+      - name: Run intraday options (paper)
+        run: |
+          python runner_intra_day_options.py --out_dir "./reports"
+
+      # 📦 Save outputs
       - name: Upload reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: reports
-          path: reports/
+          path: reports/**
