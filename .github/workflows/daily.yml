@@ -1,4 +1,4 @@
-name: intraday-options-paper
+name: daily-trade-run
 
 on:
   workflow_dispatch: {}
