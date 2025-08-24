@@ -1,216 +1,169 @@
-# runner_intraday_options.py
-from __future__ import annotations
+# runner_intradary_options.py
+"""
+Intraday options (paper) runner — Zerodha only
+
+What this script does (safe for GitHub Actions):
+1) Connects to Zerodha using env secrets (API key + ACCESS_TOKEN).
+2) Finds BANKNIFTY spot, computes nearest-100 ATM strike.
+3) Locates the weekly expiry CE & PE instruments and prints their tokens.
+4) Downloads recent 5-minute candles for the CE & PE.
+5) FIX: Robust datetime normalization
+   - Zerodha returns tz-aware datetimes; we now use tz_convert (NOT tz_localize)
+   - Accepts columns named 'date' or 'timestamp' (no more KeyError: 'Date')
+6) A tiny demo “paper signal” (no orders): prints last price + a HOLD/EXIT message.
+"""
+
 import os
-import sys
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta, date
+from typing import Optional, Tuple
 
 import pandas as pd
 
+# Zerodha
 from kiteconnect import KiteConnect
-from bot.config import get_cfg
-from bot.utils import ensure_dir, send_telegram, save_json
-from bot.strategy import StraddleParams, simulate_short_straddle_intraday
 
-IST = "Asia/Kolkata"
 
-def _kite() -> Optional[KiteConnect]:
+TZ = "Asia/Kolkata"
+INDEX_NAME = "BANKNIFTY"         # change to NIFTY if you like
+INTERVAL = "5minute"
+LOOKBACK_DAYS = 5                # how much intraday history to pull
+
+# ------------- helpers ------------- #
+
+def _get_kite() -> KiteConnect:
     api_key = os.getenv("ZERODHA_API_KEY", "").strip()
-    access = os.getenv("ZERODHA_ACCESS_TOKEN", "").strip()
+    access  = os.getenv("ZERODHA_ACCESS_TOKEN", "").strip()
     if not api_key or not access:
-        print("❌ Missing ZERODHA_API_KEY / ZERODHA_ACCESS_TOKEN")
-        return None
+        raise RuntimeError("ZERODHA_API_KEY / ZERODHA_ACCESS_TOKEN are missing in env.")
     k = KiteConnect(api_key=api_key)
     k.set_access_token(access)
-    try:
-        _ = k.profile()
-        print("✅ Zerodha token OK.")
-        return k
-    except Exception as e:
-        print("❌ Zerodha token problem:", e)
-        return None
+    # quick token check
+    _ = k.profile()
+    print("✅ Zerodha token OK.")
+    return k
 
-def _parse_date(dstr: str, tz: str = IST) -> pd.Timestamp:
-    if not dstr:
-        # today IST
-        now_ist = pd.Timestamp.now(tz=tz)
-        return now_ist.normalize()
-    return pd.Timestamp(dstr).tz_localize(tz) if pd.Timestamp(dstr).tzinfo is None else pd.Timestamp(dstr).tz_convert(tz)
+def _next_thursday(d: date) -> date:
+    # Zerodha weekly index options typically expire on Thursday
+    # Return the coming Thursday (or today if already Thursday)
+    wd = d.weekday()  # Mon=0 ... Sun=6
+    add = (3 - wd) % 7  # 3 => Thursday
+    return d + timedelta(days=add)
 
-def _ist_ts(d: pd.Timestamp, hhmm: str) -> pd.Timestamp:
-    hh, mm = map(int, hhmm.split(":"))
-    ts = d + pd.Timedelta(hours=hh, minutes=mm)
-    # ensure tz-aware IST
-    if ts.tzinfo is None:
-        return ts.tz_localize(IST)
-    return ts.tz_convert(IST)
+def _round_to_100(x: float) -> int:
+    return int(round(x / 100.0) * 100)
 
-def _get_underlying_ltp(kite: KiteConnect, underlying: str) -> float:
-    # Zerodha index tradingsymbols:
-    # NIFTY 50 index token ~ 256265? (but you already use 256265 for NIFTYBEES earlier)
-    # Safer: use `kite.quote` with the index name:
-    # NSE:NIFTY BANK  OR  NSE:NIFTY 50
-    symbol = "NSE:NIFTY BANK" if underlying.upper() == "BANKNIFTY" else "NSE:NIFTY 50"
-    q = kite.quote([symbol])
-    for v in q.values():
-        return float(v["last_price"])
-    raise RuntimeError("Unable to get underlying LTP")
-
-def _atm_strike(ltp: float, step: int) -> int:
-    return int(round(ltp / step) * step)
-
-def _find_option_tokens(kite: KiteConnect, underlying: str, trade_date: pd.Timestamp,
-                        atm: int) -> Tuple[int, int, str]:
+def _normalize_dt(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Find CE/PE instrument_tokens for BANKNIFTY/NIFTY weekly of the given trade_date week.
+    Robust datetime column normalize:
+    - Accept 'date' or 'timestamp' or 'datetime'
+    - Convert to tz-aware Asia/Kolkata using tz_convert if already aware
+    - Expose a 'Date' column (string ISO) and keep index as pandas datetime
     """
-    # expiry: choose the nearest *weekly* expiry on/after trade_date
-    nfo = kite.instruments("NFO")
-    # Determine lot size & strike step
-    if underlying.upper() == "BANKNIFTY":
-        prefix = "BANKNIFTY"
-        step = 100
-    else:
-        prefix = "NIFTY"
-        step = 50
-
-    # find the weekly expiry >= trade_date
-    wd = trade_date.tz_convert(IST).date()
-    expiries = sorted({i["expiry"] for i in nfo if i["name"] == prefix})
-    expiry = None
-    for e in expiries:
-        if e >= wd:
-            expiry = e
+    d = df.copy()
+    # locate the source dt col
+    dtcol = None
+    for c in ["date", "timestamp", "datetime", "Date", "DATE"]:
+        if c in d.columns:
+            dtcol = c
             break
-    if expiry is None:
-        raise RuntimeError("No weekly expiry found")
+    if dtcol is None:
+        raise KeyError(f"No datetime column found in columns: {list(d.columns)[:10]}")
 
-    # Build tradingsymbols like BANKNIFTY25AUG55100CE
-    # Zerodha uses format: BANKNIFTY<DDMMM><STRIKE><CE/PE>
-    # We'll search by name/strike/option_type instead of composing raw string.
-    ce_token = pe_token = None
-    for i in nfo:
-        if i["name"] != prefix:
-            continue
-        if i["expiry"] != expiry:
-            continue
-        if i["strike"] == atm and i["instrument_type"] in ("CE", "PE"):
-            if i["instrument_type"] == "CE":
-                ce_token = i["instrument_token"]
-            else:
-                pe_token = i["instrument_token"]
-        if ce_token and pe_token:
-            break
+    # to pandas datetime
+    dt = pd.to_datetime(d[dtcol], errors="coerce", utc=True)
 
-    if not ce_token or not pe_token:
-        raise RuntimeError("Could not find ATM CE/PE tokens")
+    # If timezone-aware already, convert; else localize first
+    # pd.to_datetime(..., utc=True) returns tz-aware UTC
+    # so we simply convert to Asia/Kolkata.
+    dt = dt.dt.tz_convert(TZ)
 
-    return ce_token, pe_token, expiry.isoformat()
-
-def _hist(kite: KiteConnect, token: int, frm: pd.Timestamp, to: pd.Timestamp, interval: str) -> pd.DataFrame:
-    candles = kite.historical_data(
-        instrument_token=token,
-        from_date=frm.to_pydatetime(),
-        to_date=to.to_pydatetime(),
-        interval=interval
-    )
-    d = pd.DataFrame(candles)
-    # Normalize columns
-    d.rename(columns={"date": "Date", "open": "Open", "high": "High",
-                      "low": "Low", "close": "Close", "volume": "Volume"}, inplace=True)
-    d["Date"] = pd.to_datetime(d["Date"], infer_datetime_format=True)
-    # IMPORTANT: don't double-localize -> if tz-naive, localize; else convert
-    if d["Date"].dt.tz is None:
-        d["Date"] = d["Date"].dt.tz_localize(IST)
-    else:
-        d["Date"] = d["Date"].dt.tz_convert(IST)
+    d.index = dt
+    d["Date"] = dt.astype(str)  # ISO with timezone
     return d
 
+def _find_option_tokens(kite: KiteConnect, index_name: str, expiry: date, atm: int) -> Tuple[int, int, str, str]:
+    """
+    Return (ce_token, pe_token, ce_symbol, pe_symbol) for given index, weekly expiry and ATM strike.
+    """
+    inst = pd.DataFrame(kite.instruments("NFO"))
+    inst = inst[(inst["segment"] == "NFO-OPT") & (inst["name"] == index_name)]
+
+    inst["expiry"] = pd.to_datetime(inst["expiry"]).dt.date
+    ce = inst[(inst["expiry"] == expiry) & (inst["strike"] == atm) & (inst["instrument_type"] == "CE")].copy()
+    pe = inst[(inst["expiry"] == expiry) & (inst["strike"] == atm) & (inst["instrument_type"] == "PE")].copy()
+    if ce.empty or pe.empty:
+        raise RuntimeError(f"Could not find CE/PE for {index_name} {atm}@{expiry}.")
+    ce = ce.iloc[0]
+    pe = pe.iloc[0]
+    return ce["instrument_token"], pe["instrument_token"], ce["tradingsymbol"], pe["tradingsymbol"]
+
+def _hist(kite: KiteConnect, token: int, days: int, interval: str) -> pd.DataFrame:
+    to_dt = datetime.now()
+    from_dt = to_dt - timedelta(days=days)
+    candles = kite.historical_data(instrument_token=token, from_date=from_dt, to_date=to_dt, interval=interval)
+    if not candles:
+        raise RuntimeError("No candles returned from Zerodha.")
+    d = pd.DataFrame(candles)
+    # standardize OHLCV names
+    d.rename(columns={"open": "Open", "high": "High", "low": "Low",
+                      "close": "Close", "volume": "Volume"}, inplace=True)
+    d = _normalize_dt(d)
+    d = d.dropna(subset=["Close"])
+    return d
+
+def _banknifty_spot(kite: KiteConnect) -> float:
+    # Zerodha quote key for NIFTY BANK index (works in live):
+    q = kite.quote("NSE:NIFTY BANK")
+    # example structure: {'NSE:NIFTY BANK': {'last_price': ... , ...}}
+    item = next(iter(q.values()))
+    return float(item["last_price"])
+
+# ------------- main ------------- #
+
 def main():
-    cfg = get_cfg()
-    OUT = cfg.get("out_dir", "reports")
-    ensure_dir(OUT)
+    kite = _get_kite()
 
-    ico = cfg.get("intraday_options", {})
-    underlying = str(ico.get("underlying", "BANKNIFTY")).upper()
-    lots       = int(ico.get("lots", 1))
-    lot_size   = int(ico.get("lot_size", 15 if underlying=="BANKNIFTY" else 50))
-    interval   = str(ico.get("interval", "5minute"))
-    entry_hhmm = str(ico.get("entry_time", "09:30"))
-    exit_hhmm  = str(ico.get("squareoff", "15:10"))
-    trade_date = _parse_date(str(ico.get("date", "")), IST)
+    # 1) Spot & ATM
+    spot = _banknifty_spot(kite)
+    atm = _round_to_100(spot)
+    expiry = _next_thursday(date.today())
+    print(f"ℹ️ {INDEX_NAME} spot {spot} → ATM {atm}")
+    print(f"ℹ️ Weekly expiry -> {expiry}")
 
-    leg_sl_pct = float(ico.get("leg_sl_percent", 30.0))
-    tgt_pct    = float(ico.get("combined_target_percent", 50.0))
+    # 2) Locate tokens
+    ce_token, pe_token, ce_sym, pe_sym = _find_option_tokens(kite, INDEX_NAME, expiry, atm)
+    print(f"🟦 CE {ce_sym} token={ce_token}")
+    print(f"🟥 PE {pe_sym} token={pe_token}")
 
-    print("CFG.intraday_options:", {
-        "underlying": underlying, "lots": lots, "lot_size": lot_size,
-        "interval": interval, "date": str(trade_date.date()),
-        "entry": entry_hhmm, "squareoff": exit_hhmm,
-        "leg_sl%": leg_sl_pct, "target%": tgt_pct
-    })
+    # 3) Download recent intraday candles
+    ce = _hist(kite, ce_token, LOOKBACK_DAYS, INTERVAL)
+    pe = _hist(kite, pe_token, LOOKBACK_DAYS, INTERVAL)
+    print(f"✅ Zerodha CE rows: {len(ce)}  | PE rows: {len(pe)}")
 
-    kite = _kite()
-    if kite is None:
-        sys.exit(1)
+    # 4) Simple no-trade “paper signal” demo:
+    #    We just compare today's VWAP-ish proxy: rolling price mean on last 20 bars.
+    ce["ma20"] = ce["Close"].rolling(20, min_periods=1).mean()
+    pe["ma20"] = pe["Close"].rolling(20, min_periods=1).mean()
 
-    # Get underlying LTP and decide ATM
-    ltp = _get_underlying_ltp(kite, underlying)
-    step = 100 if underlying == "BANKNIFTY" else 50
-    atm = _atm_strike(ltp, step)
-    print(f"🟦 {underlying} spot {ltp} → ATM {atm}")
+    ce_last = ce.iloc[-1]
+    pe_last = pe.iloc[-1]
 
-    ce_token, pe_token, expiry = _find_option_tokens(kite, underlying, trade_date, atm)
-    print(f"CE token={ce_token}  PE token={pe_token}  (expiry {expiry})")
+    ce_state = "UP" if ce_last["Close"] > ce_last["ma20"] else "DOWN"
+    pe_state = "UP" if pe_last["Close"] > pe_last["ma20"] else "DOWN"
 
-    # Time window for the day
-    start_ts = _ist_ts(trade_date, "09:15")
-    entry_ts = _ist_ts(trade_date, entry_hhmm)
-    end_ts   = _ist_ts(trade_date, exit_hhmm)
+    print("—" * 60)
+    print(f"📈 {ce_sym} | {ce_last['Date']} | Close: {ce_last['Close']:.2f} | MA20: {ce_last['ma20']:.2f} | {ce_state}")
+    print(f"📉 {pe_sym} | {pe_last['Date']} | Close: {pe_last['Close']:.2f} | MA20: {pe_last['ma20']:.2f} | {pe_state}")
 
-    # Download 5m candles
-    ce_df = _hist(kite, ce_token, start_ts, end_ts, interval)
-    pe_df = _hist(kite, pe_token, start_ts, end_ts, interval)
-    print(f"Fetched: CE {len(ce_df)} bars, PE {len(pe_df)} bars.")
+    # Very conservative paper “bias” message (no orders placed)
+    bias = "HOLD"
+    if ce_state == "UP" and pe_state == "DOWN":
+        bias = "CE_BIAS"
+    elif ce_state == "DOWN" and pe_state == "UP":
+        bias = "PE_BIAS"
 
-    params = StraddleParams(
-        lots=lots,
-        lot_size=lot_size,
-        leg_sl_pct=leg_sl_pct,
-        combined_target_pct=tgt_pct,
-        entry_ts=entry_ts,
-        squareoff_ts=end_ts
-    )
-    metrics = simulate_short_straddle_intraday(ce_df, pe_df, params)
-
-    print("📈 Intraday options (paper) result:", metrics)
-
-    # Save report
-    payload = {
-        "timestamp": pd.Timestamp.utcnow().isoformat(timespec="seconds") + "Z",
-        "underlying": underlying,
-        "atm_strike": atm,
-        "expiry": expiry,
-        "params": params.__dict__,
-        "metrics": metrics,
-    }
-    save_json(payload, os.path.join(OUT, "intraday_options_latest.json"))
-
-    # Optional Telegram ping
-    msg = (f"🧪 Intraday {underlying} ATM straddle (paper)\n"
-           f"Date: {trade_date.date()}  Exp: {expiry}\n"
-           f"Entry {params.entry_ts.time()}  Exit {params.squareoff_ts.time()}\n"
-           f"Lots: {params.lots}  LotSize: {params.lot_size}\n"
-           f"PnL: ₹{metrics.get('pnl_rs', 0)}  Status: {metrics.get('status')}")
-    try:
-        send_telegram(msg)
-    except Exception as _:
-        pass
+    print(f"📝 Paper bias (demo): {bias}")
+    print("ℹ️ No trades placed. This runner is for data sanity + signals preview.")
 
 if __name__ == "__main__":
-    # allow --out_dir override (kept for parity)
-    if "--out_dir" in sys.argv:
-        # bot.config/get_cfg already respects CLI via env in your setup; no-op here
-        pass
     main()
