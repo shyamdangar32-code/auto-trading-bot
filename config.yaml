@@ -51,6 +51,15 @@ intraday_options:
   combined_target_percent: 50.0   # optional: book when combined premium drops 50%
   trail: false
 
+  # ---- Re-entry & Trailing ----
+reentry_max: 2           # allow up to 2 re-entries after an exit (per day)
+reentry_cooldown: 2      # bars to wait after exit before re-entering
+trailing_enabled: true   # turn trailing on/off
+trail_type: "atr"        # "atr" (supported)
+trail_start_atr: 1.0     # start trailing once unrealized > 1.0 * ATR
+trail_atr_mult: 1.5      # trail distance = 1.5 * ATR
+adx_min: 10              # require minimum trend strength for entries
+
   # Telegram (optional; read from secrets if running in Actions)
   telegram_bot_token: ""
   telegram_chat_id: ""
