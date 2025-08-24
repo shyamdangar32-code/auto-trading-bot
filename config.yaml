@@ -2,33 +2,23 @@
 # Quant Bot — Base Config
 # =========================
 
-# ---- Data / timeframe (daily swing engine; unchanged) ----
+# ---- General / timezone ----
+tz: "Asia/Kolkata"
+
+# ---- Zerodha only ----
+zerodha_enabled: true
+# Your ACCESS TOKEN is read from env (GitHub Secrets), not from this file.
+
+# ---- Daily swing runner (unchanged; still available) ----
 symbol: "^NSEI"
 interval: "1d"
 lookback: "1y"
-tz: "Asia/Kolkata"
 
-# ---- Zerodha switch (used by both daily & intraday) ----
-zerodha_enabled: true
-zerodha_instrument_token: 256265   # NIFTYBEES token; not used by intraday options
-                                   # but keep it for your daily runner
-
-# ---- Strategy params (daily swing; unchanged) ----
-ema_fast: 21
-ema_slow: 50
-rsi_len: 14
-rsi_buy: 30
-rsi_sell: 70
-adx_len: 14
-atr_len: 14
-
-# ---- Risk / sizing (daily) ----
-stop_atr_mult: 2.0
-take_atr_mult: 3.0
+# ---- Capital & risk (generic) ----
 capital_rs: 100000
 order_qty: 1
 
-# ---- Modes (daily) ----
+# ---- Modes ----
 send_only_signals: true
 paper_trading: true
 live_trading: false
@@ -36,32 +26,31 @@ live_trading: false
 # ---- Output ----
 out_dir: "reports"
 
-# ---- Simulation control (daily) ----
-simulate_yesterday_only: false
-research_lookback: "2y"
+# =========================
+# Intraday Options (NEW)
+# =========================
+intraday_options:
+  # Underlying & lot settings
+  underlying: "BANKNIFTY"        # "NIFTY" or "BANKNIFTY"
+  lots: 1                         # paper lots
+  lot_size: 15                    # BANKNIFTY = 15, NIFTY = 50 (update if needed)
 
-# ---- Telegram (usually via GitHub Secrets) ----
-telegram_bot_token: ""
-telegram_chat_id: ""
+  # Timing (IST)
+  entry_time:  "09:30"            # first bar to take entry after market open
+  squareoff:   "15:10"            # auto exit time
+  date: ""                        # "" = today; or "YYYY-MM-DD" to simulate a past day
 
-# ---- Zerodha creds (usually via GitHub Secrets) ----
-zerodha_api_key: ""
-zerodha_api_secret: ""
-zerodha_access_token: ""
+  # OHLC interval for options
+  interval: "5minute"
 
-# ---- Intraday Options (BANKNIFTY, paper-only) ----
-options_intraday:
-  enabled: true
-  underlying: "BANKNIFTY"     # first target
-  strike_step: 100            # BANKNIFTY strikes spacing
-  interval: "5m"              # 5-minute candles
-  ema_fast: 9
-  ema_slow: 21
-  entry_start: "09:25"        # first allowed entry (IST)
-  entry_end:   "14:45"        # last new entry (IST)
-  hard_exit:   "15:20"        # force square-off (IST)
-  sl_pct: 25                  # stop-loss percent
-  target_pct: 40              # take-profit percent
-  qty: 1                      # lots; PAPER ONLY in this runner
-  paper_trading: true
-  live_trading: false
+  # Strategy: ATM Short Straddle (SELL CE & SELL PE at entry time)
+  entry_rule: "atm_short_straddle"
+
+  # Risk management (per leg)
+  leg_sl_percent: 30.0            # 30% SL of entry premium per leg
+  combined_target_percent: 50.0   # optional: book when combined premium drops 50%
+  trail: false
+
+  # Telegram (optional; read from secrets if running in Actions)
+  telegram_bot_token: ""
+  telegram_chat_id: ""
