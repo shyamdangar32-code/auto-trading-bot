@@ -7,14 +7,28 @@ tz: "Asia/Kolkata"
 
 # ---- Zerodha only ----
 zerodha_enabled: true
-# Your ACCESS TOKEN is read from env (GitHub Secrets), not from this file.
+# (Keys are read from GitHub Secrets during workflow)
+zerodha_api_key: ""
+zerodha_api_secret: ""
+zerodha_access_token: ""
 
-# ---- Daily swing runner (unchanged; still available) ----
+# ---- Daily swing runner (optional; unchanged) ----
 symbol: "^NSEI"
 interval: "1d"
 lookback: "1y"
 
-# ---- Capital & risk (generic) ----
+# Strategy params (for daily runner)
+ema_fast: 21
+ema_slow: 50
+rsi_len: 14
+rsi_buy: 30
+rsi_sell: 70
+adx_len: 14
+atr_len: 14
+stop_atr_mult: 2.0
+take_atr_mult: 3.0
+
+# ---- Capital & risk ----
 capital_rs: 100000
 order_qty: 1
 
@@ -26,40 +40,39 @@ live_trading: false
 # ---- Output ----
 out_dir: "reports"
 
+# ---- Telegram (can be filled via Secrets in Actions) ----
+telegram_bot_token: ""
+telegram_chat_id: ""
+
 # =========================
-# Intraday Options (NEW)
+# Intraday Options (NEW) — used by runner_intradary_options.py
 # =========================
 intraday_options:
-  # Underlying & lot settings
-  underlying: "BANKNIFTY"        # "NIFTY" or "BANKNIFTY"
-  lots: 1                         # paper lots
-  lot_size: 15                    # BANKNIFTY = 15, NIFTY = 50 (update if needed)
+  # Underlying & data
+  underlying: "BANKNIFTY"   # or "NIFTY"
+  index_token: 260105       # BANKNIFTY index token
+  timeframe: "5minute"
+  strike_step: 100          # strike rounding
 
-  # Timing (IST)
-  entry_time:  "09:30"            # first bar to take entry after market open
-  squareoff:   "15:10"            # auto exit time
-  date: ""                        # "" = today; or "YYYY-MM-DD" to simulate a past day
+  # Trading window (IST)
+  start_time: "09:20"
+  end_time:   "15:15"
 
-  # OHLC interval for options
-  interval: "5minute"
+  # Entry/Exit rules (per option leg)
+  ma_len: 20                # entry = price cross above MA
+  atr_len: 14
+  sl_atr_mult: 1.0          # SL distance = 1.0 * ATR
+  tgt_rr: 1.5               # target = 1.5R
 
-  # Strategy: ATM Short Straddle (SELL CE & SELL PE at entry time)
-  entry_rule: "atm_short_straddle"
+  # Trailing stop
+  trail_start_atr: 1.0      # start trailing after +1.0 * ATR profit
+  trail_atr_mult: 1.0       # trail distance = 1.0 * ATR
 
-  # Risk management (per leg)
-  leg_sl_percent: 30.0            # 30% SL of entry premium per leg
-  combined_target_percent: 50.0   # optional: book when combined premium drops 50%
-  trail: false
+  # Re-entry (same day)
+  reentry_max: 2
+  reentry_cooldown: 3       # bars to wait after exit
 
-  # ---- Re-entry & Trailing ----
-reentry_max: 2           # allow up to 2 re-entries after an exit (per day)
-reentry_cooldown: 2      # bars to wait after exit before re-entering
-trailing_enabled: true   # turn trailing on/off
-trail_type: "atr"        # "atr" (supported)
-trail_start_atr: 1.0     # start trailing once unrealized > 1.0 * ATR
-trail_atr_mult: 1.5      # trail distance = 1.5 * ATR
-adx_min: 10              # require minimum trend strength for entries
-
-  # Telegram (optional; read from secrets if running in Actions)
-  telegram_bot_token: ""
-  telegram_chat_id: ""
+  # Sizing & mode for intraday runner
+  order_qty: 1
+  paper_trading: true
+  live_trading: false
