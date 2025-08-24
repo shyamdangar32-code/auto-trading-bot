@@ -1,59 +1,36 @@
-name: daily-trade-run
+name: intraday-options-paper
 
 on:
   workflow_dispatch: {}
-  schedule:
-    # 09:20 IST (03:50 UTC) – adjust if you want a different time
-    - cron: "50 3 * * 1-5"
-
-concurrency:
-  group: daily-trade-run-${{ github.ref }}
-  cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install --prefer-binary -r requirements.txt
 
-      # NOTE: No Yahoo, no token refresh here. Zerodha only.
-      # Put a fresh ACCESS_TOKEN in repo Secrets every morning if needed.
-
-      - name: Run strategy (Zerodha only)
+      - name: Run intraday options (paper)
         env:
           TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
           ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
-          ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}   # not used in runner, kept for consistency
           ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
         run: |
-          python runner.py --out_dir "./reports"
+          python runner_intraday_options.py
 
-      - name: Upload reports as artifact
+      - name: Upload reports
         uses: actions/upload-artifact@v4
         with:
           name: reports
