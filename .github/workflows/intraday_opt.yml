@@ -83,7 +83,7 @@ jobs:
       # ▶️ Main intraday options (paper) runner
       - name: Run intraday options (paper)
         run: |
-          python runner_intra_day_options.py --out_dir "./reports"
+          python runner_intraday_options.py --out_dir "./reports"
 
       # 📦 Save outputs
       - name: Upload reports
