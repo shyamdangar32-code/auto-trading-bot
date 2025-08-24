@@ -2,17 +2,18 @@
 # Quant Bot — Base Config
 # =========================
 
-# ---- Data / timeframe (label only; Zerodha supplies candles) ----
-symbol: "^NSEI"            # used for messages only
-interval: "1d"             # '1d','1h','15m','5m'
+# ---- Data / timeframe (daily swing engine; unchanged) ----
+symbol: "^NSEI"
+interval: "1d"
 lookback: "1y"
 tz: "Asia/Kolkata"
 
-# ---- Zerodha (we use ONLY Zerodha; no Yahoo fallback) ----
+# ---- Zerodha switch (used by both daily & intraday) ----
 zerodha_enabled: true
-zerodha_instrument_token: 256265   # NIFTY 50 index
+zerodha_instrument_token: 256265   # NIFTYBEES token; not used by intraday options
+                                   # but keep it for your daily runner
 
-# ---- Strategy params ----
+# ---- Strategy params (daily swing; unchanged) ----
 ema_fast: 21
 ema_slow: 50
 rsi_len: 14
@@ -21,13 +22,13 @@ rsi_sell: 70
 adx_len: 14
 atr_len: 14
 
-# ---- Risk / sizing ----
+# ---- Risk / sizing (daily) ----
 stop_atr_mult: 2.0
 take_atr_mult: 3.0
-capital_rs: 100000   # used by backtest stats only (no live orders yet)
+capital_rs: 100000
 order_qty: 1
 
-# ---- Modes ----
+# ---- Modes (daily) ----
 send_only_signals: true
 paper_trading: true
 live_trading: false
@@ -35,18 +36,32 @@ live_trading: false
 # ---- Output ----
 out_dir: "reports"
 
-# ---- Simulation control (for “yesterday-only” paper test) ----
+# ---- Simulation control (daily) ----
 simulate_yesterday_only: false
-# paper_trade_cutoff: "2025-08-21"   # optional YYYY-MM-DD (IST). If set, use <= this date.
-
-# ---- Research (for later, if you run the research workflow) ----
 research_lookback: "2y"
 
-# ---- Telegram (normally set via GitHub Secrets / env) ----
+# ---- Telegram (usually via GitHub Secrets) ----
 telegram_bot_token: ""
 telegram_chat_id: ""
 
-# ---- Zerodha creds (ALWAYS come via GitHub Secrets / env in Actions) ----
+# ---- Zerodha creds (usually via GitHub Secrets) ----
 zerodha_api_key: ""
 zerodha_api_secret: ""
 zerodha_access_token: ""
+
+# ---- Intraday Options (BANKNIFTY, paper-only) ----
+options_intraday:
+  enabled: true
+  underlying: "BANKNIFTY"     # first target
+  strike_step: 100            # BANKNIFTY strikes spacing
+  interval: "5m"              # 5-minute candles
+  ema_fast: 9
+  ema_slow: 21
+  entry_start: "09:25"        # first allowed entry (IST)
+  entry_end:   "14:45"        # last new entry (IST)
+  hard_exit:   "15:20"        # force square-off (IST)
+  sl_pct: 25                  # stop-loss percent
+  target_pct: 40              # take-profit percent
+  qty: 1                      # lots; PAPER ONLY in this runner
+  paper_trading: true
+  live_trading: false
