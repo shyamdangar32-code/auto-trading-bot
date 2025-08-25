@@ -7,7 +7,7 @@ jobs:
   run:
     runs-on: ubuntu-latest
 
-    # Map GitHub Secrets -> env (make sure all three exist in repo settings)
+    # Expose secrets to every step in this job
     env:
       ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
       ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
@@ -35,41 +35,39 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # --- Quick sanity: make sure secrets are not empty (values are masked) ---
-      - name: Debug secrets (masked)
+      # --- quick sanity: only lengths (keeps secrets masked) ---
+      - name: Debug secrets lengths
         run: |
           echo "API_KEY length:      ${#ZERODHA_API_KEY}"
           echo "API_SECRET length:   ${#ZERODHA_API_SECRET}"
           echo "ACCESS_TOKEN length: ${#ZERODHA_ACCESS_TOKEN}"
 
-      # --- Preflight: verify token works with Kite before the main script ---
-      - name: Preflight Zerodha credentials
+      # --- the SAME preflight you just ran in kite-diagnostics ---
+      - name: Preflight Zerodha profile (must pass)
         run: |
           python - <<'PY'
           import os, sys
           from kiteconnect import KiteConnect
 
-          api_key = (os.getenv("ZERODHA_API_KEY") or "").strip()
-          token   = (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
-
-          if not api_key or not token:
-              print("❌ Missing API key or access token in env.")
-              sys.exit(2)
+          api_key  = (os.getenv("ZERODHA_API_KEY") or "").strip()
+          access   = (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
+          print("API len:", len(api_key), "| TOKEN len:", len(access))
 
           kite = KiteConnect(api_key=api_key)
-          kite.set_access_token(token)
+          kite.set_access_token(access)
+
           try:
-              p = kite.profile()
-              print("✅ Preflight OK | User:", p.get("user_id"), p.get("user_name"))
+              prof = kite.profile()
+              print("✅ Preflight OK ->", prof.get("user_id"), "|", prof.get("user_name"))
           except Exception as e:
-              print("❌ Zerodha preflight failed:", e)
+              print("❌ Preflight FAILED:", e)
               sys.exit(3)
           PY
 
-      # --- Run intraday options runner (paper). Make sure this filename MATCHES your repo ---
+      # --- run the intraday options paper strategy ---
       - name: Run intraday options (paper)
         run: |
-          python runner_intraday_options.py --out_dir "./reports"
+          python runner_intra_day_options.py --out_dir "./reports"
 
       - name: Upload reports
         if: always()
