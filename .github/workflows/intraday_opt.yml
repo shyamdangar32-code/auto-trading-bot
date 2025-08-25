@@ -1,4 +1,5 @@
 name: intraday-options-paper
+
 on:
   workflow_dispatch:
 
@@ -6,11 +7,11 @@ jobs:
   run:
     runs-on: ubuntu-latest
 
-    # Raw (possibly messy) secrets
+    # Map GitHub Secrets -> env (make sure all three exist in repo settings)
     env:
-      RAW_ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
-      RAW_ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
-      RAW_ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+      ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
+      ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
+      ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
 
     steps:
       - name: Checkout
@@ -34,29 +35,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 1) SANITIZE secrets (strip spaces, tabs, newlines, CRLF) and re-export
-      - name: Sanitize Zerodha secrets
-        shell: bash
+      # --- Quick sanity: make sure secrets are not empty (values are masked) ---
+      - name: Debug secrets (masked)
         run: |
-          clean() { printf "%s" "$1" | tr -d '\r\n\t ' ; }
-          API_KEY_CLEAN=$(clean "$RAW_ZERODHA_API_KEY")
-          API_SECRET_CLEAN=$(clean "$RAW_ZERODHA_API_SECRET")
-          ACCESS_TOKEN_CLEAN=$(clean "$RAW_ZERODHA_ACCESS_TOKEN")
+          echo "API_KEY length:      ${#ZERODHA_API_KEY}"
+          echo "API_SECRET length:   ${#ZERODHA_API_SECRET}"
+          echo "ACCESS_TOKEN length: ${#ZERODHA_ACCESS_TOKEN}"
 
-          echo "ZERODHA_API_KEY=$API_KEY_CLEAN"           >> $GITHUB_ENV
-          echo "ZERODHA_API_SECRET=$API_SECRET_CLEAN"     >> $GITHUB_ENV
-          echo "ZERODHA_ACCESS_TOKEN=$ACCESS_TOKEN_CLEAN" >> $GITHUB_ENV
-
-          # Safe fingerprints (first 6 chars) to confirm we’re using what you think
-          echo "API_KEY_FP=${API_KEY_CLEAN:0:6}"           >> $GITHUB_ENV
-          echo "ACCESS_TOKEN_FP=${ACCESS_TOKEN_CLEAN:0:6}" >> $GITHUB_ENV
-
-      - name: Show safe fingerprints
-        run: |
-          echo "Using API key starting with: $API_KEY_FP"
-          echo "Using Access token starting with: $ACCESS_TOKEN_FP"
-
-      # 2) PREFLIGHT with the SAME sanitized env that runner will use
+      # --- Preflight: verify token works with Kite before the main script ---
       - name: Preflight Zerodha credentials
         run: |
           python - <<'PY'
@@ -64,24 +50,23 @@ jobs:
           from kiteconnect import KiteConnect
 
           api_key = (os.getenv("ZERODHA_API_KEY") or "").strip()
-          access  = (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
+          token   = (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
 
-          print("API len:", len(api_key), "| TOKEN len:", len(access))
-          if len(api_key) < 6 or len(access) < 10:
-              print("❌ Missing API key or Access token after sanitize.")
+          if not api_key or not token:
+              print("❌ Missing API key or access token in env.")
               sys.exit(2)
 
           kite = KiteConnect(api_key=api_key)
-          kite.set_access_token(access)
+          kite.set_access_token(token)
           try:
-              prof = kite.profile()
-              print("✅ Zerodha profile OK:", prof.get("user_id"), prof.get("user_name"))
+              p = kite.profile()
+              print("✅ Preflight OK | User:", p.get("user_id"), p.get("user_name"))
           except Exception as e:
               print("❌ Zerodha preflight failed:", e)
               sys.exit(3)
           PY
 
-      # 3) Run your intraday script (make sure filename matches your repo)
+      # --- Run intraday options runner (paper). Make sure this filename MATCHES your repo ---
       - name: Run intraday options (paper)
         run: |
           python runner_intraday_options.py --out_dir "./reports"
