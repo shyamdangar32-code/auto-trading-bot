@@ -1,19 +1,17 @@
 name: intraday-options-paper
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
 
-    # Job-level env (available to all steps)
+    # <-- Map GitHub Secrets into the job environment
     env:
-      ZERODHA_API_KEY: ${{ secrets.ZERODHA_API_KEY }}
-      ZERODHA_API_SECRET: ${{ secrets.ZERODHA_API_SECRET }}
-      ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      ZERODHA_API_KEY:     ${{ secrets.ZERODHA_API_KEY }}
+      ZERODHA_API_SECRET:  ${{ secrets.ZERODHA_API_SECRET }}
+      ZERODHA_ACCESS_TOKEN:${{ secrets.ZERODHA_ACCESS_TOKEN }}
 
     steps:
       - name: Checkout
@@ -22,7 +20,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Cache pip
         uses: actions/cache@v4
@@ -34,51 +32,50 @@ jobs:
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+            python -m pip install --upgrade pip
+            pip install -r requirements.txt
 
-      - name: Put envs into config.yaml at runtime if fields are blank
+      # ---- DEBUG: check that envs actually exist (prints only LENGTHS) ----
+      - name: Debug secrets lengths
         run: |
-          python - <<'PY'
-          import os, yaml
-          with open("config.yaml","r") as f:
-              cfg = yaml.safe_load(f)
-          # backfill Telegram if missing
-          if not cfg.get("intraday_options"): cfg["intraday_options"] = {}
-          if not cfg["intraday_options"].get("telegram_bot_token"):
-              cfg["intraday_options"]["telegram_bot_token"] = os.getenv("TELEGRAM_BOT_TOKEN","")
-          if not cfg["intraday_options"].get("telegram_chat_id"):
-              cfg["intraday_options"]["telegram_chat_id"] = os.getenv("TELEGRAM_CHAT_ID","")
-          with open("config.yaml","w") as f:
-              yaml.safe_dump(cfg, f, sort_keys=False)
-          PY
+          echo "API_KEY length:     ${#ZERODHA_API_KEY}"
+          echo "API_SECRET length:  ${#ZERODHA_API_SECRET}"
+          echo "ACCESS_TOKEN length:${#ZERODHA_ACCESS_TOKEN}"
 
-      - name: Fingerprint envs (safe)
-        run: |
-          python - <<'PY'
-          import os
-          def fp(x): 
-              x=(x or "").strip()
-              return f"{x[:4]}... (len={len(x)})" if x else "MISSING"
-          print("API_KEY      :", fp(os.getenv("ZERODHA_API_KEY")))
-          print("ACCESS_TOKEN :", fp(os.getenv("ZERODHA_ACCESS_TOKEN")))
-          PY
-
+      # ---- Python preflight: verify the credentials BEFORE main runner ----
       - name: Preflight Zerodha credentials
         run: |
-          python verify_kite.py
+          python - <<'PY'
+          import os, sys
+          from kiteconnect import KiteConnect
 
+          api_key = (os.getenv("ZERODHA_API_KEY") or "").strip()
+          api_secret = (os.getenv("ZERODHA_API_SECRET") or "").strip()
+          access = (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
+
+          print("API len:", len(api_key), "| TOKEN len:", len(access))
+          if len(api_key) < 6 or len(access) < 10:
+              print("❌ Secrets missing or empty in job env.")
+              sys.exit(2)
+
+          kite = KiteConnect(api_key=api_key)
+          kite.set_access_token(access)
+          try:
+              prof = kite.profile()
+              print("✅ Zerodha profile OK:", prof.get("user_id"), prof.get("user_name"))
+          except Exception as e:
+              print("❌ Zerodha preflight failed:", e)
+              sys.exit(3)
+          PY
+
+      # ---- Run your intraday options runner (paper)----
       - name: Run intraday options (paper)
-        # add env here TOO, to be absolutely sure
-        env:
-          ZERODHA_API_KEY: ${{ secrets.ZERODHA_API_KEY }}
-          ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
         run: |
-          python runner_intraday_options.py --out_dir "./reports"
+          python runner_intra_day_options.py --out_dir "./reports"
 
       - name: Upload reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: reports
-          path: reports/**
+          path: reports/
