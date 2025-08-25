@@ -7,11 +7,10 @@ jobs:
   run:
     runs-on: ubuntu-latest
 
-    # Expose secrets to every step in this job
     env:
-      ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
-      ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
-      ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+      ZERODHA_API_KEY:     ${{ secrets.ZERODHA_API_KEY }}
+      ZERODHA_API_SECRET:  ${{ secrets.ZERODHA_API_SECRET }}
+      ZERODHA_ACCESS_TOKEN:${{ secrets.ZERODHA_ACCESS_TOKEN }}
 
     steps:
       - name: Checkout
@@ -35,39 +34,40 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # --- quick sanity: only lengths (keeps secrets masked) ---
+      # ---- Debug secrets lengths (safe: only prints LENGTHS) ----
       - name: Debug secrets lengths
         run: |
-          echo "API_KEY length:      ${#ZERODHA_API_KEY}"
-          echo "API_SECRET length:   ${#ZERODHA_API_SECRET}"
-          echo "ACCESS_TOKEN length: ${#ZERODHA_ACCESS_TOKEN}"
+          echo "API_KEY length:     ${#ZERODHA_API_KEY}"
+          echo "API_SECRET length:  ${#ZERODHA_API_SECRET}"
+          echo "ACCESS_TOKEN length:${#ZERODHA_ACCESS_TOKEN}"
 
-      # --- the SAME preflight you just ran in kite-diagnostics ---
+      # ---- Preflight Zerodha profile (fail early if creds are bad) ----
       - name: Preflight Zerodha profile (must pass)
         run: |
           python - <<'PY'
           import os, sys
           from kiteconnect import KiteConnect
 
-          api_key  = (os.getenv("ZERODHA_API_KEY") or "").strip()
-          access   = (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
-          print("API len:", len(api_key), "| TOKEN len:", len(access))
+          api_key = os.getenv("ZERODHA_API_KEY", "").strip()
+          access  = os.getenv("ZERODHA_ACCESS_TOKEN", "").strip()
+
+          print("API Key length:", len(api_key))
+          print("Access Token length:", len(access))
 
           kite = KiteConnect(api_key=api_key)
           kite.set_access_token(access)
-
           try:
               prof = kite.profile()
-              print("✅ Preflight OK ->", prof.get("user_id"), "|", prof.get("user_name"))
+              print("✅ Zerodha profile OK:", prof.get("user_id"), prof.get("user_name"))
           except Exception as e:
-              print("❌ Preflight FAILED:", e)
+              print("❌ Zerodha profile failed:", e)
               sys.exit(3)
           PY
 
-      # --- run the intraday options paper strategy ---
+      # ---- Run your intraday options runner ----
       - name: Run intraday options (paper)
         run: |
-          python runner_intra_day_options.py --out_dir "./reports"
+          python runner_intraday_options.py --out_dir "./reports"
 
       - name: Upload reports
         if: always()
