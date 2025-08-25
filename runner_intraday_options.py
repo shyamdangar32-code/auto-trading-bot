@@ -16,17 +16,25 @@ from kiteconnect import KiteConnect
 IST = timezone(timedelta(hours=5, minutes=30))
 
 def ensure_date(x):
-    """Return a date object. If x is datetime, convert; if it's already date, return as-is."""
     return x.date() if isinstance(x, datetime) else x
 
 def ist_now():
     return datetime.now(IST)
 
+def is_weekend(d: date) -> bool:
+    return d.weekday() >= 5  # Sat=5, Sun=6
+
+def prev_trading_day(d: date) -> date:
+    # simple weekend skip; (holiday handling would need an external list)
+    dd = d - timedelta(days=1)
+    while is_weekend(dd):
+        dd -= timedelta(days=1)
+    return dd
+
 def round_to_strike(spot: float, base: int) -> int:
     return int(round(spot / base) * base)
 
 def send_telegram(text: str, token: str, chat_id: str):
-    """Fire-and-forget telegram message (no crash if it fails)."""
     try:
         import requests
         requests.get(
@@ -34,8 +42,7 @@ def send_telegram(text: str, token: str, chat_id: str):
             params={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
             timeout=8,
         )
-    except Exception as _e:
-        # quiet: keep the run green
+    except Exception:
         pass
 
 # ---------------- Zerodha helpers ----------------
@@ -48,7 +55,6 @@ def get_kite_from_env() -> KiteConnect:
 
     kite = KiteConnect(api_key=api_key)
     kite.set_access_token(access)
-    # sanity
     kite.profile()
     print("✅ Zerodha token OK.")
     return kite
@@ -69,20 +75,13 @@ STRIKE_STEP = {
 }
 
 def nfo_instruments(kite):
-    # cache heavy call
     return kite.instruments("NFO")
 
 def this_week_expiry(dt: datetime) -> date:
-    """
-    Weekly index options expire on Thursday.
-    If today is Thu before close, use today; else next Thu.
-    """
     d = dt.date()
-    weekday = d.weekday()  # Mon=0 ... Sun=6
-    # Thursday = 3
+    weekday = d.weekday()  # Mon=0 ... Thu=3
     days_ahead = (3 - weekday) % 7
     expiry = d + timedelta(days=days_ahead)
-    # If already past market close (15:30 IST) and it is Thursday, push to next Thursday
     if weekday == 3 and dt.time() > time(15, 30):
         expiry = expiry + timedelta(days=7)
     return expiry
@@ -112,48 +111,64 @@ def map_interval(iv: str) -> str:
         "15m": "15minute",
     }.get(iv, "5minute")
 
-def fetch_today_ohlc(kite, token: int, interval: str) -> pd.DataFrame:
-    today = ist_now().date()
-    start_dt = datetime.combine(today, time(9, 15), tzinfo=IST)
-    end_dt   = datetime.combine(today, time(15, 30), tzinfo=IST)
-
+def fetch_session_ohlc(kite, token: int, for_day: date, interval_alias: str) -> pd.DataFrame:
+    start_dt = datetime.combine(for_day, time(9, 15), tzinfo=IST)
+    end_dt   = datetime.combine(for_day, time(15, 30), tzinfo=IST)
     candles = kite.historical_data(
         instrument_token=int(token),
         from_date=start_dt,
         to_date=end_dt,
-        interval=map_interval(interval),
+        interval=map_interval(interval_alias),
     )
-    if not candles:
-        raise RuntimeError("No candles returned")
-    df = pd.DataFrame(candles)
+    df = pd.DataFrame(candles or [])
+    if df.empty:
+        return df
     df.rename(columns={"date":"Date","open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"}, inplace=True)
     df["Date"] = pd.to_datetime(df["Date"])
     return df
 
+def fetch_best_ohlc(kite, token: int, interval_alias: str, prefer_day: date | None) -> tuple[pd.DataFrame, date]:
+    """
+    1) If prefer_day given, try it.
+    2) Else try today.
+    3) If empty, fallback to previous trading day.
+    Returns (df, the_day_used)
+    """
+    if prefer_day:
+        d = prefer_day
+        df = fetch_session_ohlc(kite, token, d, interval_alias)
+        if not df.empty:
+            return df, d
+        # if user asked a holiday/non-trading day, fallback one step
+        d2 = prev_trading_day(d)
+        df2 = fetch_session_ohlc(kite, token, d2, interval_alias)
+        if not df2.empty:
+            return df2, d2
+        raise RuntimeError(f"No candles for {d} or previous trading day {d2}")
+
+    # Auto mode
+    today = ist_now().date()
+    df = fetch_session_ohlc(kite, token, today, interval_alias)
+    if not df.empty:
+        return df, today
+    d2 = prev_trading_day(today)
+    df2 = fetch_session_ohlc(kite, token, d2, interval_alias)
+    if not df2.empty:
+        return df2, d2
+    raise RuntimeError("No candles returned for today or previous trading day")
+
 # ---------------- Strategy: ATM Short Straddle ----------------
 
 def make_signal_log(entry_px_ce, entry_px_pe, sl_pct, tgt_pct, lots, lot_size, trail_cfg):
-    # compute SL/Target per leg
-    ce_sl = round(entry_px_ce * (1 + sl_pct/100.0), 2)  # SL for short is price going up
+    ce_sl = round(entry_px_ce * (1 + sl_pct/100.0), 2)
     pe_sl = round(entry_px_pe * (1 + sl_pct/100.0), 2)
-    target_drop = tgt_pct/100.0 if tgt_pct and tgt_pct > 0 else None
-
     pos_value = lots * lot_size
-    note = {
-        "entry": {
-            "CE": entry_px_ce,
-            "PE": entry_px_pe,
-            "qty_per_leg": pos_value,
-        },
-        "risk": {
-            "sl_percent_per_leg": sl_pct,
-            "ce_sl": ce_sl,
-            "pe_sl": pe_sl,
-            "combined_target_percent": tgt_pct,
-        },
+    return {
+        "entry": {"CE": entry_px_ce, "PE": entry_px_pe, "qty_per_leg": pos_value},
+        "risk":  {"sl_percent_per_leg": sl_pct, "ce_sl": ce_sl, "pe_sl": pe_sl,
+                  "combined_target_percent": tgt_pct},
         "trailing": trail_cfg,
     }
-    return note
 
 # ---------------- Config ----------------
 
@@ -174,42 +189,44 @@ def main():
 
     kite = get_kite_from_env()
 
-    # Spot
-    index_token = INDEX_TOKENS.get(iocfg.underlying)
-    if not index_token:
-        raise RuntimeError(f"Unsupported underlying {iocfg.underlying}")
-    spot = kite.ltp([f"NSE:{'NIFTY 50' if iocfg.underlying=='NIFTY' else 'NIFTY BANK'}"])
-    # pull last price from dict
-    try:
-        spot_val = list(spot.values())[0]["last_price"]
-    except Exception:
-        # fallback using quote for index token
-        spot_val = kite.quote(f"NSE:{'NIFTY 50' if iocfg.underlying=='NIFTY' else 'NIFTY BANK'}")[f"NSE:{'NIFTY 50' if iocfg.underlying=='NIFTY' else 'NIFTY BANK'}"]["last_price"]
-
+    # Spot & ATM
+    index_label = 'NIFTY 50' if iocfg.underlying == 'NIFTY' else 'NIFTY BANK'
+    spot_info = kite.ltp([f"NSE:{index_label}"])
+    spot_val = list(spot_info.values())[0]["last_price"]
     atm = round_to_strike(spot_val, STRIKE_STEP[iocfg.underlying])
     print(f"ℹ️  {iocfg.underlying} spot {spot_val:.1f} → ATM {atm}")
 
-    # Expiry (weekly)
+    # Weekly expiry
     expiry = ensure_date(this_week_expiry(ist_now()))
     print(f"ℹ️  Weekly expiry → {expiry:%Y-%m-%d}")
 
-    # CE/PE tokens
+    # Tokens
     instr = nfo_instruments(kite)
     ce_token, pe_token, ce_sym, pe_sym = find_tokens_for_strike(instr, iocfg.underlying, expiry, atm)
     print(f"✅ Using expiry {expiry:%Y-%m-%d} | CE token: {ce_token} | PE token: {pe_token}")
-
     print("______________________________________________")
 
-    # Pull today's OHLC (5m default)
+    # Which day to fetch?
+    prefer_day = None
+    if getattr(iocfg, "date", ""):
+        try:
+            prefer_day = datetime.strptime(iocfg.date.strip(), "%Y-%m-%d").date()
+        except Exception:
+            raise RuntimeError(f"Invalid intraday_options.date '{iocfg.date}', use YYYY-MM-DD")
+
+    # OHLC (robust)
     ival = iocfg.interval if hasattr(iocfg, "interval") else "5minute"
-    ce_df = fetch_today_ohlc(kite, ce_token, ival)
-    pe_df = fetch_today_ohlc(kite, pe_token, ival)
+    ce_df, used_day = fetch_best_ohlc(kite, ce_token, ival, prefer_day)
+    pe_df, _       = fetch_best_ohlc(kite, pe_token, ival, prefer_day)
+    print(f"📅 Using session: {used_day}")
 
-    # Determine entry bar (first bar >= entry_time)
+    # Entry bar at/after entry_time
     entry_h, entry_m = map(int, iocfg.entry_time.split(":"))
-    ce_bar = ce_df[ce_df["Date"].dt.tz_convert(IST).dt.time >= time(entry_h, entry_m)].head(1)
-    pe_bar = pe_df[pe_df["Date"].dt.tz_convert(IST).dt.time >= time(entry_h, entry_m)].head(1)
+    def first_bar_at(df: pd.DataFrame):
+        return df[df["Date"].dt.tz_convert(IST).dt.time >= time(entry_h, entry_m)].head(1)
 
+    ce_bar = first_bar_at(ce_df)
+    pe_bar = first_bar_at(pe_df)
     if ce_bar.empty or pe_bar.empty:
         raise RuntimeError("No entry bar found at/after entry_time")
 
@@ -231,19 +248,19 @@ def main():
 
     log_note = make_signal_log(ce_entry, pe_entry, sl_pct, tgt_pct, lots, lot_size, trail_cfg)
 
-    # Print real plan
+    # Plan print
     print(f"🧾 {ce_sym} | rows: {len(ce_df)} | Close: {ce_entry}")
     print(f"🧾 {pe_sym} | rows: {len(pe_df)} | Close: {pe_entry}")
     print(f"📌 Entry {iocfg.entry_time} | Short Straddle {atm} | Lots: {lots} (lot_size {lot_size})")
     print(f"🛡️  SL per leg: {sl_pct}% | 🎯 Combined target: {tgt_pct}% | 🧵 Trailing: {trail_cfg}")
 
-    # Telegram alert (if configured)
+    # Telegram
     t_token = getattr(iocfg, "telegram_bot_token", "") or os.getenv("TELEGRAM_BOT_TOKEN", "")
     t_chat  = getattr(iocfg, "telegram_chat_id", "") or os.getenv("TELEGRAM_CHAT_ID", "")
     if t_token and t_chat:
         msg = (
             f"🔔 <b>ATM Short Straddle</b>\n"
-            f"• <b>{iocfg.underlying}</b> {atm} | Entry {iocfg.entry_time} IST\n"
+            f"• <b>{iocfg.underlying}</b> {atm} | {used_day} | Entry {iocfg.entry_time} IST\n"
             f"• CE {ce_sym}: {ce_entry}\n"
             f"• PE {pe_sym}: {pe_entry}\n"
             f"• SL/leg: {sl_pct}% | Target: {tgt_pct}%\n"
@@ -251,10 +268,11 @@ def main():
         )
         send_telegram(msg, t_token, t_chat)
 
-    # Write report JSON
+    # Report
     os.makedirs(args.out_dir, exist_ok=True)
     out = {
         "ts": ist_now().isoformat(),
+        "session_date": f"{used_day:%Y-%m-%d}",
         "underlying": iocfg.underlying,
         "atm_strike": atm,
         "expiry": f"{expiry:%Y-%m-%d}",
