@@ -1,247 +1,169 @@
 # runner_intraday_options.py
-# Paper intraday options preview using the SAME validated Zerodha client
-# used in bot/data_io._get_kite().
-
-from __future__ import annotations
+# Intraday options (paper) – robust expiry + token finding
 
 import os
-import sys
-import json
-import math
-import argparse
-from datetime import datetime, timedelta, date
-from pathlib import Path
-from typing import Dict, List, Tuple
+from datetime import datetime, date, timedelta, time as dt_time
+from typing import Tuple, Optional
 
 import pandas as pd
+from kiteconnect import KiteConnect
 
-# --------- use the exact same validated client as diagnostics ----------
-# This reads ZERODHA_API_KEY + ZERODHA_ACCESS_TOKEN from env and calls profile()
-from bot.data_io import _get_kite as _kite_ok
+# ---------- Config (reads from config.yaml via env-injection in workflow) ----------
+OUT_DIR = os.getenv("OUT_DIR", "reports")
+UNDERLYING = os.getenv("INTRA_UNDERLYING", "BANKNIFTY").upper()   # "BANKNIFTY" | "NIFTY"
+INTERVAL   = os.getenv("INTRA_INTERVAL",  "5minute")
 
+# strike step & lot size hints (just for logs)
+STRIKE_STEP = 100 if UNDERLYING == "BANKNIFTY" else 50
 
-def get_kite():
-    """Return a ready-to-use KiteConnect client (validated)."""
-    kite = _kite_ok()  # prints "✅ Zerodha token OK." if fine, raises otherwise
+# ---------- Zerodha helpers ----------
+def get_kite() -> KiteConnect:
+    api_key = (os.getenv("ZERODHA_API_KEY") or "").strip()
+    access  = (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
+    if not api_key or not access:
+        raise RuntimeError("Missing ZERODHA_API_KEY or ZERODHA_ACCESS_TOKEN in env.")
+
+    kite = KiteConnect(api_key=api_key)
+    kite.set_access_token(access)
+    # Sanity check
+    kite.profile()
+    print("✅ Zerodha token OK.")
     return kite
 
+def next_thursday(d: date) -> date:
+    # Monday=0 ... Thursday=3 ... Sunday=6
+    target_wd = 3
+    days = (target_wd - d.weekday()) % 7
+    if days == 0:
+        # If it's already Thursday, keep the same day (weekly expiry is today)
+        return d
+    return d + timedelta(days=days)
 
-# ----------------------------- helpers --------------------------------
-IST = "Asia/Kolkata"
+def round_to_step(x: float, step: int) -> int:
+    return int(round(x / step) * step)
 
-
-def _today_ist() -> date:
-    # runner executes in UTC; we just use 'today' for simplicity
-    # (for precise IST, use pytz/zoneinfo if you like)
-    return datetime.utcnow().date()
-
-
-def _next_weekday(d: date, weekday: int) -> date:
+def option_tokens_for_atm(
+    inst_df: pd.DataFrame, underlying: str, expiry: date, atm: int
+) -> Tuple[Optional[int], Optional[int]]:
     """
-    Return the next date with the given weekday (Mon=0..Sun=6).
-    If d itself is that weekday, return d.
+    Try to find CE & PE instrument_token for a given UNDERLYING / expiry / ATM strike.
+    If not found on exact expiry, tries expiry±1 day.
+    Returns (ce_token, pe_token) or (None, None).
     """
-    days_ahead = (weekday - d.weekday()) % 7
-    return d + timedelta(days=days_ahead)
 
+    def _filter_for_exp(dt_exp: date) -> pd.DataFrame:
+        f = inst_df[
+            (inst_df["segment"] == "NFO-OPT")
+            & (inst_df["name"].str.upper() == underlying)
+            & (pd.to_datetime(inst_df["expiry"]).dt.date == dt_exp)
+            & (inst_df["strike"] == float(atm))
+        ]
+        return f
 
-def banknifty_weekly_expiry(base: date | None = None) -> date:
-    """
-    BANKNIFTY weekly expiry is currently WEDNESDAY.
-    (If this changes later, update the weekday below.)
-    """
-    base = base or _today_ist()
-    return _next_weekday(base, 2)  # 2 = Wednesday
+    # 1) Exact expiry
+    e0 = _filter_for_exp(expiry)
+    print(f"🔎 Instruments @ {expiry}: {len(e0)} rows for strike {atm}")
 
+    # 2) Fallbacks: expiry - 1 day, expiry + 1 day
+    e_minus = _filter_for_exp(expiry - timedelta(days=1)) if e0.empty else pd.DataFrame()
+    if e0.empty:
+        print(f"   …fallback {expiry - timedelta(days=1)}: {len(e_minus)} rows")
+    e_plus  = _filter_for_exp(expiry + timedelta(days=1)) if e0.empty and e_minus.empty else pd.DataFrame()
+    if e0.empty and e_minus.empty:
+        print(f"   …fallback {expiry + timedelta(days=1)}: {len(e_plus)} rows")
 
-def round_to_nearest_strike(spot: float, step: int) -> int:
-    return int(round(spot / step) * step)
+    pool = e0
+    chosen_exp = expiry
+    if pool.empty and not e_minus.empty:
+        pool = e_minus
+        chosen_exp = expiry - timedelta(days=1)
+    if pool.empty and not e_plus.empty:
+        pool = e_plus
+        chosen_exp = expiry + timedelta(days=1)
 
+    if pool.empty:
+        return None, None
 
-def instruments_df(kite) -> pd.DataFrame:
-    ins = kite.instruments("NFO")
-    df = pd.DataFrame(ins)
-    # keep common fields
-    keep = [
-        "instrument_token",
-        "tradingsymbol",
-        "name",
-        "segment",
-        "exchange",
-        "instrument_type",
-        "strike",
-        "expiry",
-        "lot_size",
-        "tick_size",
-    ]
-    df = df[keep]
-    if not pd.api.types.is_datetime64_any_dtype(df["expiry"]):
-        df["expiry"] = pd.to_datetime(df["expiry"]).dt.date
-    return df
+    ce = pool.loc[pool["instrument_type"] == "CE", "instrument_token"]
+    pe = pool.loc[pool["instrument_type"] == "PE", "instrument_token"]
 
+    ce_token = int(ce.iloc[0]) if not ce.empty else None
+    pe_token = int(pe.iloc[0]) if not pe.empty else None
 
-def find_option_tokens_for_banknifty(
-    kite, expiry: date, atm: int
-) -> Tuple[int, int, pd.DataFrame]:
-    """
-    Return (ce_token, pe_token, nfo_df_filtered)
-    """
-    df = instruments_df(kite)
-    f = df[
-        (df["name"] == "BANKNIFTY")
-        & (df["segment"] == "NFO-OPT")
-        & (df["expiry"] == expiry)
-        & (df["strike"].astype(int).isin([atm]))
-    ]
-    ce_row = f[(f["instrument_type"] == "CE")].head(1)
-    pe_row = f[(f["instrument_type"] == "PE")].head(1)
-
-    if ce_row.empty or pe_row.empty:
-        raise RuntimeError(
-            f"Could not find CE/PE tokens for BANKNIFTY {expiry} @ {atm}"
-        )
-
-    ce_token = int(ce_row["instrument_token"].iloc[0])
-    pe_token = int(pe_row["instrument_token"].iloc[0])
-    return ce_token, pe_token, f
-
-
-def banknifty_spot(kite) -> float:
-    # index symbol for LTP in KiteConnect:
-    # "NSE:NIFTY BANK" (a.k.a. BANKNIFTY)
-    quote = kite.ltp(["NSE:NIFTY BANK"])
-    return float(quote["NSE:NIFTY BANK"]["last_price"])
-
-
-def hist_ohlc(kite, instrument_token: int, frm: datetime, to: datetime, interval="5minute") -> pd.DataFrame:
-    candles = kite.historical_data(
-        instrument_token=instrument_token,
-        from_date=frm,
-        to_date=to,
-        interval=interval,
-    )
-    if not candles:
-        return pd.DataFrame(columns=["Date", "Open", "High", "Low", "Close", "Volume"])
-
-    df = pd.DataFrame(candles)
-    df.rename(
-        columns={
-            "date": "Date",
-            "open": "Open",
-            "high": "High",
-            "low": "Low",
-            "close": "Close",
-            "volume": "Volume",
-        },
-        inplace=True,
-    )
-    df["Date"] = pd.to_datetime(df["Date"])
-    return df
-
-
-def ensure_dir(p: Path):
-    p.mkdir(parents=True, exist_ok=True)
-
-
-# ------------------------------ main ----------------------------------
+    print(f"✅ Using expiry {chosen_exp} | CE token: {ce_token} | PE token: {pe_token}")
+    return ce_token, pe_token
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out_dir", default="./reports")
-    ap.add_argument("--interval", default="5minute")
-    ap.add_argument("--lots", type=int, default=1)
-    ap.add_argument("--underlying", default="BANKNIFTY")
-    args = ap.parse_args()
-
-    out_dir = Path(args.out_dir)
-    ensure_dir(out_dir)
-
+    os.makedirs(OUT_DIR, exist_ok=True)
     kite = get_kite()
 
-    # 1) Spot & expiry
-    spot = banknifty_spot(kite)
-    expiry = banknifty_weekly_expiry()
-    step = 100  # BANKNIFTY strike step
-    atm = round_to_nearest_strike(spot, step)
+    # 1) Get spot to compute ATM
+    # BANKNIFTY index token for LTP is available via quote for 'NSE:NIFTY BANK' alias in some libs,
+    # but using instrument token is simpler through the instruments file.
+    # We’ll use LTP via kite.ltp for index tradingsymbols supported by Kite.
+    # For BANKNIFTY/NIFTY, Kite supports "NSE:NIFTY BANK" and "NSE:NIFTY 50".
+    spot_tradingsymbol = "NSE:NIFTY BANK" if UNDERLYING == "BANKNIFTY" else "NSE:NIFTY 50"
+    spot_ltp = kite.ltp([spot_tradingsymbol])[spot_tradingsymbol]["last_price"]
+    atm = round_to_step(spot_ltp, STRIKE_STEP)
 
-    print(f"ℹ️  {args.underlying} spot {spot:.1f} → ATM {atm}")
-    print(f"ℹ️  Weekly expiry → {expiry}")
+    # 2) Compute intended weekly expiry (Thursday)
+    today = datetime.now().date()
+    exp = next_thursday(today)
 
-    # 2) Find ATM CE/PE tokens
-    ce_token, pe_token, df_filtered = find_option_tokens_for_banknifty(kite, expiry, atm)
-    print(f"ℹ️  CE BANKNIFTY token={ce_token}")
-    print(f"ℹ️  PE BANKNIFTY token={pe_token}")
+    print(f"ℹ️  {UNDERLYING} spot {spot_ltp:.1f} → ATM {atm}")
+    print(f"ℹ️  Weekly expiry → {exp}")
 
-    # 3) Pull today 5-min bars (09:15–15:30 IST roughly → take UTC day span)
-    now = datetime.utcnow()
-    start = now - timedelta(days=1)  # safe window
-    ce_df = hist_ohlc(kite, ce_token, start, now, args.interval)
-    pe_df = hist_ohlc(kite, pe_token, start, now, args.interval)
-    print(f"ℹ️  Zerodha CE rows: {len(ce_df)} | PE rows: {len(pe_df)}")
+    # 3) Pull NFO instruments and hunt for tokens
+    inst = pd.DataFrame(kite.instruments("NFO"))
+    # Keep only needed columns to speed up ops
+    keep = ["instrument_token", "tradingsymbol", "name", "segment", "expiry", "strike", "instrument_type"]
+    inst = inst[keep].copy()
+    inst["name"] = inst["name"].astype(str).str.upper()
 
-    # 4) Tiny indicators (MA20 on Close) just for preview
-    for d in (ce_df, pe_df):
-        if not d.empty:
-            d["MA20"] = d["Close"].rolling(20).mean()
+    ce_token, pe_token = option_tokens_for_atm(inst, UNDERLYING, exp, atm)
+    if not ce_token or not pe_token:
+        raise RuntimeError(f"Could not find CE/PE tokens for {UNDERLYING} {exp} @ {atm}")
 
-    def last_row_txt(label, d: pd.DataFrame) -> str:
-        if d.empty:
-            return f"{label} | nan"
-        last = d.iloc[-1]
-        ma = float(last.get("MA20", float("nan")))
-        direction = "UP" if last["Close"] >= ma else "DOWN"
-        return f"{label} | {last['Date']} | Close: {last['Close']:.2f} | MA20: {ma:.2f} | {direction}"
+    # 4) Pull a small OHLC preview to emulate your previous “signals preview” output
+    def hist_df(token: int) -> pd.DataFrame:
+        # 3 days of 5-min candles is enough for a preview here
+        frm = datetime.now() - timedelta(days=3)
+        candles = kite.historical_data(
+            instrument_token=token,
+            from_date=frm,
+            to_date=datetime.now(),
+            interval="5minute",
+        )
+        df = pd.DataFrame(candles)
+        if df.empty:
+            return df
+        df.rename(columns={"date": "Date", "open": "Open", "high": "High",
+                           "low": "Low", "close": "Close", "volume": "Volume"}, inplace=True)
+        df["Date"] = pd.to_datetime(df["Date"])
+        return df
 
-    print("—" * 20)
-    print("📈", last_row_txt("BANKNIFTY CE", ce_df))
-    print("📉", last_row_txt("BANKNIFTY PE", pe_df))
-    print("📝 Paper bias (demo):", "PE_BIAS" if not pe_df.empty else "UNKNOWN")
+    ce_df = hist_df(ce_token)
+    pe_df = hist_df(pe_token)
+    print("—" * 42)
+    print(f"📈 {UNDERLYING}{exp:%d%b}{atm:05d}CE | rows: {len(ce_df)} | Close: {ce_df['Close'].iloc[-1] if not ce_df.empty else 'nan'}")
+    print(f"📉 {UNDERLYING}{exp:%d%b}{atm:05d}PE | rows: {len(pe_df)} | Close: {pe_df['Close'].iloc[-1] if not pe_df.empty else 'nan'}")
+
+    # 5) Minimal paper-run banner (no live orders here)
+    print("🧪 Paper bias (demo): PE_BIAS" if (not pe_df.empty and not ce_df.empty and pe_df['Close'].iloc[-1] > ce_df['Close'].iloc[-1]) else "🧪 Paper bias (demo): CE_BIAS")
     print("ℹ️  No trades placed. This runner is for data sanity + signals preview.")
 
-    # 5) Write reports
-    # latest.json
-    summary = {
-        "timestamp_utc": datetime.utcnow().isoformat(),
-        "underlying": args.underlying,
-        "spot": spot,
+    # 6) Write a tiny report so the artifact always exists
+    rpt = {
+        "underlying": UNDERLYING,
+        "spot": spot_ltp,
         "atm": atm,
-        "expiry": str(expiry),
-        "interval": args.interval,
+        "expiry": exp.isoformat(),
         "ce_token": ce_token,
         "pe_token": pe_token,
-        "rows": {"ce": int(len(ce_df)), "pe": int(len(pe_df))},
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
     }
-    (out_dir / "latest.json").write_text(json.dumps(summary, indent=2))
-
-    # latest_signals.csv (very small preview)
-    rows = []
-    if not ce_df.empty:
-        last = ce_df.iloc[-1]
-        rows.append(
-            {
-                "symbol": f"BANKNIFTY{expiry:%d%b%y}".upper() + f"{atm}CE",
-                "close": last["Close"],
-                "ma20": last.get("MA20", float("nan")),
-                "dir": "UP" if last["Close"] >= last.get("MA20", last["Close"]) else "DOWN",
-            }
-        )
-    if not pe_df.empty:
-        last = pe_df.iloc[-1]
-        rows.append(
-            {
-                "symbol": f"BANKNIFTY{expiry:%d%b%y}".upper() + f"{atm}PE",
-                "close": last["Close"],
-                "ma20": last.get("MA20", float("nan")),
-                "dir": "UP" if last["Close"] >= last.get("MA20", last["Close"]) else "DOWN",
-            }
-        )
-    pd.DataFrame(rows).to_csv(out_dir / "latest_signals.csv", index=False)
-
+    pd.Series(rpt).to_json(os.path.join(OUT_DIR, "latest.json"), indent=2)
+    print(f"🗂  Wrote {os.path.join(OUT_DIR, 'latest.json')}")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        # make failures obvious in Actions log
-        print("❌ Runner failed:", repr(e))
-        sys.exit(1)
+    main()
