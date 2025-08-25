@@ -1,0 +1,48 @@
+name: kite-diag
+on: { workflow_dispatch: {} }
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      ZERODHA_API_KEY:     ${{ secrets.ZERODHA_API_KEY }}
+      ZERODHA_ACCESS_TOKEN:${{ secrets.ZERODHA_ACCESS_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: python -m pip install --upgrade pip && pip install kiteconnect==5.0.1
+
+      - name: Verify profile + LTP (no repo code used)
+        run: |
+          python - <<'PY'
+          import os, hashlib, sys
+          from kiteconnect import KiteConnect
+
+          api_key = (os.getenv("ZERODHA_API_KEY") or "").strip()
+          token   = (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
+
+          def fp(s): 
+              import hashlib
+              return hashlib.sha1(s.encode()).hexdigest()[:10]
+
+          print("API len/hash:", len(api_key), fp(api_key))
+          print("TOK len/hash:", len(token),   fp(token))
+          if not api_key or not token:
+              print("❌ Missing envs"); sys.exit(2)
+
+          kite = KiteConnect(api_key=api_key)
+          kite.set_access_token(token)
+
+          try:
+              p = kite.profile()
+              print("✅ Profile OK:", p.get("user_id"), p.get("user_name"))
+          except Exception as e:
+              print("❌ Profile failed:", e); sys.exit(3)
+
+          try:
+              ltp = kite.ltp(["NSE:NIFTY BANK"])
+              print("✅ LTP OK:", ltp)
+          except Exception as e:
+              print("❌ LTP failed:", e); sys.exit(4)
+          PY
