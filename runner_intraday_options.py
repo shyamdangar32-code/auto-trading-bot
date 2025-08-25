@@ -1,361 +1,292 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-"""
-Intraday ATM short-straddle (paper) with REAL signals printed + optional Telegram alerts.
-- Uses Zerodha-only data (no Yahoo fallback)
-- CE+PE at-the-money selection for weekly expiry
-- Entry time, SL%, combined target%, ATR trailing, re-entries, cooldown, square-off
-- Logs all events; writes reports/latest.json
-
-Will NOT place any orders. (send_only_signals/paper/live flags remain unchanged)
-"""
+# runner_intraday_options.py
+# Intraday options (paper) — ATM short straddle with SL / target / ATR trailing
+# - Zerodha-only (expects ZERODHA_API_KEY + ZERODHA_ACCESS_TOKEN in env)
+# - Config is read from ./config.yaml
+# - Writes ./reports/latest.json and logs human-friendly lines
+# - Sends Telegram alerts if configured
 
 import os
 import json
 import math
-from dataclasses import dataclass, asdict
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, date, time, timedelta, timezone
 
+import pytz
 import pandas as pd
+import yaml
+from kiteconnect import KiteConnect
 
-from bot.config import load_config
-from bot.data_io import _get_kite  # already in your repo; validates token & returns KiteConnect
+# ----------------------- small helpers -----------------------
 
+def load_config(path: str = "config.yaml") -> dict:
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
 
-# ---------------------------- helpers ----------------------------
+def ist_now():
+    return datetime.now(pytz.timezone("Asia/Kolkata"))
 
-IST = timezone(timedelta(hours=5, minutes=30))
-
-def ist_today_str():
-    return datetime.now(IST).strftime("%Y-%m-%d")
-
-def to_ist(dt):
-    return dt.astimezone(IST) if dt.tzinfo else dt.replace(tzinfo=IST)
-
-def parse_hhmm(s: str) -> time:
-    hh, mm = s.strip().split(":")
-    return time(int(hh), int(mm), tzinfo=IST)
-
-def nearest_atm_strike(spot, step):
-    return int(round(spot / step) * step)
-
-def tr_atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    """True Range + ATR on OHLC."""
-    prev_close = df["Close"].shift(1)
-    ranges = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - prev_close).abs(),
-        (df["Low"] - prev_close).abs(),
-    ], axis=1)
-    tr = ranges.max(axis=1)
-    return tr.rolling(n, min_periods=1).mean()
-
-def send_telegram(text: str):
-    """
-    Sends a Telegram message if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID envs are present
-    or if the same are set in config.yaml under intraday_options.
-    """
-    import requests
-
-    # Prefer env (from secrets). If missing, try config fields.
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-    # Fallback to config.yaml if envs are empty
-    if not token or not chat_id:
-        cfg = load_config()
-        tcfg = cfg.get("intraday_options", {})
-        token = token or (tcfg.get("telegram_bot_token") or "").strip()
-        chat_id = chat_id or (tcfg.get("telegram_chat_id") or "").strip()
-
-    if not token or not chat_id:
-        return  # silently skip
-
+def send_telegram(bot_token: str, chat_id: str, text: str):
+    """Fire-and-forget Telegram message (silent if not configured)."""
+    if not bot_token or not chat_id:
+        return
     try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        import requests
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {"chat_id": chat_id, "text": text}
-        requests.post(url, json=payload, timeout=7)
-    except Exception:
-        # don't crash the run if Telegram has an issue
+        requests.post(url, json=payload, timeout=10)
+    except Exception as _:
+        # keep CI green even if telegram fails
         pass
 
+def get_kite_from_env() -> KiteConnect:
+    api_key = (os.getenv("ZERODHA_API_KEY") or "").strip()
+    access  = (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
+    if not api_key or not access:
+        raise RuntimeError("Missing ZERODHA_API_KEY / ZERODHA_ACCESS_TOKEN in env.")
+    kite = KiteConnect(api_key=api_key)
+    kite.set_access_token(access)
+    # quick sanity
+    kite.profile()
+    print("✅ Zerodha token OK.")
+    return kite
 
-# ---------------------------- strategy structs ----------------------------
+def next_weekly_expiry(d: date) -> date:
+    # India weekly index options expire on Thursday
+    # If today is Thursday and before close, use today; else next Thursday
+    weekday = d.weekday()  # Mon=0 ... Sun=6, Thu=3
+    days_ahead = (3 - weekday) % 7
+    if days_ahead == 0:
+        return d
+    return d + timedelta(days=days_ahead)
 
-@dataclass
-class Leg:
-    symbol: str
-    token: int
-    entry: float = math.nan
-    stop: float = math.nan
-    trail_active: bool = False
-    exit: float = math.nan
-    status: str = "PENDING"  # PENDING / ACTIVE / EXIT
+def floor_to_step(x: float, step: int) -> int:
+    return int(round(x / step) * step)
 
-@dataclass
-class TradeEvent:
-    ts: str
-    kind: str
-    msg: str
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    # df has columns: Open, High, Low, Close
+    high_low = df["High"] - df["Low"]
+    high_close = (df["High"] - df["Close"].shift()).abs()
+    low_close = (df["Low"] - df["Close"].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.rolling(period, min_periods=1).mean()
 
+# ----------------------- instrument discovery -----------------------
 
-# ---------------------------- core runner ----------------------------
+INDEX_TOKENS = {
+    "NIFTY": 256265,
+    "BANKNIFTY": 260105,
+}
+
+STRIKE_STEP = {
+    "NIFTY": 50,
+    "BANKNIFTY": 100,
+}
+
+def get_spot_ltp(kite: KiteConnect, underlying: str) -> float:
+    token = INDEX_TOKENS[underlying]
+    # ltp can accept numeric instrument tokens
+    data = kite.ltp([token])
+    # key is the same token converted to string
+    key = str(token)
+    return float(data[key]["last_price"])
+
+def find_weekly_tokens(kite: KiteConnect, underlying: str, expiry_dt: date, strike: int):
+    """Return (ce_token, pe_token) for the weekly options."""
+    nfo = kite.instruments("NFO")
+    ce_token = pe_token = None
+    for ins in nfo:
+        if ins.get("segment") != "NFO-OPT":
+            continue
+        if ins.get("name") != underlying:
+            continue
+        # match weekly expiry (no explicit monthly check; good enough for paper)
+        if pd.to_datetime(ins.get("expiry")).date() != expiry_dt:
+            continue
+        if int(ins.get("strike")) != int(strike):
+            continue
+        if ins.get("instrument_type") == "CE":
+            ce_token = ins.get("instrument_token")
+        elif ins.get("instrument_type") == "PE":
+            pe_token = ins.get("instrument_token")
+    if not ce_token or not pe_token:
+        raise RuntimeError(f"Could not find CE/PE tokens for {underlying} {expiry_dt} @ {strike}")
+    return int(ce_token), int(pe_token)
+
+def get_hist(kite: KiteConnect, token: int, from_dt: datetime, to_dt: datetime, interval: str):
+    candles = kite.historical_data(
+        instrument_token=token,
+        from_date=from_dt,
+        to_date=to_dt,
+        interval=interval,
+    )
+    if not candles:
+        return pd.DataFrame(columns=["Date","Open","High","Low","Close","Volume"])
+    df = pd.DataFrame(candles)
+    df.rename(columns={"date":"Date","open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"}, inplace=True)
+    df["Date"] = pd.to_datetime(df["Date"])
+    return df[["Date","Open","High","Low","Close","Volume"]]
+
+# ----------------------- main engine -----------------------
 
 def main():
-    cfg = load_config()
-    tz = cfg.get("tz", "Asia/Kolkata")
+    cfg = load_config("config.yaml")
 
-    icfg = cfg.get("intraday_options", {})
-    underlying = icfg.get("underlying", "BANKNIFTY").upper()
-    lots = int(icfg.get("lots", 1))
-    lot_size = int(icfg.get("lot_size", 15))
-    interval = icfg.get("interval", "5minute")
+    tz = pytz.timezone(cfg.get("tz", "Asia/Kolkata"))
+    io_cfg = cfg.get("intraday_options", {})
+    underlying = io_cfg.get("underlying", "BANKNIFTY").upper()
+    lots       = int(io_cfg.get("lots", 1))
+    lot_size   = int(io_cfg.get("lot_size", 15))
+    ival       = io_cfg.get("interval", "5minute")
+    entry_rule = io_cfg.get("entry_rule", "atm_short_straddle")
 
-    entry_t = parse_hhmm(icfg.get("entry_time", "09:30"))
-    squareoff_t = parse_hhmm(icfg.get("squareoff", "15:10"))
-    sim_date = (icfg.get("date") or "").strip() or ist_today_str()
+    entry_time_str = io_cfg.get("entry_time", "09:30")
+    squareoff_str  = io_cfg.get("squareoff", "15:10")
+    date_override  = (io_cfg.get("date") or "").strip()
 
-    # Risk & trailing
-    leg_sl_pct = float(icfg.get("leg_sl_percent", 30.0))
-    tgt_pct = float(icfg.get("combined_target_percent", 50.0))
-    trailing_enabled = bool(icfg.get("trailing_enabled", True))
-    trail_type = icfg.get("trail_type", "atr")
-    trail_start_atr = float(icfg.get("trail_start_atr", 1.0))
-    trail_atr_mult = float(icfg.get("trail_atr_mult", 1.5))
-    reentry_max = int(icfg.get("reentry_max", 0))
-    reentry_cooldown = int(icfg.get("reentry_cooldown", 2))
+    leg_sl_pct     = float(io_cfg.get("leg_sl_percent", 30.0))
+    comb_tgt_pct   = float(io_cfg.get("combined_target_percent", 50.0))
+    trail_on       = bool(io_cfg.get("trail", False) or io_cfg.get("trailing_enabled", False))
+    trail_start_atr= float(io_cfg.get("trail_start_atr", 1.0))
+    trail_atr_mult = float(io_cfg.get("trail_atr_mult", 1.5))
+    adx_min        = float(io_cfg.get("adx_min", 10))
 
-    print(f"✅ Zerodha token OK.")
-    kite = _get_kite()  # prints profile ok in data_io._get_kite
+    # Telegram
+    tg_token = io_cfg.get("telegram_bot_token") or os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TG_BOT_TOKEN") or ""
+    tg_chat  = io_cfg.get("telegram_chat_id") or os.getenv("TELEGRAM_CHAT_ID") or os.getenv("TG_CHAT_ID") or ""
 
-    # ------------- spot, strike step & expiry selection -------------
-    # Spot via quote for index
-    index_map = {"NIFTY": "NSE:NIFTY 50", "BANKNIFTY": "NSE:NIFTY BANK"}
-    q = kite.ltp([index_map[underlying]])
-    spot = list(q.values())[0]["last_price"]
-    step = 50 if underlying == "NIFTY" else 100
-    atm = nearest_atm_strike(spot, step)
+    # Trading day
+    if date_override:
+        trade_day = datetime.strptime(date_override, "%Y-%m-%d").date()
+    else:
+        trade_day = ist_now().date()
 
-    print(f"ℹ️  {underlying} spot {spot:.1f} → ATM {atm}")
-    # Weekly expiry for given sim_date (Thurs for NSE)
-    # Find next Thursday >= sim_date
-    d = datetime.strptime(sim_date, "%Y-%m-%d").replace(tzinfo=IST)
-    while d.weekday() != 3:  # 0=Mon ... 3=Thu
-        d += timedelta(days=1)
-    expiry_str = d.strftime("%Y-%m-%d")
-    print(f"ℹ️  Weekly expiry → {expiry_str}")
+    # Entry / squareoff datetimes (IST)
+    entry_dt    = tz.localize(datetime.combine(trade_day, datetime.strptime(entry_time_str, "%H:%M").time()))
+    squareoff_dt= tz.localize(datetime.combine(trade_day, datetime.strptime(squareoff_str, "%H:%M").time()))
+    now_ist     = ist_now()
 
-    # ------------- instrument lookup for CE/PE -------------
-    # Use instruments() once, filter locally for performance.
-    instruments = kite.instruments("NFO")
-    ce_token = pe_token = None
-    ce_tradingsym = pe_tradingsym = None
+    # Kite
+    kite = get_kite_from_env()
 
-    suffix = "CE", "PE"
-    for ins in instruments:
-        try:
-            if ins.get("segment") != "NFO-OPT":
-                continue
-            if underlying not in ins.get("name", ""):
-                continue
-            if int(ins.get("strike", 0)) != atm:
-                continue
-            # normalize expiry compare by date only
-            ins_exp = pd.to_datetime(ins["expiry"]).strftime("%Y-%m-%d")
-            if ins_exp != expiry_str:
-                continue
-            tsym = ins["tradingsymbol"]
-            tok = int(ins["instrument_token"])
-            if tsym.endswith("CE"):
-                ce_token, ce_tradingsym = tok, tsym
-            elif tsym.endswith("PE"):
-                pe_token, pe_tradingsym = tok, tsym
-        except Exception:
-            continue
+    # 1) Discover ATM
+    spot = get_spot_ltp(kite, underlying)
+    step = STRIKE_STEP[underlying]
+    atm_strike = floor_to_step(spot, step)
+    print(f"ℹ️  {underlying} spot {spot:.1f} → ATM {atm_strike}")
 
-    if not ce_token or not pe_token:
-        raise RuntimeError(f"Could not find CE/PE tokens for {underlying} {expiry_str} @ {atm}")
+    # 2) Expiry
+    expiry = next_weekly_expiry(trade_day)
+    print(f"ℹ️  Weekly expiry → {expiry}")
 
-    print(f"✅ Using expiry {expiry_str} | CE token: {ce_token} | PE token: {pe_token}")
+    # 3) CE/PE instrument tokens
+    ce_token, pe_token = find_weekly_tokens(kite, underlying, expiry, atm_strike)
+    print(f"✅ Using expiry {expiry} | CE token: {ce_token} | PE token: {pe_token}")
+    print("—" * 56)
 
-    # ------------- fetch OHLC for options for the sim day -------------
-    def hist(tok):
-        # We need only the sim_date data; use from->to same day + 1
-        start = pd.Timestamp(sim_date + " 09:15:00", tz=IST)
-        end   = pd.Timestamp(sim_date + " 15:30:00", tz=IST)
-        candles = kite.historical_data(
-            instrument_token=int(tok),
-            from_date=start.to_pydatetime(),
-            to_date=end.to_pydatetime(),
-            interval=interval,
-        )
-        df = pd.DataFrame(candles)
-        df.rename(columns={"date": "Date", "open": "Open", "high": "High",
-                           "low": "Low", "close": "Close", "volume": "Volume"}, inplace=True)
-        df["Date"] = pd.to_datetime(df["Date"]).dt.tz_convert(IST)
-        return df
+    # 4) History window (for the day)
+    day_start = tz.localize(datetime.combine(trade_day, time(9, 15)))
+    to_dt     = min(now_ist, squareoff_dt)
 
-    ce_df = hist(ce_token)
-    pe_df = hist(pe_token)
+    ce_df = get_hist(kite, ce_token, day_start, to_dt, ival)
+    pe_df = get_hist(kite, pe_token, day_start, to_dt, ival)
 
-    print(f"📈 {ce_tradingsym} | rows: {len(ce_df)} | Close: {ce_df['Close'].iloc[-1]}")
-    print(f"📉 {pe_tradingsym} | rows: {len(pe_df)} | Close: {pe_df['Close'].iloc[-1]}")
-
-    # ------------- prepare ATR (for trailing) -------------
-    ce_df["ATR"] = tr_atr(ce_df, 14)
-    pe_df["ATR"] = tr_atr(pe_df, 14)
-
-    # ------------- simulate from entry_time to squareoff -------------
-    events: list[TradeEvent] = []
-    def log(kind, msg, ts=None):
-        ts = ts or datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
-        print(msg)
-        events.append(TradeEvent(ts=ts, kind=kind, msg=msg))
-
-    # find entry bar index (first bar whose time >= entry_time)
-    def find_entry_idx(df: pd.DataFrame) -> int:
-        for i, dt in enumerate(df["Date"]):
-            if dt.timetz() >= entry_t:
-                return i
-        return -1
-
-    ent_idx = find_entry_idx(ce_df)
-    if ent_idx < 0:
-        log("WARN", "No entry bar found (check entry_time/interval). Exiting.")
-        _write_report(cfg, underlying, expiry_str, atm, ce_tradingsym, pe_tradingsym, events)
+    # If there is no candle yet (very early), exit gracefully
+    if ce_df.empty or pe_df.empty:
+        print("ℹ️  No candles yet for options; exiting.")
         return
 
-    # legs (we SELL both, so SL is above price)
-    ce = Leg(symbol=ce_tradingsym, token=ce_token)
-    pe = Leg(symbol=pe_tradingsym, token=pe_token)
+    # 5) Find entry bar close at/after entry_time
+    ce_entry_row = ce_df[ce_df["Date"] >= entry_dt].head(1)
+    pe_entry_row = pe_df[pe_df["Date"] >= entry_dt].head(1)
+    if ce_entry_row.empty or pe_entry_row.empty:
+        print("ℹ️  Entry time not reached yet; exiting.")
+        return
 
-    active_reentries = 0
-    cooldown_left = 0
-    combined_target = None
+    ce_entry_px = float(ce_entry_row["Close"].iloc[0])
+    pe_entry_px = float(pe_entry_row["Close"].iloc[0])
+    entry_bar_time = ce_entry_row["Date"].iloc[0].to_pydatetime().astimezone(tz)
 
-    # walk bars from entry index to end
-    i = ent_idx
-    while i < len(ce_df):
-        ts = ce_df["Date"].iloc[i]
-        if ts.timetz() >= squareoff_t:
-            log("EXIT", f"⏰ Square-off at {ts.strftime('%H:%M')}. Exiting open legs.", ts.strftime("%Y-%m-%d %H:%M:%S"))
-            if ce.status == "ACTIVE":
-                ce.exit = ce_df["Close"].iloc[i]; ce.status = "EXIT"
-            if pe.status == "ACTIVE":
-                pe.exit = pe_df["Close"].iloc[i]; pe.status = "EXIT"
-            break
+    # 6) Risk math
+    ce_sl = round(ce_entry_px * (1 + leg_sl_pct/100.0), 2)   # short → SL above entry
+    pe_sl = round(pe_entry_px * (1 + leg_sl_pct/100.0), 2)
+    comb_entry = ce_entry_px + pe_entry_px
+    comb_target_val = round(comb_entry * (1 - comb_tgt_pct/100.0), 2)
 
-        # Cooldown handling
-        if cooldown_left > 0:
-            cooldown_left -= 1
+    # Trailing (ATR on each leg)
+    ce_df["ATR"] = atr(ce_df)
+    pe_df["ATR"] = atr(pe_df)
+    ce_last_atr = float(ce_df["ATR"].iloc[-1])
+    pe_last_atr = float(pe_df["ATR"].iloc[-1])
 
-        # Entry
-        if ce.status == "PENDING" and pe.status == "PENDING" and cooldown_left == 0:
-            ce.entry = float(ce_df["Close"].iloc[i])
-            pe.entry = float(pe_df["Close"].iloc[i])
-            ce.stop  = ce.entry * (1 + leg_sl_pct / 100.0)
-            pe.stop  = pe.entry * (1 + leg_sl_pct / 100.0)
-            ce.status = pe.status = "ACTIVE"
-            combined_entry = ce.entry + pe.entry
-            combined_target = combined_entry * (1 - tgt_pct / 100.0) if tgt_pct > 0 else None
-            msg = (f"🟢 ENTRY {ts.strftime('%H:%M')} | SELL {ce.symbol} @{ce.entry:.2f}, "
-                   f"SELL {pe.symbol} @{pe.entry:.2f} | SLs: {ce.stop:.2f}/{pe.stop:.2f}")
-            log("ENTRY", msg, ts.strftime("%Y-%m-%d %H:%M:%S"))
-            send_telegram(f"[ENTRY] {underlying} {sim_date} {ts.strftime('%H:%M')}\n"
-                          f"SELL {ce.symbol} @{ce.entry:.2f} SL {ce.stop:.2f}\n"
-                          f"SELL {pe.symbol} @{pe.entry:.2f} SL {pe.stop:.2f}")
+    trailing_info = None
+    if trail_on:
+        ce_trail_dist = round(trail_atr_mult * ce_last_atr, 2)
+        pe_trail_dist = round(trail_atr_mult * pe_last_atr, 2)
+        trailing_info = {
+            "start_trigger_atr": trail_start_atr,
+            "ce_atr": ce_last_atr,
+            "pe_atr": pe_last_atr,
+            "ce_trail_dist": ce_trail_dist,
+            "pe_trail_dist": pe_trail_dist,
+        }
 
-        # If active, check target/SL and trailing
-        if ce.status == "ACTIVE" and pe.status == "ACTIVE":
-            ce_px = float(ce_df["Close"].iloc[i])
-            pe_px = float(pe_df["Close"].iloc[i])
-            combined = ce_px + pe_px
+    # 7) Present state @ latest bar
+    ce_last = float(ce_df["Close"].iloc[-1])
+    pe_last = float(pe_df["Close"].iloc[-1])
+    comb_last = ce_last + pe_last
 
-            # Combined target
-            if combined_target is not None and combined <= combined_target:
-                ce.exit = ce_px; pe.exit = pe_px
-                ce.status = pe.status = "EXIT"
-                log("TARGET", f"🎯 TARGET hit {ts.strftime('%H:%M')} | Combined {combined:.2f} ≤ {combined_target:.2f}")
-                send_telegram(f"[TARGET] {underlying} {ts.strftime('%H:%M')}\nCombined {combined:.2f} ≤ {combined_target:.2f}")
-                # enable potential re-entry
-                if active_reentries < reentry_max:
-                    cooldown_left = reentry_cooldown
-                    active_reentries += 1
-                    ce = Leg(symbol=ce_tradingsym, token=ce_token)
-                    pe = Leg(symbol=pe_tradingsym, token=pe_token)
-                i += 1
-                continue
+    # 8) Logs
+    print(f"🕘 Entry bar (>= {entry_time_str}) @ {entry_bar_time.strftime('%H:%M')}")
+    print(f"🎯 Strategy: {entry_rule} | Lots={lots} | Lot size={lot_size}")
+    print(f"🟠 SELL CE @ {ce_entry_px:.2f} | SL: {ce_sl:.2f}")
+    print(f"🟠 SELL PE @ {pe_entry_px:.2f} | SL: {pe_sl:.2f}")
+    print(f"📉 Combined entry premium: {comb_entry:.2f}")
+    print(f"✅ Combined target ({comb_tgt_pct:.0f}%): {comb_target_val:.2f}")
+    if trailing_info:
+        print(f"🔁 Trailing ON (ATR): start>{trail_start_atr}*ATR | CE trail≈{trailing_info['ce_trail_dist']:.2f} | PE trail≈{trailing_info['pe_trail_dist']:.2f}")
+    else:
+        print("🔁 Trailing: OFF")
 
-            # SL checks (since we are short, SL is price rising above stop)
-            if ce_px >= ce.stop or pe_px >= pe.stop:
-                reason = []
-                if ce_px >= ce.stop:
-                    ce.exit = ce_px; ce.status = "EXIT"; reason.append(f"{ce.symbol} SL")
-                if pe_px >= pe.stop:
-                    pe.exit = pe_px; pe.status = "EXIT"; reason.append(f"{pe.symbol} SL")
-                log("SL", f"❌ STOP hit {ts.strftime('%H:%M')} | " + " & ".join(reason))
-                send_telegram(f"[STOP] {underlying} {ts.strftime('%H:%M')} | " + " & ".join(reason))
-                # re-entry?
-                if active_reentries < reentry_max:
-                    cooldown_left = reentry_cooldown
-                    active_reentries += 1
-                    ce = Leg(symbol=ce_tradingsym, token=ce_token)
-                    pe = Leg(symbol=pe_tradingsym, token=pe_token)
-                i += 1
-                continue
+    print("—" * 56)
+    print(f"📊 Latest bar: CE={ce_last:.2f} | PE={pe_last:.2f} | Combo={comb_last:.2f}")
+    print(f"⏹️  Auto squareoff: {squareoff_str} IST")
 
-            # Trailing (simple ATR trailing for shorts)
-            if trailing_enabled and trail_type == "atr":
-                ce_atr = float(ce_df["ATR"].iloc[i])
-                pe_atr = float(pe_df["ATR"].iloc[i])
+    # 9) Telegram push
+    msg = (
+        f"📈 {underlying} {expiry} ATM Short Straddle\n"
+        f"Entry@{entry_bar_time.strftime('%H:%M')}  CE {atm_strike} @ {ce_entry_px:.2f}  | SL {ce_sl:.2f}\n"
+        f"                          PE {atm_strike} @ {pe_entry_px:.2f}  | SL {pe_sl:.2f}\n"
+        f"Target (combo −{comb_tgt_pct:.0f}%): {comb_target_val:.2f}  | Latest combo: {comb_last:.2f}\n"
+        f"Trailing: {'ON' if trailing_info else 'OFF'}  | Squareoff: {squareoff_str}"
+    )
+    send_telegram(tg_token, tg_chat, msg)
 
-                # Activate trailing once unrealized gain exceeds start*ATR (i.e., price moved our way)
-                if not ce.trail_active:
-                    if (ce.entry - ce_px) >= trail_start_atr * ce_atr:
-                        ce.trail_active = True
-                        log("TRAIL", f"🪢 {ce.symbol} trailing activated at {ts.strftime('%H:%M')}")
-                if not pe.trail_active:
-                    if (pe.entry - pe_px) >= trail_start_atr * pe_atr:
-                        pe.trail_active = True
-                        log("TRAIL", f"🪢 {pe.symbol} trailing activated at {ts.strftime('%H:%M')}")
-
-                if ce.trail_active:
-                    new_stop = ce_px + trail_atr_mult * ce_atr
-                    if new_stop < ce.stop:
-                        ce.stop = new_stop
-                        log("TRAIL", f"🔧 {ce.symbol} stop trailed → {ce.stop:.2f}")
-                if pe.trail_active:
-                    new_stop = pe_px + trail_atr_mult * pe_atr
-                    if new_stop < pe.stop:
-                        pe.stop = new_stop
-                        log("TRAIL", f"🔧 {pe.symbol} stop trailed → {pe.stop:.2f}")
-
-        i += 1
-
-    # final log if still pending (no entry bar met, etc.)
-    if ce.status == "PENDING" and pe.status == "PENDING":
-        log("INFO", "No entries taken for the day.")
-
-    _write_report(cfg, underlying, expiry_str, atm, ce_tradingsym, pe_tradingsym, events)
-
-
-def _write_report(cfg, underlying, expiry, atm, ce_sym, pe_sym, events):
-    out_dir = cfg.get("out_dir", "reports")
-    os.makedirs(out_dir, exist_ok=True)
-    payload = {
-        "ts": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+    # 10) Persist a JSON report
+    os.makedirs("reports", exist_ok=True)
+    out = {
+        "generated_at": ist_now().isoformat(),
         "underlying": underlying,
-        "expiry": expiry,
-        "atm": atm,
-        "ce": ce_sym,
-        "pe": pe_sym,
-        "events": [asdict(e) for e in events],
+        "expiry": str(expiry),
+        "atm_strike": atm_strike,
+        "entry_time": entry_bar_time.strftime("%H:%M"),
+        "legs": {
+            "CE": {"token": ce_token, "entry": ce_entry_px, "sl": ce_sl, "last": ce_last},
+            "PE": {"token": pe_token, "entry": pe_entry_px, "sl": pe_sl, "last": pe_last},
+        },
+        "combined": {
+            "entry": comb_entry,
+            "last": comb_last,
+            "target_percent": comb_tgt_pct,
+            "target_value": comb_target_val,
+        },
+        "trailing": trailing_info or {"enabled": False},
+        "squareoff": squareoff_str,
+        "interval": ival,
+        "lots": lots,
+        "lot_size": lot_size,
     }
-    with open(os.path.join(out_dir, "latest.json"), "w") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-    print("📦 Wrote reports/latest.json")
-
+    with open("reports/latest.json", "w") as f:
+        json.dump(out, f, indent=2)
+    print("🗂️  Wrote reports/latest.json")
 
 if __name__ == "__main__":
     main()
