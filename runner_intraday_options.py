@@ -25,7 +25,6 @@ def is_weekend(d: date) -> bool:
     return d.weekday() >= 5  # Sat=5, Sun=6
 
 def prev_trading_day(d: date) -> date:
-    # simple weekend skip; (holiday handling would need an external list)
     dd = d - timedelta(days=1)
     while is_weekend(dd):
         dd -= timedelta(days=1)
@@ -33,6 +32,20 @@ def prev_trading_day(d: date) -> date:
 
 def round_to_strike(spot: float, base: int) -> int:
     return int(round(spot / base) * base)
+
+def parse_hhmm(s: str, fallback: str = "09:30") -> tuple[int,int]:
+    """Return (hh,mm); if missing/invalid, use fallback."""
+    txt = (s or "").strip()
+    if not txt:
+        txt = fallback
+    try:
+        hh, mm = map(int, txt.split(":"))
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            raise ValueError
+        return hh, mm
+    except Exception:
+        fh, fm = map(int, fallback.split(":"))
+        return fh, fm
 
 def send_telegram(text: str, token: str, chat_id: str):
     try:
@@ -129,24 +142,20 @@ def fetch_session_ohlc(kite, token: int, for_day: date, interval_alias: str) -> 
 
 def fetch_best_ohlc(kite, token: int, interval_alias: str, prefer_day: date | None) -> tuple[pd.DataFrame, date]:
     """
-    1) If prefer_day given, try it.
-    2) Else try today.
-    3) If empty, fallback to previous trading day.
-    Returns (df, the_day_used)
+    1) If prefer_day given, try it; if empty, try previous trading day.
+    2) Else try today; if empty, try previous trading day.
     """
     if prefer_day:
         d = prefer_day
         df = fetch_session_ohlc(kite, token, d, interval_alias)
         if not df.empty:
             return df, d
-        # if user asked a holiday/non-trading day, fallback one step
         d2 = prev_trading_day(d)
         df2 = fetch_session_ohlc(kite, token, d2, interval_alias)
         if not df2.empty:
             return df2, d2
         raise RuntimeError(f"No candles for {d} or previous trading day {d2}")
 
-    # Auto mode
     today = ist_now().date()
     df = fetch_session_ohlc(kite, token, today, interval_alias)
     if not df.empty:
@@ -206,7 +215,7 @@ def main():
     print(f"✅ Using expiry {expiry:%Y-%m-%d} | CE token: {ce_token} | PE token: {pe_token}")
     print("______________________________________________")
 
-    # Which day to fetch?
+    # Prefer session day from config if provided
     prefer_day = None
     if getattr(iocfg, "date", ""):
         try:
@@ -215,13 +224,15 @@ def main():
             raise RuntimeError(f"Invalid intraday_options.date '{iocfg.date}', use YYYY-MM-DD")
 
     # OHLC (robust)
-    ival = iocfg.interval if hasattr(iocfg, "interval") else "5minute"
+    ival = iocfg.interval if hasattr(iocfg, "interval") else "5m"
     ce_df, used_day = fetch_best_ohlc(kite, ce_token, ival, prefer_day)
     pe_df, _       = fetch_best_ohlc(kite, pe_token, ival, prefer_day)
     print(f"📅 Using session: {used_day}")
 
-    # Entry bar at/after entry_time
-    entry_h, entry_m = map(int, iocfg.entry_time.split(":"))
+    # ----- tolerant entry time -----
+    raw_entry_time = getattr(iocfg, "entry_time", None) or getattr(iocfg, "start_time", None) or "09:30"
+    entry_h, entry_m = parse_hhmm(raw_entry_time, fallback="09:30")
+
     def first_bar_at(df: pd.DataFrame):
         return df[df["Date"].dt.tz_convert(IST).dt.time >= time(entry_h, entry_m)].head(1)
 
@@ -233,9 +244,9 @@ def main():
     ce_entry = float(ce_bar["Close"].iloc[0])
     pe_entry = float(pe_bar["Close"].iloc[0])
 
-    lots = int(iocfg.lots)
+    lots = int(getattr(iocfg, "lots", 1))
     lot_size = int(getattr(iocfg, "lot_size", LOT_SIZE[iocfg.underlying]))
-    sl_pct = float(iocfg.leg_sl_percent)
+    sl_pct = float(getattr(iocfg, "leg_sl_percent", 25))
     tgt_pct = float(getattr(iocfg, "combined_target_percent", 0.0))
 
     trail_cfg = {
@@ -251,7 +262,7 @@ def main():
     # Plan print
     print(f"🧾 {ce_sym} | rows: {len(ce_df)} | Close: {ce_entry}")
     print(f"🧾 {pe_sym} | rows: {len(pe_df)} | Close: {pe_entry}")
-    print(f"📌 Entry {iocfg.entry_time} | Short Straddle {atm} | Lots: {lots} (lot_size {lot_size})")
+    print(f"📌 Entry {entry_h:02d}:{entry_m:02d} | Short Straddle {atm} | Lots: {lots} (lot_size {lot_size})")
     print(f"🛡️  SL per leg: {sl_pct}% | 🎯 Combined target: {tgt_pct}% | 🧵 Trailing: {trail_cfg}")
 
     # Telegram
@@ -260,7 +271,7 @@ def main():
     if t_token and t_chat:
         msg = (
             f"🔔 <b>ATM Short Straddle</b>\n"
-            f"• <b>{iocfg.underlying}</b> {atm} | {used_day} | Entry {iocfg.entry_time} IST\n"
+            f"• <b>{iocfg.underlying}</b> {atm} | {used_day} | Entry {entry_h:02d}:{entry_m:02d} IST\n"
             f"• CE {ce_sym}: {ce_entry}\n"
             f"• PE {pe_sym}: {pe_entry}\n"
             f"• SL/leg: {sl_pct}% | Target: {tgt_pct}%\n"
@@ -276,7 +287,7 @@ def main():
         "underlying": iocfg.underlying,
         "atm_strike": atm,
         "expiry": f"{expiry:%Y-%m-%d}",
-        "entry_time": iocfg.entry_time,
+        "entry_time": f"{entry_h:02d}:{entry_m:02d}",
         "ce": {"symbol": ce_sym, "entry": ce_entry, "token": ce_token},
         "pe": {"symbol": pe_sym, "entry": pe_entry, "token": pe_token},
         "risk": log_note["risk"],
