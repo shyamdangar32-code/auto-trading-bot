@@ -7,6 +7,7 @@ jobs:
   run:
     runs-on: ubuntu-latest
 
+    # Map GitHub Secrets into job env
     env:
       ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
       ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
@@ -34,25 +35,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # (Optional) quick lengths-only check that secrets are present
       - name: Debug secrets lengths
         run: |
-          echo "API_KEY length:     ${#ZERODHA_API_KEY}"
-          echo "API_SECRET length:  ${#ZERODHA_API_SECRET}"
-          echo "ACCESS_TOKEN length:${#ZERODHA_ACCESS_TOKEN}"
+          echo "API_KEY len: ${#ZERODHA_API_KEY}"
+          echo "API_SECRET len: ${#ZERODHA_API_SECRET}"
+          echo "ACCESS_TOKEN len: ${#ZERODHA_ACCESS_TOKEN}"
 
+      # Preflight: verify your Kite credentials before main run
       - name: Preflight Zerodha credentials
         run: |
           python - <<'PY'
           import os, sys
           from kiteconnect import KiteConnect
 
-          api_key  = (os.getenv("ZERODHA_API_KEY") or "").strip()
-          api_sec  = (os.getenv("ZERODHA_API_SECRET") or "").strip()
-          access   = (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
-
-          print("API len:", len(api_key), "| TOKEN len:", len(access))
-          if len(api_key) < 6 or len(access) < 10:
-              print("❌ Secrets missing or empty in job env.")
+          api_key = (os.getenv("ZERODHA_API_KEY") or "").strip()
+          access  = (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
+          if not api_key or not access:
+              print("❌ Missing API key or Access token in env.")
               sys.exit(2)
 
           kite = KiteConnect(api_key=api_key)
@@ -65,9 +65,10 @@ jobs:
               sys.exit(3)
           PY
 
+      # 🔧 Correct script name here (intraday, not intra_day)
       - name: Run intraday options (paper)
         run: |
-          python runner_intra_day_options.py --out_dir "./reports"
+          python runner_intraday_options.py --out_dir "./reports"
 
       - name: Upload reports
         if: always()
