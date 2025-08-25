@@ -8,9 +8,13 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      ZERODHA_API_KEY: ${{ secrets.ZERODHA_API_KEY }}
-      ZERODHA_API_SECRET: ${{ secrets.ZERODHA_API_SECRET }}
+      # Zerodha (already working)
+      ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
+      ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
       ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+      # Telegram (optional; safe if missing)
+      TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
       - name: Checkout
@@ -39,29 +43,26 @@ jobs:
           echo "API_KEY length:     ${#ZERODHA_API_KEY}"
           echo "API_SECRET length:  ${#ZERODHA_API_SECRET}"
           echo "ACCESS_TOKEN length:${#ZERODHA_ACCESS_TOKEN}"
+          echo "TG_TOKEN length:    ${#TELEGRAM_BOT_TOKEN}"
+          echo "TG_CHAT_ID length:  ${#TELEGRAM_CHAT_ID}"
 
       - name: Preflight Zerodha profile (must pass)
         run: |
           python - <<'PY'
           import os, sys
           from kiteconnect import KiteConnect
-          api_key = os.getenv("ZERODHA_API_KEY")
-          access  = os.getenv("ZERODHA_ACCESS_TOKEN")
-          print("API len:", len(api_key), "| Token len:", len(access))
-          kite = KiteConnect(api_key=api_key)
-          kite.set_access_token(access)
+          api_key = (os.getenv("ZERODHA_API_KEY") or "").strip()
+          access  = (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
+          kite = KiteConnect(api_key=api_key); kite.set_access_token(access)
           try:
-              prof = kite.profile()
-              print("✅ Zerodha profile OK:", prof.get("user_id"), prof.get("user_name"))
+              p = kite.profile()
+              print("✅ Token works! User:", p.get("user_name"), "| ID:", p.get("user_id"))
           except Exception as e:
-              print("❌ Zerodha check failed:", e)
-              sys.exit(1)
+              print("❌ Zerodha preflight failed:", e); sys.exit(3)
           PY
 
       - name: List repo (sanity)
-        run: |
-          pwd
-          ls -la
+        run: ls -1
 
       - name: Run intraday options (paper)
         run: |
