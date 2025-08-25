@@ -1,299 +1,370 @@
 # runner_intraday_options.py
-# Intraday ATM Short Straddle (paper) for BANKNIFTY/NIFTY
-# - Uses today's intraday window only (fixes "from date after to date")
-# - Clean logs (no demo bias)
-# - Optional Telegram alerts
+# Intraday ATM short-straddle (paper) for BANKNIFTY/NIFTY with real logs + Telegram
 
 import os
+import sys
 import json
 import math
 import time
-import pytz
-import yaml
-import requests
+import argparse
 from dataclasses import dataclass
-from typing import Tuple, Optional, List, Dict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 import pandas as pd
+import numpy as np
+
 from kiteconnect import KiteConnect
+from bot.config import load_config   # <- your existing helper
 
 
-IST = pytz.timezone("Asia/Kolkata")
+# ------------------- Utils -------------------
 
+IST = "Asia/Kolkata"
 
-# ---------------------------- helpers ----------------------------
+def tz_now_ist():
+    # naive -> local IST time using pandas (no extra deps)
+    return pd.Timestamp.now(tz=IST).to_pydatetime()
 
-def ist_now() -> datetime:
-    return datetime.now(IST)
-
-
-def today_intraday_window() -> Tuple[datetime, datetime]:
-    """Return today's intraday window 09:15 → min(now, 15:30) in IST."""
-    now = ist_now()
-    start = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    day_end = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    end = min(now, day_end)
-    # in case this runs before 09:15, clamp end to start to avoid invalid range
-    if end < start:
-        end = start + timedelta(minutes=1)
-    return start, end
-
-
-def round_to_step(value: float, step: int) -> int:
-    return int(round(value / step) * step)
-
-
-def next_weekly_expiry(from_dt: Optional[datetime] = None) -> datetime:
-    """Return upcoming Thursday (weekly expiry) in IST (date only)."""
-    d = from_dt.astimezone(IST) if from_dt else ist_now()
-    # if it's Thursday after 3:30pm, move to next week
-    weekday = d.weekday()  # Mon=0 ... Sun=6
-    days_ahead = (3 - weekday) % 7  # Thursday = 3
-    expiry = (d + timedelta(days=days_ahead)).date()
-    if weekday == 3 and d.time() > datetime(1,1,1,15,30).time():
-        expiry = (d + timedelta(days=7)).date()
-    return datetime.combine(expiry, datetime.min.time()).replace(tzinfo=IST)
-
-
-def telegram_notify(token: str, chat_id: str, text: str) -> None:
-    """Fire-and-forget Telegram message; silence any network error."""
-    if not token or not chat_id:
+def send_telegram(msg: str):
+    """Fire-and-forget Telegram message if envs are present."""
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat  = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+    if not token or not chat:
         return
+    import urllib.parse, urllib.request
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = urllib.parse.urlencode({"chat_id": chat, "text": msg, "parse_mode": "HTML"}).encode()
     try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        requests.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=10)
+        urllib.request.urlopen(url, data=payload, timeout=10)
     except Exception:
         pass
 
 
-def load_config(path: str = "config.yaml") -> dict:
-    with open(path, "r") as f:
-        return yaml.safe_load(f)
+def round_to_strike(x: float, step: int) -> int:
+    return int(round(x / step) * step)
+
+
+def weekly_thursday(from_dt: datetime) -> date:
+    """Next/this Thursday for weekly options (including today if Thu)."""
+    d = from_dt.date()
+    offset = (3 - d.weekday()) % 7  # Thu = 3
+    return d + timedelta(days=offset)
 
 
 def get_kite() -> KiteConnect:
-    api_key = (os.getenv("ZERODHA_API_KEY") or "").strip()
-    access = (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
-    if not api_key or not access:
-        raise RuntimeError("ZERODHA_API_KEY / ZERODHA_ACCESS_TOKEN missing in env.")
-    kite = KiteConnect(api_key=api_key)
-    kite.set_access_token(access)
-    # sanity
-    prof = kite.profile()
-    print(f"✅ Zerodha token OK. User: {prof.get('user_id')} | {prof.get('user_name')}")
+    ak = (os.getenv("ZERODHA_API_KEY") or "").strip()
+    at = (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
+    if not ak or not at:
+        raise RuntimeError("ZERODHA_API_KEY / ZERODHA_ACCESS_TOKEN missing")
+    kite = KiteConnect(api_key=ak)
+    kite.set_access_token(at)
+    # quick check
+    _ = kite.profile()
     return kite
 
 
-def get_spot(kite: KiteConnect, underlying: str) -> float:
-    """Get spot for BANKNIFTY / NIFTY index via LTP."""
-    symbol_map = {
-        "BANKNIFTY": "NSE:NIFTY BANK",
-        "NIFTY": "NSE:NIFTY 50",
-    }
-    key = symbol_map.get(underlying.upper())
-    if not key:
-        raise ValueError("underlying must be NIFTY or BANKNIFTY")
-    ltp = kite.ltp([key])
-    return float(ltp[key]["last_price"])
-
-
-def pick_atm_tokens(
-    kite: KiteConnect,
-    underlying: str,
-    expiry_dt: datetime,
-    strike: int
-) -> Tuple[int, int, str, str]:
-    """Return (CE_token, PE_token, CE_symbol, PE_symbol) for given underlying/expiry/strike."""
-    # Pull once; filter in memory
-    nfo = pd.DataFrame(kite.instruments("NFO"))
-    nfo = nfo[(nfo["name"] == underlying.upper()) & (nfo["segment"] == "NFO-OPT")]
-    # expiry is timezone-naive date in exchange listing; compare on date
-    exp_date = expiry_dt.date()
-    nfo = nfo[nfo["expiry"].dt.date == exp_date]
-    nfo = nfo[nfo["strike"] == float(strike)]
-
-    ce = nfo[nfo["instrument_type"] == "CE"].head(1)
-    pe = nfo[nfo["instrument_type"] == "PE"].head(1)
-    if ce.empty or pe.empty:
-        raise RuntimeError(f"Could not find CE/PE tokens for {underlying} {exp_date} @ {strike}")
-
-    ce_token = int(ce.iloc[0]["instrument_token"])
-    pe_token = int(pe.iloc[0]["instrument_token"])
-    return ce_token, pe_token, ce.iloc[0]["tradingsymbol"], pe.iloc[0]["tradingsymbol"]
-
-
-def get_hist(kite: KiteConnect, token: int, from_dt: datetime, to_dt: datetime, interval: str) -> pd.DataFrame:
-    """Fetch intraday OHLCV for today window, robust to Zerodha rules."""
-    # Kite expects timezone-naive datetimes; pass IST-naive
-    f = from_dt.astimezone(IST).replace(tzinfo=None)
-    t = to_dt.astimezone(IST).replace(tzinfo=None)
-    if f >= t:
-        # guardrail to avoid "from > to"
-        t = f + timedelta(minutes=1)
-    data = kite.historical_data(token, f, t, interval)
-    df = pd.DataFrame(data)
+def get_hist(kite: KiteConnect, token: int, frm: datetime, to: datetime, interval: str) -> pd.DataFrame:
+    """
+    SAFE historical fetch that guarantees a datetime column.
+    Fixes: ensure `date` is converted to datetime so .dt works.
+    """
+    candles = kite.historical_data(token, frm, to, interval)
+    df = pd.DataFrame(candles)
     if df.empty:
-        raise RuntimeError("No candles returned")
-    df.rename(columns={"date": "Date", "open": "Open", "high": "High",
-                      "low": "Low", "close": "Close", "volume": "Volume"}, inplace=True)
-    df["Date"] = pd.to_datetime(df["Date"])
+        return df
+    # Standardize and ensure datetime dtype
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+    # Rename for consistency
+    df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"}, inplace=True)
     return df
 
 
-# ---------------------------- strategy (paper) ----------------------------
+def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    h, l, c = df["High"], df["Low"], df["Close"]
+    prev_c = c.shift(1)
+    tr = pd.concat([(h - l), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+    return tr.rolling(n, min_periods=n).mean()
+
+
+# ------------------- Strategy bits -------------------
 
 @dataclass
 class Leg:
-    symbol: str
+    side: str      # "CE" or "PE"
     token: int
-    side: str  # SELL
-    entry_price: float
-    sl_price: float
+    entry: float = np.nan
+    sl_price: float = np.nan
     trail_active: bool = False
 
 
-def simulate_short_straddle(
-    ce_df: pd.DataFrame,
-    pe_df: pd.DataFrame,
-    entry_time_str: str,
-    leg_sl_percent: float,
-    combined_target_percent: Optional[float],
-    trailing: bool,
-) -> Dict:
+def select_tokens(kite: KiteConnect, underlying: str, expiry_d: date, atm_strike: int):
     """
-    Paper-sim only:
-      - Entry: first candle with Date.time() >= entry_time
-      - SL: % of entry price (per leg)
-      - Optional combined MTM target
-      - Trailing: not implemented deeply; placeholder switch kept for logs
+    Find CE/PE instrument tokens for the given underlying/expiry/strike.
     """
-    entry_time = datetime.strptime(entry_time_str, "%H:%M").time()
-
-    ce_entry_row = ce_df[ce_df["Date"].dt.time >= entry_time].head(1)
-    pe_entry_row = pe_df[pe_df["Date"].dt.time >= entry_time].head(1)
-    if ce_entry_row.empty or pe_entry_row.empty:
-        return {"note": "No entry candle ≥ entry_time", "trades": []}
-
-    ce_entry = float(ce_entry_row.iloc[0]["Close"])
-    pe_entry = float(pe_entry_row.iloc[0]["Close"])
-
-    ce_sl = ce_entry * (1 + leg_sl_percent / 100.0)
-    pe_sl = pe_entry * (1 + leg_sl_percent / 100.0)
-
-    # For a simple paper preview we won’t walk bar-by-bar exits;
-    # we’ll just produce entry + SL + optional combined target levels.
-    result = {
-        "entry_time": str(ce_entry_row.iloc[0]["Date"]),
-        "legs": [
-            {"symbol": "CE", "side": "SELL", "entry": ce_entry, "sl": ce_sl},
-            {"symbol": "PE", "side": "SELL", "entry": pe_entry, "sl": pe_sl},
-        ],
-        "combined_target": None,
-        "trailing_enabled": bool(trailing),
-    }
-    if combined_target_percent is not None:
-        total_entry = ce_entry + pe_entry
-        target_value = total_entry * (1 - combined_target_percent / 100.0)
-        result["combined_target"] = target_value
-    return result
+    seg = "NFO"
+    ins = kite.instruments(seg)
+    ul_prefix = "BANKNIFTY" if underlying.upper().startswith("BANK") else "NIFTY"
+    rows = [r for r in ins if r["segment"] == "NFO-OPT"
+            and r["tradingsymbol"].startswith(ul_prefix)
+            and r["expiry"].date() == expiry_d
+            and int(r["strike"]) == atm_strike]
+    ce = next((r for r in rows if r["instrument_type"] == "CE"), None)
+    pe = next((r for r in rows if r["instrument_type"] == "PE"), None)
+    if not ce or not pe:
+        raise RuntimeError(f"Could not find CE/PE tokens for {ul_prefix} {expiry_d} @ {atm_strike}")
+    return ce["instrument_token"], pe["instrument_token"], ce["tradingsymbol"], pe["tradingsymbol"]
 
 
-# ---------------------------- main ----------------------------
+def ltp(kite: KiteConnect, instrument_token: int) -> float:
+    q = kite.ltp([instrument_token])
+    key = str(instrument_token)
+    if instrument_token in q:
+        return q[instrument_token]["last_price"]
+    if key in q:
+        return q[key]["last_price"]
+    # Fallback via quote
+    x = kite.quote([instrument_token])
+    if instrument_token in x:
+        return x[instrument_token]["last_price"]
+    if key in x:
+        return x[key]["last_price"]
+    raise RuntimeError("LTP not available")
 
-def main():
-    cfg = load_config()
 
-    intr = cfg.get("intraday_options", {}) or {}
+# ------------------- Runner -------------------
+
+def run_intraday(config_path: str, out_dir: str):
+    cfg = load_config(config_path)
+
+    intr = cfg.get("intraday_options", {})
     underlying = intr.get("underlying", "BANKNIFTY").upper()
-    interval = intr.get("interval", "5minute")
-    entry_time = intr.get("entry_time", "09:30")
-    leg_sl_percent = float(intr.get("leg_sl_percent", 30.0))
-    combined_target_percent = intr.get("combined_target_percent", None)
-    trailing = bool(intr.get("trail", False)) or bool(intr.get("trailing_enabled", False))
-    lots = int(intr.get("lots", 1))
-    lot_size = int(intr.get("lot_size", 15 if underlying == "BANKNIFTY" else 50))
-    out_dir = cfg.get("out_dir", "reports")
-
-    tg_token = (intr.get("telegram_bot_token") or "").strip()
-    tg_chat = (intr.get("telegram_chat_id") or "").strip()
+    lots        = int(intr.get("lots", 1))
+    lot_size    = int(intr.get("lot_size", 15 if underlying == "BANKNIFTY" else 50))
+    entry_time  = intr.get("entry_time", "09:30")
+    squareoff   = intr.get("squareoff", "15:10")
+    sim_date_s  = (intr.get("date") or "").strip()
+    interval    = intr.get("interval", "5minute")
+    leg_sl_pct  = float(intr.get("leg_sl_percent", 30.0))
+    combo_tgt   = float(intr.get("combined_target_percent", 50.0))
+    trailing_on = bool(intr.get("trailing_enabled", True))
+    trail_type  = intr.get("trail_type", "atr")
+    trail_start = float(intr.get("trail_start_atr", 1.0))
+    trail_mult  = float(intr.get("trail_atr_mult", 1.5))
+    adx_min     = float(intr.get("adx_min", 10))
 
     os.makedirs(out_dir, exist_ok=True)
 
     kite = get_kite()
+    print("✅ Zerodha token OK.")
 
-    # 1) Spot & ATM strike
-    spot = get_spot(kite, underlying)
-    step = 100 if underlying == "BANKNIFTY" else 50
-    atm = round_to_step(spot, step)
+    # ---- Spot & ATM strike
+    # BankNifty index token (official) is 260105; NIFTY is 256265
+    idx_token = 260105 if underlying == "BANKNIFTY" else 256265
+    spot = ltp(kite, idx_token)
+    strike_step = 100 if underlying == "BANKNIFTY" else 50
+    atm = round_to_strike(spot, strike_step)
     print(f"ℹ️  {underlying} spot {spot:.1f} → ATM {atm}")
 
-    # 2) Weekly expiry (date only) – used for picking option tokens, NOT for history range
-    expiry_dt = next_weekly_expiry()
-    print(f"ℹ️  Weekly expiry → {expiry_dt.date()}")
-
-    ce_token, pe_token, ce_sym, pe_sym = pick_atm_tokens(kite, underlying, expiry_dt, atm)
-    print(f"✅ Using expiry {expiry_dt.date()} | CE token: {ce_token} | PE token: {pe_token}")
-    print("—" * 60)
-
-    # 3) Today’s intraday window (fix for 'from date after to date')
-    day_start, day_end = today_intraday_window()
-
-    # 4) Pull OHLC
-    ce_df = get_hist(kite, ce_token, day_start, day_end, interval)
-    pe_df = get_hist(kite, pe_token, day_start, day_end, interval)
-
-    # 5) Simulate paper short straddle (clean preview)
-    res = simulate_short_straddle(
-        ce_df, pe_df,
-        entry_time_str=entry_time,
-        leg_sl_percent=leg_sl_percent,
-        combined_target_percent=combined_target_percent,
-        trailing=trailing
-    )
-
-    if not res.get("legs"):
-        print("ℹ️  No entry candle >= entry_time; nothing to do.")
+    # ---- Expiry
+    now = tz_now_ist()
+    if sim_date_s:
+        # simulate as if "today" = sim_date
+        try:
+            sim_dt = datetime.strptime(sim_date_s, "%Y-%m-%d")
+        except ValueError:
+            raise RuntimeError("intraday_options.date must be YYYY-MM-DD")
+        expiry_d = weekly_thursday(sim_dt)
     else:
-        print(f"🕒 Entry @ {res['entry_time']}")
-        for leg in res["legs"]:
-            print(f"🔻 SELL {leg['symbol']}  entry={leg['entry']:.2f}  SL={leg['sl']:.2f}")
-        if res.get("combined_target") is not None:
-            print(f"🎯 Combined target (premium) = {res['combined_target']:.2f}")
-        if res.get("trailing_enabled"):
-            print("📍 Trailing: ENABLED (ATR/percent logic can be extended here)")
-        else:
-            print("📍 Trailing: disabled")
+        expiry_d = weekly_thursday(now)
+    print(f"ℹ️  Weekly expiry → {expiry_d}")
 
-        # Telegram alert (optional)
-        msg_lines = [
-            f"<b>{underlying} ATM Short Straddle (paper)</b>",
-            f"Expiry: {expiry_dt.date()}   Lots: {lots} (lot_size {lot_size})",
-            f"Entry time: {entry_time}",
-            f"CE entry: {res['legs'][0]['entry']:.2f}  SL: {res['legs'][0]['sl']:.2f}",
-            f"PE entry: {res['legs'][1]['entry']:.2f}  SL: {res['legs'][1]['sl']:.2f}",
-        ]
-        if res.get("combined_target") is not None:
-            msg_lines.append(f"Target (combined premium): {res['combined_target']:.2f}")
-        if res.get("trailing_enabled"):
-            msg_lines.append("Trailing: ENABLED")
-        telegram_notify(tg_token, tg_chat, "\n".join(msg_lines))
+    # ---- Pick CE/PE tokens
+    ce_token, pe_token, ce_sym, pe_sym = select_tokens(kite, underlying, expiry_d, atm)
+    print(f"✅ Using expiry {expiry_d} | CE token: {ce_token} | PE token: {pe_token}")
 
-    # 6) Write artifact json for inspection
-    artifact = {
-        "underlying": underlying,
-        "spot": spot,
-        "atm": atm,
-        "expiry": str(expiry_dt.date()),
-        "entry_time": res.get("entry_time"),
-        "legs": res.get("legs", []),
-        "combined_target": res.get("combined_target"),
-        "trailing_enabled": res.get("trailing_enabled"),
-    }
+    # ---- Historical candles (today)
+    # from market open to now for context; Zerodha requires from <= to
+    day_start = datetime.combine(now.date(), datetime.min.time()) + timedelta(hours=9, minutes=15)
+    to_dt = now
+    ce_df = get_hist(kite, ce_token, day_start, to_dt, interval)
+    pe_df = get_hist(kite, pe_token, day_start, to_dt, interval)
+
+    # Ensure we have candles
+    if ce_df.empty or pe_df.empty:
+        raise RuntimeError("No candles for CE/PE — market holiday or bad token?")
+
+    # Compute ATR on underlying legs individually for trailing, if requested
+    ce_df["ATR"] = atr(ce_df, 14)
+    pe_df["ATR"] = atr(pe_df, 14)
+
+    print("—" * 60)
+    print(f"📈 {ce_sym} | rows: {len(ce_df)} | Close: {float(ce_df['Close'].iloc[-1]):.2f}")
+    print(f"📈 {pe_sym} | rows: {len(pe_df)} | Close: {float(pe_df['Close'].iloc[-1]):.2f}")
+
+    # ---- Simulated entry at latest completed bar at/after entry_time
+    # Safe .dt usage (we fixed dtype in get_hist)
+    et_hours, et_minutes = map(int, entry_time.split(":"))
+    entry_mask = (ce_df["date"].dt.hour > et_hours) | ((ce_df["date"].dt.hour == et_hours) & (ce_df["date"].dt.minute >= et_minutes))
+    if not entry_mask.any():
+        raise RuntimeError("No bar at/after entry_time yet.")
+    entry_idx = np.where(entry_mask)[0][0]
+
+    ce_entry = float(ce_df["Close"].iloc[entry_idx])
+    pe_entry = float(pe_df["Close"].iloc[entry_idx])
+
+    ce_leg = Leg(side="CE", token=ce_token, entry=ce_entry)
+    pe_leg = Leg(side="PE", token=pe_token, entry=pe_entry)
+
+    ce_leg.sl_price = round(ce_leg.entry * (1 + leg_sl_pct / 100.0), 2)  # SL for short position (price rises)
+    pe_leg.sl_price = round(pe_leg.entry * (1 + leg_sl_pct / 100.0), 2)
+
+    combo_entry = ce_leg.entry + pe_leg.entry
+    combo_tgt_val = round(combo_entry * (1 - combo_tgt / 100.0), 2)
+
+    header = (
+        f"🚀 <b>Paper SELL ATM Straddle</b> ({underlying})\n"
+        f"• ATM {atm} | Exp {expiry_d}\n"
+        f"• Lots {lots} × lot_size {lot_size}\n"
+        f"• Entry {entry_time} bar: CE={ce_leg.entry:.2f}, PE={pe_leg.entry:.2f} (Combo={combo_entry:.2f})\n"
+        f"• SL per leg {leg_sl_pct:.0f}% → CE SL {ce_leg.sl_price:.2f}, PE SL {pe_leg.sl_price:.2f}\n"
+        f"• Combo target {combo_tgt:.0f}% → {combo_tgt_val:.2f}\n"
+        f"• Trailing: {'ON' if trailing_on else 'OFF'} ({trail_type}, start>={trail_start}×ATR, dist={trail_mult}×ATR)"
+    )
+    print(header)
+    send_telegram(header)
+
+    # ---- Paper loop over remaining bars until squareoff
+    so_hours, so_minutes = map(int, squareoff.split(":"))
+    exit_time = datetime.combine(now.date(), datetime.min.time()) + timedelta(hours=so_hours, minutes=so_minutes)
+
+    pnl_rows = []
+    ce_sl_hit = pe_sl_hit = False
+    combo_hit = False
+
+    for i in range(entry_idx + 1, len(ce_df)):
+        bar_dt = ce_df["date"].iloc[i].to_pydatetime()
+        if bar_dt >= exit_time:
+            print(f"🕒 Squareoff reached @ {bar_dt.time()}")
+            break
+
+        ce_close = float(ce_df["Close"].iloc[i])
+        pe_close = float(pe_df["Close"].iloc[i])
+
+        # Trailing logic using ATR of each leg
+        if trailing_on:
+            ce_atr = float(ce_df["ATR"].iloc[i]) if not math.isnan(ce_df["ATR"].iloc[i]) else None
+            pe_atr = float(pe_df["ATR"].iloc[i]) if not math.isnan(pe_df["ATR"].iloc[i]) else None
+
+            # Activate trailing once profit >= trail_start*ATR (for SHORT, profit when price drops)
+            if ce_atr:
+                unreal_ce = ce_leg.entry - ce_close
+                if unreal_ce >= trail_start * ce_atr:
+                    ce_leg.trail_active = True
+                    new_sl = round(ce_close + trail_mult * ce_atr, 2)  # for short, SL above price
+                    if new_sl < ce_leg.sl_price:
+                        ce_leg.sl_price = new_sl
+                        print(f"🔧 CE trail @ {bar_dt.time()} → SL {ce_leg.sl_price:.2f}")
+
+            if pe_atr:
+                unreal_pe = pe_leg.entry - pe_close
+                if unreal_pe >= trail_start * pe_atr:
+                    pe_leg.trail_active = True
+                    new_sl = round(pe_close + trail_mult * pe_atr, 2)
+                    if new_sl < pe_leg.sl_price:
+                        pe_leg.sl_price = new_sl
+                        print(f"🔧 PE trail @ {bar_dt.time()} → SL {pe_leg.sl_price:.2f}")
+
+        # Check individual SL hits
+        if not ce_sl_hit and ce_close >= ce_leg.sl_price:
+            ce_sl_hit = True
+            msg = f"⛔ CE SL hit @ {bar_dt.time()} | close {ce_close:.2f} ≥ SL {ce_leg.sl_price:.2f}"
+            print(msg); send_telegram(msg)
+
+        if not pe_sl_hit and pe_close >= pe_leg.sl_price:
+            pe_sl_hit = True
+            msg = f"⛔ PE SL hit @ {bar_dt.time()} | close {pe_close:.2f} ≥ SL {pe_leg.sl_price:.2f}"
+            print(msg); send_telegram(msg)
+
+        # Combo target check (profit when combined premium falls)
+        combo = ce_close + pe_close
+        if not combo_hit and combo <= combo_tgt_val:
+            combo_hit = True
+            msg = f"🎯 Combo target hit @ {bar_dt.time()} | {combo:.2f} ≤ {combo_tgt_val:.2f}"
+            print(msg); send_telegram(msg)
+
+        pnl_rows.append(
+            {"time": bar_dt.isoformat(timespec="minutes"),
+             "ce": ce_close, "pe": pe_close,
+             "ce_sl": ce_leg.sl_price, "pe_sl": pe_leg.sl_price,
+             "combo": combo}
+        )
+
+        if (ce_sl_hit and pe_sl_hit) or combo_hit:
+            break
+
+    # Exit prices (last processed bar or squareoff)
+    if pnl_rows:
+        last = pnl_rows[-1]
+        ce_exit = last["ce"]
+        pe_exit = last["pe"]
+        exit_t = last["time"]
+    else:
+        # no bars processed after entry, fallback to last close
+        ce_exit = float(ce_df["Close"].iloc[-1])
+        pe_exit = float(pe_df["Close"].iloc[-1])
+        exit_t = ce_df["date"].iloc[-1].isoformat(timespec="minutes")
+
+    # P&L (short premium)
+    ce_pnl = (ce_leg.entry - ce_exit) * lot_size * lots
+    pe_pnl = (pe_leg.entry - pe_exit) * lot_size * lots
+    total_pnl = ce_pnl + pe_pnl
+
+    summary = (
+        f"📦 Exit @ {exit_t}\n"
+        f"• CE: entry {ce_leg.entry:.2f} → exit {ce_exit:.2f} | P&L {ce_pnl:.0f}\n"
+        f"• PE: entry {pe_leg.entry:.2f} → exit {pe_exit:.2f} | P&L {pe_pnl:.0f}\n"
+        f"• <b>Total P&L</b>: {total_pnl:.0f}"
+    )
+    print(summary)
+    send_telegram(summary)
+
+    # Write reports
     with open(os.path.join(out_dir, "latest.json"), "w") as f:
-        json.dump(artifact, f, indent=2)
-    print(f"📦 Wrote {out_dir}/latest.json")
+        json.dump({
+            "when": tz_now_ist().isoformat(timespec="seconds"),
+            "underlying": underlying,
+            "atm": atm,
+            "expiry": str(expiry_d),
+            "entry_time": entry_time,
+            "squareoff": squareoff,
+            "ce_entry": ce_leg.entry, "pe_entry": pe_leg.entry,
+            "ce_sl": ce_leg.sl_price, "pe_sl": pe_leg.sl_price,
+            "combo_target": combo_tgt_val,
+            "exit_time": exit_t,
+            "ce_exit": ce_exit, "pe_exit": pe_exit,
+            "pnl": {"ce": ce_pnl, "pe": pe_pnl, "total": total_pnl},
+            "trail": {
+                "enabled": trailing_on, "type": trail_type,
+                "start_atr": trail_start, "atr_mult": trail_mult
+            },
+            "bars": pnl_rows
+        }, f, indent=2)
 
+    print(f"📁 Wrote {os.path.join(out_dir, 'latest.json')}")
+
+
+# ------------------- CLI -------------------
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--out_dir", default="./reports")
+    args = parser.parse_args()
+
+    try:
+        run_intraday(args.config, args.out_dir)
+    except Exception as e:
+        print(f"❌ Runner failed: {e}")
+        sys.exit(1)
