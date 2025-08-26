@@ -1,0 +1,79 @@
+name: backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      token:
+        description: "Instrument token (int)"
+        required: true
+      date_from:
+        description: "From (YYYY-MM-DD)"
+        required: true
+      date_to:
+        description: "To (YYYY-MM-DD)"
+        required: true
+      interval:
+        description: "Candle interval"
+        required: false
+        default: "5minute"
+      side:
+        description: "buy or sell"
+        required: false
+        default: "sell"
+      qty:
+        description: "Quantity"
+        required: false
+        default: "1"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      ZERODHA_API_KEY:     ${{ secrets.ZERODHA_API_KEY }}
+      ZERODHA_API_SECRET:  ${{ secrets.ZERODHA_API_SECRET }}
+      ZERODHA_ACCESS_TOKEN:${{ secrets.ZERODHA_ACCESS_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Preflight Zerodha profile (must pass)
+        run: |
+          python - <<'PY'
+          import os
+          from kiteconnect import KiteConnect
+          kite = KiteConnect(api_key=os.getenv("ZERODHA_API_KEY").strip())
+          kite.set_access_token(os.getenv("ZERODHA_ACCESS_TOKEN").strip())
+          p = kite.profile()
+          print("✅ Zerodha:", p.get("user_id"), p.get("user_name"))
+          PY
+
+      - name: Run backtest
+        run: |
+          python bot/backtest.py \
+            --token ${{ inputs.token }} \
+            --from  "${{ inputs.date_from }}" \
+            --to    "${{ inputs.date_to }}" \
+            --interval "${{ inputs.interval }}" \
+            --side "${{ inputs.side }}" \
+            --qty  ${{ inputs.qty }}
+
+      - name: Compute metrics
+        run: |
+          python bot/metrics.py
+
+      - name: Upload backtest reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-reports
+          path: reports/backtest/
