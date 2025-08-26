@@ -1,27 +1,54 @@
 name: weekly-optimizer
-on:
-  schedule:
-    - cron: '0 9 * * 1'    # Mondays 09:00 UTC
-  workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
+on:
+  workflow_dispatch:
 
 jobs:
   opt:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
-      - run: pip install -r requirements.txt
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      # 👇 Key fix so `import bot.*` works
+      - name: Set PYTHONPATH
+        run: echo "PYTHONPATH=$PWD" >> $GITHUB_ENV
+
       - name: Run optimizer
-        run: python tools/weekly_opt.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python tools/weekly_opt.py
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports
+          path: |
+            reports/**
+            **/reports/**
+          if-no-files-found: ignore
+
+      # Optional: keep if your optimizer writes back new params to config.yaml
       - name: Create PR with updated config
+        if: always()
         uses: peter-evans/create-pull-request@v6
         with:
-          commit-message: "auto: weekly param update"
-          title: "Weekly optimizer: update params"
-          body: "This PR bumps config.yaml to the best grid params and saves reports/opt_latest.json."
-          branch: "auto/weekly-params"
+          commit-message: "chore(optimizer): weekly params update"
+          title: "Weekly optimizer update"
+          body: "Automated PR from weekly optimizer run."
+          branch: weekly-opt/${{ github.run_id }}
+          add-paths: |
+            config.yaml
+            reports/**
