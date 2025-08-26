@@ -1,5 +1,4 @@
 name: backtest
-
 on:
   workflow_dispatch:
     inputs:
@@ -7,38 +6,28 @@ on:
         description: "Instrument token (int)"
         required: true
       date_from:
-        description: "From (YYYY-MM-DD)"
+        description: "From date (YYYY-MM-DD)"
         required: true
       date_to:
-        description: "To (YYYY-MM-DD)"
+        description: "To date (YYYY-MM-DD)"
         required: true
       interval:
         description: "Candle interval"
         required: false
         default: "5minute"
-      side:
-        description: "buy or sell"
-        required: false
-        default: "sell"
-      qty:
-        description: "Quantity"
-        required: false
-        default: "1"
 
 jobs:
   run:
     runs-on: ubuntu-latest
     env:
-      ZERODHA_API_KEY:     ${{ secrets.ZERODHA_API_KEY }}
-      ZERODHA_API_SECRET:  ${{ secrets.ZERODHA_API_SECRET }}
-      ZERODHA_ACCESS_TOKEN:${{ secrets.ZERODHA_ACCESS_TOKEN }}
+      ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
+      ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
+      ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -47,7 +36,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Preflight Zerodha profile (must pass)
+      - name: Preflight Zerodha (must pass)
         run: |
           python - <<'PY'
           import os
@@ -60,17 +49,12 @@ jobs:
 
       - name: Run backtest
         run: |
-          python bot/backtest.py \
-            --token ${{ inputs.token }} \
-            --from  "${{ inputs.date_from }}" \
-            --to    "${{ inputs.date_to }}" \
+          python tools/run_backtest.py \
+            --token  ${{ inputs.token }} \
+            --from   "${{ inputs.date_from }}" \
+            --to     "${{ inputs.date_to }}" \
             --interval "${{ inputs.interval }}" \
-            --side "${{ inputs.side }}" \
-            --qty  ${{ inputs.qty }}
-
-      - name: Compute metrics
-        run: |
-          python bot/metrics.py
+            --out_dir "reports/backtest"
 
       - name: Upload backtest reports
         uses: actions/upload-artifact@v4
