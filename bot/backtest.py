@@ -1,185 +1,225 @@
 # bot/backtest.py
-import json
-from dataclasses import dataclass
-import numpy as np
+# Minimal, self-contained day-by-day backtester that uses the SAME
+# risk settings from config.yaml and historical candles from Kite.
+# It simulates ONE trade per day on ONE instrument token:
+# enter at entry_time, exit on SL/Target/End-of-day.
+#
+# Writes:
+#   reports/backtest/trades.csv
+#   reports/backtest/equity_curve.csv
+#   reports/backtest/summary.json
+
+from __future__ import annotations
+
+import os, json, argparse
+from datetime import datetime, timedelta, date, time
+from typing import List, Dict
+
 import pandas as pd
-from .strategy import (
-    prepare_signals, initial_stop_target, trail_stop,
-    LONG, SHORT, FLAT
-)
+from kiteconnect import KiteConnect
 
-@dataclass
-class Trade:
-    side: int
-    entry_time: pd.Timestamp
-    entry: float
-    exit_time: pd.Timestamp = None
-    exit: float = None
-    reason: str = ""
-    pnl: float = 0.0
+# ---- tiny config loader (works with your existing bot/config.py if present) ----
+def _load_config():
+    # Prefer your helper if it exists
+    try:
+        from bot.config import load_config  # type: ignore
+        return load_config()
+    except Exception:
+        import yaml
+        with open("config.yaml", "r") as f:
+            return yaml.safe_load(f)
 
-def run_backtest(prices: pd.DataFrame, cfg: dict):
+def ist_dt(d: date, hhmm: str) -> datetime:
+    hh, mm = map(int, hhmm.split(":"))
+    # naive datetime in IST wall-clock (Kite accepts naive local timestamps fine in GA)
+    return datetime(d.year, d.month, d.day, hh, mm, 0)
+
+def daterange(d0: date, d1: date):
+    d = d0
+    while d <= d1:
+        yield d
+        d += timedelta(days=1)
+
+def fetch_day_candles(kite: KiteConnect, token: int, d: date, interval: str) -> pd.DataFrame:
+    # 09:15 -> 15:30 to be safe for all F&O segments
+    start = ist_dt(d, "09:15")
+    end   = ist_dt(d, "15:30")
+    raw = kite.historical_data(token, start, end, interval=interval)
+    if not raw:
+        return pd.DataFrame()
+    df = pd.DataFrame(raw)
+    # ensure datetime and standard cols
+    df["datetime"] = pd.to_datetime(df["date"])
+    df = df.rename(columns={"open":"o","high":"h","low":"l","close":"c","volume":"v"})
+    df = df[["datetime","o","h","l","c","v"]].sort_values("datetime").reset_index(drop=True)
+    return df
+
+def simulate_day(
+    df: pd.DataFrame,
+    d: date,
+    side: str,
+    qty: int,
+    entry_time: str,
+    end_time: str,
+    sl_pct: float,
+    target_pct: float,
+):
     """
-    Walk-forward backtest with:
-      - Re-entry
-      - ATR stop/target
-      - Trailing stop
-    Returns (summary_dict, trades_df, equity_series)
+    One trade per day:
+    - Entry on/after entry_time at the first available candle close
+    - Exit if SL/Target hit; otherwise exit at end_time close
     """
-    d = prepare_signals(prices, cfg).copy()
+    if df.empty:
+        return None  # holiday / no data
 
-    qty        = int(cfg.get("order_qty", 1))
-    capital    = float(cfg.get("capital_rs", 100000.0))
-    re_max     = int(cfg.get("reentry_max", 0))
-    cooldown   = int(cfg.get("reentry_cooldown", 0))
+    # window
+    et = ist_dt(d, entry_time)
+    xt = ist_dt(d, end_time)
 
-    # containers
-    position = FLAT
-    entry_px = stop = target = np.nan
-    re_count = 0
-    last_exit_idx = -10**9
-    trades: list[Trade] = []
+    df = df[(df["datetime"] >= et) & (df["datetime"] <= xt)].copy()
+    if df.empty:
+        return None
 
-    equity = capital
-    eq_curve = []
+    # entry is the first candle's close at/after entry_time
+    entry_row = df.iloc[0]
+    entry_px = float(entry_row["c"])
 
-    idx_list = list(d.index)
-    for i, ts in enumerate(idx_list):
-        row = d.loc[ts]
-        px  = float(row["Close"])
-        atr = float(row["atr"]) if not np.isnan(row.get("atr", np.nan)) else 0.0
-
-        # update trailing if in position
-        if position != FLAT:
-            stop = trail_stop(position, px, atr, stop, entry_px, cfg)
-
-        # exits
-        did_exit = False
-        if position == LONG:
-            if row["Low"] <= stop:
-                trades[-1].exit_time = ts
-                trades[-1].exit = stop
-                trades[-1].reason = "STOP"
-                trades[-1].pnl = (stop - entry_px) * qty
-                equity += trades[-1].pnl
-                position = FLAT
-                did_exit = True
-            elif row["High"] >= target:
-                trades[-1].exit_time = ts
-                trades[-1].exit = target
-                trades[-1].reason = "TARGET"
-                trades[-1].pnl = (target - entry_px) * qty
-                equity += trades[-1].pnl
-                position = FLAT
-                did_exit = True
-
-        elif position == SHORT:
-            if row["High"] >= stop:
-                trades[-1].exit_time = ts
-                trades[-1].exit = stop
-                trades[-1].reason = "STOP"
-                trades[-1].pnl = (entry_px - stop) * qty
-                equity += trades[-1].pnl
-                position = FLAT
-                did_exit = True
-            elif row["Low"] <= target:
-                trades[-1].exit_time = ts
-                trades[-1].exit = target
-                trades[-1].reason = "TARGET"
-                trades[-1].pnl = (entry_px - target) * qty
-                equity += trades[-1].pnl
-                position = FLAT
-                did_exit = True
-
-        if did_exit:
-            last_exit_idx = i
-            # allow re-entries later; counter preserved
-
-        # entries & re-entries
-        if position == FLAT:
-            same_day = True
-            if i - last_exit_idx < cooldown:
-                same_day = False  # still in cooldown window
-
-            if same_day:
-                if d.loc[ts, "long_entry"] and (re_count < re_max or re_max == 0):
-                    position = LONG
-                    entry_px = px
-                    stop, target = initial_stop_target(LONG, entry_px, atr, cfg)
-                    trades.append(Trade(LONG, ts, entry_px))
-                    re_count += 1 if last_exit_idx > -10**9 else 0
-
-                elif d.loc[ts, "short_entry"] and (re_count < re_max or re_max == 0):
-                    position = SHORT
-                    entry_px = px
-                    stop, target = initial_stop_target(SHORT, entry_px, atr, cfg)
-                    trades.append(Trade(SHORT, ts, entry_px))
-                    re_count += 1 if last_exit_idx > -10**9 else 0
-
-        # new day -> reset re-entry counter
-        if i > 0:
-            prev_day = pd.Timestamp(idx_list[i-1]).date()
-            this_day = pd.Timestamp(ts).date()
-            if this_day != prev_day:
-                re_count = 0
-
-        eq_curve.append(equity if position == FLAT else equity)  # equity shown mark-to-market
-
-    trades_df = pd.DataFrame([t.__dict__ for t in trades])
-    if not trades_df.empty:
-        trades_df["side"] = trades_df["side"].map({1: "LONG", -1: "SHORT"})
-    equity_ser = pd.Series(eq_curve, index=d.index, name="equity")
-
-    summary = evaluate(equity_ser, trades_df, capital)
-    return summary, trades_df, equity_ser
-
-def evaluate(equity: pd.Series, trades: pd.DataFrame, starting_capital: float):
-    """Compute ROI, Drawdown, R:R, Win-rate, Equity curve stats, Time drawdown."""
-    if equity.empty:
-        return {"n_trades": 0, "win_rate": 0.0, "roi_pct": 0.0,
-                "max_dd_pct": 0.0, "time_dd_bars": 0, "rr": 0.0}
-
-    # ROI
-    roi = (equity.iloc[-1] - starting_capital) / starting_capital * 100.0
-
-    # Drawdown (magnitude)
-    roll_max = equity.cummax()
-    dd = equity / roll_max - 1.0
-    max_dd = dd.min() * 100.0
-
-    # Time drawdown (longest stretch below prior peak)
-    time_dd = 0
-    curr = 0
-    for below in (equity < roll_max):
-        curr = curr + 1 if below else 0
-        time_dd = max(time_dd, curr)
-
-    # Trade stats
-    if trades.empty:
-        win_rate = rr = 0.0
+    # compute absolute SL/Target
+    if sl_pct and sl_pct > 0:
+        sl_abs = entry_px * (1 - sl_pct) if side == "buy" else entry_px * (1 + sl_pct)
     else:
-        wins = trades.loc[trades["pnl"] > 0, "pnl"].values
-        losses = trades.loc[trades["pnl"] < 0, "pnl"].abs().values
-        win_rate = (len(wins) / len(trades)) * 100.0 if len(trades) else 0.0
-        avg_win = np.mean(wins) if len(wins) else 0.0
-        avg_loss = np.mean(losses) if len(losses) else np.nan
-        rr = (avg_win / avg_loss) if avg_loss and not np.isnan(avg_loss) and avg_loss > 0 else 0.0
+        sl_abs = None
+    if target_pct and target_pct > 0:
+        tgt_abs = entry_px * (1 + target_pct) if side == "buy" else entry_px * (1 - target_pct)
+    else:
+        tgt_abs = None
+
+    exit_reason = "EOD"
+    exit_px = float(df.iloc[-1]["c"])
+    exit_time = df.iloc[-1]["datetime"]
+
+    # scan candles to see which hits first
+    for _, r in df.iterrows():
+        high = float(r["h"])
+        low  = float(r["l"])
+        # buy: SL if low<=sl_abs, target if high>=tgt_abs
+        # sell: SL if high>=sl_abs, target if low<=tgt_abs
+        if sl_abs is not None:
+            if side == "buy" and low <= sl_abs:
+                exit_px = sl_abs
+                exit_time = r["datetime"]
+                exit_reason = "SL"
+                break
+            if side == "sell" and high >= sl_abs:
+                exit_px = sl_abs
+                exit_time = r["datetime"]
+                exit_reason = "SL"
+                break
+        if tgt_abs is not None:
+            if side == "buy" and high >= tgt_abs:
+                exit_px = tgt_abs
+                exit_time = r["datetime"]
+                exit_reason = "TARGET"
+                break
+            if side == "sell" and low <= tgt_abs:
+                exit_px = tgt_abs
+                exit_time = r["datetime"]
+                exit_reason = "TARGET"
+                break
+
+    # PnL
+    if side == "buy":
+        pnl = (exit_px - entry_px) * qty
+        rr  = None if sl_pct in (None,0) else pnl / (entry_px * sl_pct * qty)
+    else:
+        pnl = (entry_px - exit_px) * qty
+        rr  = None if sl_pct in (None,0) else pnl / (entry_px * sl_pct * qty)
 
     return {
-        "n_trades": int(len(trades)),
-        "win_rate": float(round(win_rate, 2)),
-        "roi_pct": float(round(roi, 2)),
-        "max_dd_pct": float(round(max_dd, 2)),
-        "time_dd_bars": int(time_dd),
-        "rr": float(round(rr, 2)),
+        "date": d.isoformat(),
+        "entry_time": df.iloc[0]["datetime"].isoformat(),
+        "exit_time": exit_time.isoformat(),
+        "side": side,
+        "entry": round(entry_px, 2),
+        "exit": round(exit_px, 2),
+        "reason": exit_reason,
+        "qty": qty,
+        "pnl": round(pnl, 2),
+        "rr": None if rr is None else round(rr, 3),
     }
 
-def save_reports(out_dir: str, summary: dict, trades: pd.DataFrame, equity: pd.Series):
-    out_dir = out_dir.rstrip("/")
+def main():
+    cfg = _load_config()
+    trade = cfg.get("trade", {})
+    entry_time  = trade.get("entry_time", "09:20")
+    end_time    = trade.get("end_time",   "15:05")
+    sl_pct      = float(trade.get("sl_pct", 0.25))
+    target_pct  = float(trade.get("target_pct", 0.0))
 
-    if trades is not None and not trades.empty:
-        trades.to_csv(f"{out_dir}/trades.csv", index=False)
-    equity.to_csv(f"{out_dir}/equity.csv", header=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--token",   type=int, required=True, help="instrument token to backtest")
+    parser.add_argument("--from",    dest="date_from", required=True, help="YYYY-MM-DD")
+    parser.add_argument("--to",      dest="date_to",   required=True, help="YYYY-MM-DD")
+    parser.add_argument("--interval", default="5minute", choices=["3minute","5minute","10minute","15minute"])
+    parser.add_argument("--side",    default="sell", choices=["buy","sell"])
+    parser.add_argument("--qty",     type=int, default=1)
+    args = parser.parse_args()
 
-    with open(f"{out_dir}/metrics.json", "w", encoding="utf-8") as f:
+    api_key = (os.getenv("ZERODHA_API_KEY") or "").strip()
+    access  = (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
+    kite = KiteConnect(api_key=api_key)
+    kite.set_access_token(access)
+
+    d0 = datetime.fromisoformat(args.date_from).date()
+    d1 = datetime.fromisoformat(args.date_to).date()
+
+    os.makedirs("reports/backtest", exist_ok=True)
+
+    trades: List[Dict] = []
+    equity_rows = []
+    eq = 0.0
+
+    for d in daterange(d0, d1):
+        df = fetch_day_candles(kite, args.token, d, args.interval)
+        row = simulate_day(
+            df, d,
+            side=args.side,
+            qty=args.qty,
+            entry_time=entry_time,
+            end_time=end_time,
+            sl_pct=sl_pct,
+            target_pct=target_pct,
+        )
+        if row is None:
+            continue
+        trades.append(row)
+        eq += row["pnl"]
+        equity_rows.append({"date": d.isoformat(), "equity": round(eq, 2)})
+
+    # Save outputs
+    pd.DataFrame(trades).to_csv("reports/backtest/trades.csv", index=False)
+    pd.DataFrame(equity_rows).to_csv("reports/backtest/equity_curve.csv", index=False)
+
+    summary = {
+        "trades": len(trades),
+        "net_pnl": round(eq, 2),
+        "win_rate": round(100.0 * (sum(t["pnl"] > 0 for t in trades) / max(1,len(trades))), 2),
+        "config": {
+            "entry_time": entry_time,
+            "end_time": end_time,
+            "sl_pct": sl_pct,
+            "target_pct": target_pct,
+            "interval": args.interval,
+            "side": args.side,
+            "qty": args.qty,
+            "token": args.token,
+            "range": [args.date_from, args.date_to],
+        },
+    }
+    with open("reports/backtest/summary.json", "w") as f:
         json.dump(summary, f, indent=2)
+    print("✅ Backtest done:",
+          f"{summary['trades']} trades | Net PnL {summary['net_pnl']} | Win {summary['win_rate']}%")
+
+if __name__ == "__main__":
+    main()
