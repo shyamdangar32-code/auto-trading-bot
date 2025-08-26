@@ -1,71 +1,56 @@
 # bot/metrics.py
-# Reads reports/backtest/trades.csv and equity_curve.csv,
-# computes ROI, Max Drawdown, Accuracy, R:R (median), Time drawdown (days),
-# and updates/prints reports/backtest/summary.json.
-
-import json, os
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-def max_drawdown(series: pd.Series):
-    rollmax = series.cummax()
-    dd = series - rollmax
-    return float(dd.min())
+def compute_metrics(trades: pd.DataFrame, equity: pd.Series, starting_capital: float):
+    """
+    Compute extended metrics for both backtests and live runs.
+    """
+    if equity is None or equity.empty:
+        return {"n_trades": 0, "win_rate": 0.0, "roi_pct": 0.0}
 
-def time_underwater_days(series: pd.Series):
-    # consecutive days below the running max
-    rollmax = series.cummax()
-    underwater = series < rollmax
-    longest = curr = 0
-    for u in underwater:
-        curr = curr + 1 if u else 0
-        longest = max(longest, curr)
-    return int(longest)
+    # ROI
+    roi = (equity.iloc[-1] - starting_capital) / starting_capital * 100.0
 
-def main():
-    trades_path = "reports/backtest/trades.csv"
-    equity_path = "reports/backtest/equity_curve.csv"
-    summary_path = "reports/backtest/summary.json"
+    # Drawdown
+    roll_max = equity.cummax()
+    dd = equity / roll_max - 1.0
+    max_dd = dd.min() * 100.0
 
-    if not (os.path.exists(trades_path) and os.path.exists(equity_path)):
-        print("No backtest outputs found.")
-        return
+    # Time in drawdown
+    time_dd = 0
+    curr = 0
+    for below in (equity < roll_max):
+        curr = curr + 1 if below else 0
+        time_dd = max(time_dd, curr)
 
-    tdf = pd.read_csv(trades_path)
-    edf = pd.read_csv(equity_path)
+    # Trade stats
+    if trades is None or trades.empty:
+        n_trades = 0
+        win_rate = 0.0
+        rr = 0.0
+        avg_hold_bars = 0
+    else:
+        n_trades = len(trades)
+        wins = trades.loc[trades["pnl"] > 0, "pnl"].values
+        losses = trades.loc[trades["pnl"] < 0, "pnl"].abs().values
+        win_rate = (len(wins) / n_trades) * 100.0 if n_trades else 0.0
+        avg_win = np.mean(wins) if len(wins) else 0.0
+        avg_loss = np.mean(losses) if len(losses) else np.nan
+        rr = (avg_win / avg_loss) if avg_loss and not np.isnan(avg_loss) and avg_loss > 0 else 0.0
+        avg_hold_bars = trades.apply(lambda r: (r["exit_time"] - r["entry_time"]).total_seconds() / 60, axis=1).mean()
 
-    roi = float(edf["equity"].iloc[-1]) if not edf.empty else 0.0
-    wins = (tdf["pnl"] > 0).sum()
-    total = max(1, len(tdf))
-    acc = 100.0 * wins / total
-    rr_med = float(np.nanmedian(tdf.get("rr", pd.Series(dtype=float))))
+    # Sharpe ratio (approx, using bar returns)
+    returns = equity.pct_change().dropna()
+    sharpe = (returns.mean() / returns.std() * np.sqrt(252)) if not returns.empty else 0.0
 
-    mdd = max_drawdown(edf["equity"]) if not edf.empty else 0.0
-    tdd = time_underwater_days(edf["equity"]) if not edf.empty else 0
-
-    summary = {}
-    if os.path.exists(summary_path):
-        with open(summary_path, "r") as f:
-            summary = json.load(f)
-
-    summary.update({
-        "metrics": {
-            "ROI": round(roi, 2),
-            "Accuracy_pct": round(acc, 2),
-            "Median_R_multiple": None if np.isnan(rr_med) else round(rr_med, 3),
-            "Max_Drawdown": round(mdd, 2),
-            "Time_Drawdown_days": tdd,
-        }
-    })
-
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
-
-    print("📊 Metrics:",
-          f"ROI={summary['metrics']['ROI']},",
-          f"Acc={summary['metrics']['Accuracy_pct']}%,",
-          f"MDD={summary['metrics']['Max_Drawdown']},",
-          f"TDD={summary['metrics']['Time_Drawdown_days']}d")
-
-if __name__ == "__main__":
-    main()
+    return {
+        "n_trades": int(n_trades),
+        "win_rate": float(round(win_rate, 2)),
+        "roi_pct": float(round(roi, 2)),
+        "max_dd_pct": float(round(max_dd, 2)),
+        "time_dd_bars": int(time_dd),
+        "rr": float(round(rr, 2)),
+        "avg_hold_minutes": float(round(avg_hold_bars, 2)),
+        "sharpe_ratio": float(round(sharpe, 2)),
+    }
