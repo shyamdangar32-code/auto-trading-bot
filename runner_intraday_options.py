@@ -3,7 +3,6 @@
 
 import os
 import json
-import math
 import argparse
 from types import SimpleNamespace
 from datetime import datetime, date, time, timedelta, timezone
@@ -34,10 +33,7 @@ def round_to_strike(spot: float, base: int) -> int:
     return int(round(spot / base) * base)
 
 def parse_hhmm(s: str, fallback: str = "09:30") -> tuple[int,int]:
-    """Return (hh,mm); if missing/invalid, use fallback."""
-    txt = (s or "").strip()
-    if not txt:
-        txt = fallback
+    txt = (s or "").strip() or fallback
     try:
         hh, mm = map(int, txt.split(":"))
         if not (0 <= hh <= 23 and 0 <= mm <= 59):
@@ -50,13 +46,30 @@ def parse_hhmm(s: str, fallback: str = "09:30") -> tuple[int,int]:
 def send_telegram(text: str, token: str, chat_id: str):
     try:
         import requests
-        requests.get(
+        requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            params={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
             timeout=8,
         )
     except Exception:
         pass
+
+def tz_to_ist(df: pd.DataFrame, col: str = "Date") -> pd.DataFrame:
+    """Make df[col] timezone-aware in IST; if aware, convert to IST."""
+    d = df.copy()
+    if d.empty:
+        return d
+    s = d[col]
+    try:
+        # pandas 2.x: dt.tz is None for naive
+        if s.dt.tz is None:
+            d[col] = s.dt.tz_localize(IST)
+        else:
+            d[col] = s.dt.tz_convert(IST)
+    except Exception:
+        # last resort: assume naive and localize
+        d[col] = pd.to_datetime(s).dt.tz_localize(IST)
+    return d
 
 # ---------------- Zerodha helpers ----------------
 
@@ -67,14 +80,16 @@ def get_kite_from_env() -> KiteConnect:
         raise RuntimeError("ZERODHA_API_KEY / ZERODHA_ACCESS_TOKEN missing")
 
     kite = KiteConnect(api_key=api_key)
+    # If your account requires a pinned CA cert/fingerprint, set it here:
+    # kite.set_session_expiry_hook(lambda: None)  # no-op, placeholder
     kite.set_access_token(access)
     kite.profile()
     print("✅ Zerodha token OK.")
     return kite
 
 INDEX_TOKENS = {
-    "NIFTY": 256265,
-    "BANKNIFTY": 260105,
+    "NIFTY": 256265,      # NIFTY 50 spot
+    "BANKNIFTY": 260105,  # NIFTY BANK spot
 }
 
 LOT_SIZE = {
@@ -93,8 +108,9 @@ def nfo_instruments(kite):
 def this_week_expiry(dt: datetime) -> date:
     d = dt.date()
     weekday = d.weekday()  # Mon=0 ... Thu=3
-    days_ahead = (3 - weekday) % 7
+    days_ahead = (3 - weekday) % 7  # weekly Thursday
     expiry = d + timedelta(days=days_ahead)
+    # If it's already Thu after close, move to next week
     if weekday == 3 and dt.time() > time(15, 30):
         expiry = expiry + timedelta(days=7)
     return expiry
@@ -122,6 +138,8 @@ def map_interval(iv: str) -> str:
         "5m": "5minute",
         "10m": "10minute",
         "15m": "15minute",
+        "5minute": "5minute",
+        "15minute": "15minute",
     }.get(iv, "5minute")
 
 def fetch_session_ohlc(kite, token: int, for_day: date, interval_alias: str) -> pd.DataFrame:
@@ -136,15 +154,16 @@ def fetch_session_ohlc(kite, token: int, for_day: date, interval_alias: str) -> 
     df = pd.DataFrame(candles or [])
     if df.empty:
         return df
-    df.rename(columns={"date":"Date","open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"}, inplace=True)
-    df["Date"] = pd.to_datetime(df["Date"])
+    df.rename(columns={
+        "date":"Date","open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"
+    }, inplace=True)
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"])
+    df = tz_to_ist(df, "Date")
     return df
 
 def fetch_best_ohlc(kite, token: int, interval_alias: str, prefer_day: date | None) -> tuple[pd.DataFrame, date]:
-    """
-    1) If prefer_day given, try it; if empty, try previous trading day.
-    2) Else try today; if empty, try previous trading day.
-    """
+    """Try prefer_day → previous trading day; else today → previous trading day."""
     if prefer_day:
         d = prefer_day
         df = fetch_session_ohlc(kite, token, d, interval_alias)
@@ -198,10 +217,16 @@ def main():
 
     kite = get_kite_from_env()
 
-    # Spot & ATM
+    # Spot & ATM (robust: try NSE:INDEX_LABEL then fallback to instrument token)
     index_label = 'NIFTY 50' if iocfg.underlying == 'NIFTY' else 'NIFTY BANK'
-    spot_info = kite.ltp([f"NSE:{index_label}"])
-    spot_val = list(spot_info.values())[0]["last_price"]
+    try:
+        spot_info = kite.ltp([f"NSE:{index_label}"])
+        spot_val = list(spot_info.values())[0]["last_price"]
+    except Exception:
+        tok = INDEX_TOKENS[iocfg.underlying]
+        spot_info = kite.ltp([tok])
+        spot_val = list(spot_info.values())[0]["last_price"]
+
     atm = round_to_strike(spot_val, STRIKE_STEP[iocfg.underlying])
     print(f"ℹ️  {iocfg.underlying} spot {spot_val:.1f} → ATM {atm}")
 
@@ -224,7 +249,7 @@ def main():
             raise RuntimeError(f"Invalid intraday_options.date '{iocfg.date}', use YYYY-MM-DD")
 
     # OHLC (robust)
-    ival = iocfg.interval if hasattr(iocfg, "interval") else "5m"
+    ival = iocfg.interval if hasattr(iocfg, "interval") else "5minute"
     ce_df, used_day = fetch_best_ohlc(kite, ce_token, ival, prefer_day)
     pe_df, _       = fetch_best_ohlc(kite, pe_token, ival, prefer_day)
     print(f"📅 Using session: {used_day}")
@@ -234,7 +259,8 @@ def main():
     entry_h, entry_m = parse_hhmm(raw_entry_time, fallback="09:30")
 
     def first_bar_at(df: pd.DataFrame):
-        return df[df["Date"].dt.tz_convert(IST).dt.time >= time(entry_h, entry_m)].head(1)
+        d = tz_to_ist(df, "Date")
+        return d[d["Date"].dt.time >= time(entry_h, entry_m)].head(1)
 
     ce_bar = first_bar_at(ce_df)
     pe_bar = first_bar_at(pe_df)
@@ -263,7 +289,7 @@ def main():
     print(f"🧾 {ce_sym} | rows: {len(ce_df)} | Close: {ce_entry}")
     print(f"🧾 {pe_sym} | rows: {len(pe_df)} | Close: {pe_entry}")
     print(f"📌 Entry {entry_h:02d}:{entry_m:02d} | Short Straddle {atm} | Lots: {lots} (lot_size {lot_size})")
-    print(f"🛡️  SL per leg: {sl_pct}% | 🎯 Combined target: {tgt_pct}% | 🧵 Trailing: {trail_cfg}")
+    print(f"🛡️  SL/leg: {sl_pct}% | 🎯 Combined target: {tgt_pct}% | 🧵 Trailing: {trail_cfg}")
 
     # Telegram
     t_token = getattr(iocfg, "telegram_bot_token", "") or os.getenv("TELEGRAM_BOT_TOKEN", "")
