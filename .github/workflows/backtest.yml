@@ -39,7 +39,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
-    # Secrets are available for ONLINE mode and Telegram notifications
     env:
       ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
       ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
@@ -72,7 +71,6 @@ jobs:
       - name: Add repo to PYTHONPATH (fix imports)
         run: echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
 
-      # Optional: verify Zerodha profile only when mode=online
       - name: Verify Kite (optional)
         if: ${{ github.event.inputs.mode == 'online' }}
         continue-on-error: true
@@ -98,7 +96,8 @@ jobs:
         if: always()
         run: |
           ls -la reports || true
-          [ -f reports/latest.json ] && head -n 60 reports/latest.json || true
+          [ -f reports/metrics.json ] && (echo "----- metrics.json -----"; head -n 80 reports/metrics.json) || true
+          [ -f reports/latest.json ] && (echo "----- latest.json (legacy) -----"; head -n 60 reports/latest.json) || true
 
       - name: Upload artifacts (reports + logs)
         if: always()
@@ -108,3 +107,11 @@ jobs:
           path: |
             reports/**
             logs/**
+
+      - name: Notify Telegram (summary + charts)
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python tools/telegram_notify.py --dir reports
