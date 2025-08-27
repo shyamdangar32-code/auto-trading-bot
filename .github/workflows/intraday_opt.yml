@@ -6,11 +6,14 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     env:
+      # Zerodha (paper run still verifies token/profile)
       ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
       ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
       ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+      # Telegram (optional but recommended)
       TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
 
@@ -31,21 +34,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Add repo to PYTHONPATH
         run: echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
-
-      - name: Debug secrets lengths
-        run: |
-          echo "API_KEY length:     ${#ZERODHA_API_KEY}"
-          echo "API_SECRET length:  ${#ZERODHA_API_SECRET}"
-          echo "ACCESS_TOKEN length:${#ZERODHA_ACCESS_TOKEN}"
-          echo "TG_TOKEN length:    ${#TELEGRAM_BOT_TOKEN}"
-          echo "TG_CHAT_ID length:  ${#TELEGRAM_CHAT_ID}"
 
       - name: Preflight Zerodha profile (must pass)
         run: |
@@ -66,6 +61,11 @@ jobs:
         run: |
           mkdir -p reports logs
           python runner_intraday_options.py --out_dir "./reports" | tee logs/intraday.log
+
+      # NEW: guarantee minimal artifacts even on a no-trade day
+      - name: Ensure reports exist (even if no trades)
+        run: |
+          python tools/ensure_metrics.py --dir "./reports" --note "No signals generated today."
 
       - name: Upload artifacts (reports + logs)
         if: always()
