@@ -1,4 +1,5 @@
 # bot/backtest.py
+from __future__ import annotations
 import json
 from dataclasses import dataclass
 import numpy as np
@@ -8,7 +9,8 @@ from .strategy import (
     prepare_signals, initial_stop_target, trail_stop,
     LONG, SHORT, FLAT
 )
-from .metrics import compute_metrics  # ⬅️ NEW: centralize metrics here
+from .metrics import compute_metrics
+from .evaluation import plot_equity_and_drawdown, write_quick_report
 
 
 @dataclass
@@ -16,8 +18,8 @@ class Trade:
     side: int
     entry_time: pd.Timestamp
     entry: float
-    exit_time: pd.Timestamp = None
-    exit: float = None
+    exit_time: pd.Timestamp | None = None
+    exit: float | None = None
     reason: str = ""
     pnl: float = 0.0
 
@@ -27,7 +29,7 @@ def run_backtest(prices: pd.DataFrame, cfg: dict):
     Walk-forward backtest with:
       - Re-entry (cooldown supported)
       - ATR stop/target
-      - Trailing stop (ATR-based via strategy.trail_stop)
+      - Trailing stop (ATR-based)
     Returns: (summary_dict, trades_df, equity_series)
     """
     d = prepare_signals(prices, cfg).copy()
@@ -37,83 +39,75 @@ def run_backtest(prices: pd.DataFrame, cfg: dict):
     re_max     = int(cfg.get("reentry_max", 0))
     cooldown   = int(cfg.get("reentry_cooldown", 0))
 
-    # containers
     position = FLAT
     entry_px = stop = target = np.nan
     re_count = 0
     last_exit_idx = -10**9
     trades: list[Trade] = []
 
-    equity = capital
-    eq_curve = []
+    equity_val = capital
+    eq_curve: list[float] = []
 
     idx_list = list(d.index)
     for i, ts in enumerate(idx_list):
         row = d.loc[ts]
         px  = float(row["Close"])
-        atr_val = float(row["atr"]) if not np.isnan(row.get("atr", np.nan)) else 0.0
+        atr_val = float(row.get("atr", np.nan)) if not np.isnan(row.get("atr", np.nan)) else 0.0
 
-        # trailing while in position
+        # Update trailing stop if in position
         if position != FLAT:
             stop = trail_stop(position, px, atr_val, stop, entry_px, cfg)
 
-        # -------- exits --------
+        # ----- exits -----
         did_exit = False
         if position == LONG:
-            # stop
-            if row["Low"] <= stop:
+            if row["Low"] <= stop:  # stop hit
                 trades[-1].exit_time = ts
                 trades[-1].exit = stop
                 trades[-1].reason = "STOP"
                 trades[-1].pnl = (stop - entry_px) * qty
-                equity += trades[-1].pnl
+                equity_val += trades[-1].pnl
                 position = FLAT
                 did_exit = True
-            # target
-            elif row["High"] >= target:
+            elif row["High"] >= target:  # target hit
                 trades[-1].exit_time = ts
                 trades[-1].exit = target
                 trades[-1].reason = "TARGET"
                 trades[-1].pnl = (target - entry_px) * qty
-                equity += trades[-1].pnl
+                equity_val += trades[-1].pnl
                 position = FLAT
                 did_exit = True
 
         elif position == SHORT:
-            # stop
             if row["High"] >= stop:
                 trades[-1].exit_time = ts
                 trades[-1].exit = stop
                 trades[-1].reason = "STOP"
                 trades[-1].pnl = (entry_px - stop) * qty
-                equity += trades[-1].pnl
+                equity_val += trades[-1].pnl
                 position = FLAT
                 did_exit = True
-            # target
             elif row["Low"] <= target:
                 trades[-1].exit_time = ts
                 trades[-1].exit = target
                 trades[-1].reason = "TARGET"
                 trades[-1].pnl = (entry_px - target) * qty
-                equity += trades[-1].pnl
+                equity_val += trades[-1].pnl
                 position = FLAT
                 did_exit = True
 
         if did_exit:
             last_exit_idx = i
-            # keep re_count; it’s handled on new-day reset
 
-        # -------- entries & re-entries --------
+        # ----- entries & re-entries -----
         if position == FLAT:
             ok_after_cooldown = (i - last_exit_idx) >= cooldown
-
             if ok_after_cooldown:
                 if bool(row.get("long_entry", False)) and (re_count < re_max or re_max == 0):
                     position = LONG
                     entry_px = px
                     stop, target = initial_stop_target(LONG, entry_px, atr_val, cfg)
                     trades.append(Trade(LONG, ts, entry_px))
-                    # if this is a re-entry (i.e., there was a prior exit in the day)
                     re_count += 1 if last_exit_idx > -10**8 else 0
 
                 elif bool(row.get("short_entry", False)) and (re_count < re_max or re_max == 0):
@@ -123,15 +117,14 @@ def run_backtest(prices: pd.DataFrame, cfg: dict):
                     trades.append(Trade(SHORT, ts, entry_px))
                     re_count += 1 if last_exit_idx > -10**8 else 0
 
-        # -------- new day => reset re-entry counter --------
+        # reset re-entries on day change
         if i > 0:
             prev_day = pd.Timestamp(idx_list[i-1]).date()
             this_day = pd.Timestamp(ts).date()
             if this_day != prev_day:
                 re_count = 0
 
-        # mark-to-market (simple)
-        eq_curve.append(equity)
+        eq_curve.append(equity_val)
 
     trades_df = pd.DataFrame([t.__dict__ for t in trades])
     if not trades_df.empty:
@@ -139,17 +132,20 @@ def run_backtest(prices: pd.DataFrame, cfg: dict):
 
     equity_ser = pd.Series(eq_curve, index=d.index, name="equity")
 
-    # 🔢 NEW: richer metrics from bot/metrics.py
+    # metrics
     summary = compute_metrics(trades_df, equity_ser, capital)
     return summary, trades_df, equity_ser
 
 
 def save_reports(out_dir: str, summary: dict, trades: pd.DataFrame, equity: pd.Series):
     """
-    Persist backtest artifacts:
+    Writes:
       - trades.csv
       - equity.csv
       - metrics.json
+      - equity_curve.png
+      - drawdown.png
+      - report.md
     """
     out_dir = out_dir.rstrip("/")
 
@@ -161,3 +157,8 @@ def save_reports(out_dir: str, summary: dict, trades: pd.DataFrame, equity: pd.S
 
     with open(f"{out_dir}/metrics.json", "w", encoding="utf-8") as f:
         json.dump(summary or {}, f, indent=2)
+
+    # plots + quick MD report
+    if equity is not None and not equity.empty:
+        plot_equity_and_drawdown(equity, out_dir)
+    write_quick_report(summary or {}, trades, out_dir)
