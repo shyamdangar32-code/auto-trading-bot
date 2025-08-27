@@ -19,44 +19,20 @@ on:
         description: "1m,3m,5m,10m,15m"
         required: true
         default: "5m"
-      # strategy/risk knobs (forwarded to your CLI)
       capital_rs:
         required: true
         default: "100000"
       order_qty:
         required: true
         default: "1"
-      leg_sl_percent:
-        required: true
-        default: "25"
-      combined_target_percent:
-        required: true
-        default: "0"
-      reentry_max:
-        required: true
-        default: "0"
-      reentry_cooldown:
-        required: true
-        default: "0"
-      trailing_enabled:
-        required: true
-        default: "false"
-      trail_type:
-        required: true
-        default: "atr"
-      trail_atr_mult:
-        required: true
-        default: "1.5"
-      adx_min:
-        required: true
-        default: "10"
-      telegram_notify:
-        required: true
-        default: "true"
       mode:
         description: "offline (default) or online"
         required: true
         default: "offline"
+      params_json:
+        description: "Extra params as JSON (e.g. {\"leg_sl_percent\":25,\"reentry_max\":0})"
+        required: false
+        default: "{}"
 
 jobs:
   run:
@@ -64,7 +40,6 @@ jobs:
     timeout-minutes: 20
 
     env:
-      # Zerodha + Telegram (only used in online mode / notifications)
       ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
       ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
       ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
@@ -75,46 +50,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show tree
-        run: |
-          pwd && ls -la
-          echo "---- tools/ ----"; ls -la tools || true
-          echo "---- bot/ ----";   ls -la bot || true
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
       - name: Install deps
-        run: |
-          python -V
-          pip install -r requirements.txt
-
-      # --- Optional: sanity check Zerodha token (safe to run even in offline mode) ---
-      - name: Verify Kite (optional)
-        continue-on-error: true
-        run: |
-          if [ "${{ github.event.inputs.mode }}" = "online" ]; then
-            echo "Running verify_kite.py…"
-            python verify_kite.py
-          else
-            echo "Offline mode: skip verify_kite.py"
-          fi
+        run: pip install -r requirements.txt
 
       - name: Run backtest
         run: |
           mkdir -p reports logs
           echo "▶ Inputs: ${{ toJson(github.event.inputs) }}"
-          # offline by default; your script should ignore Zerodha when offline
+
           python tools/run_backtest.py \
             --underlying "${{ github.event.inputs.underlying }}" \
             --start "${{ github.event.inputs.start_date }}" \
@@ -122,24 +70,10 @@ jobs:
             --interval "${{ github.event.inputs.interval }}" \
             --capital_rs "${{ github.event.inputs.capital_rs }}" \
             --order_qty "${{ github.event.inputs.order_qty }}" \
-            --leg_sl_percent "${{ github.event.inputs.leg_sl_percent }}" \
-            --combined_target_percent "${{ github.event.inputs.combined_target_percent }}" \
-            --reentry_max "${{ github.event.inputs.reentry_max }}" \
-            --reentry_cooldown "${{ github.event.inputs.reentry_cooldown }}" \
-            --trailing_enabled "${{ github.event.inputs.trailing_enabled }}" \
-            --trail_type "${{ github.event.inputs.trail_type }}" \
-            --trail_atr_mult "${{ github.event.inputs.trail_atr_mult }}" \
-            --adx_min "${{ github.event.inputs.adx_min }}" \
-            --telegram_notify "${{ github.event.inputs.telegram_notify }}" \
             --mode "${{ github.event.inputs.mode }}" \
+            --extra_params '${{ github.event.inputs.params_json }}' \
             --out_dir "./reports" \
             | tee logs/backtest.log
-
-      - name: Show reports
-        if: always()
-        run: |
-          ls -la reports || true
-          [ -f reports/latest.json ] && head -n 60 reports/latest.json || true
 
       - name: Upload artifacts
         if: always()
