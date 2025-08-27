@@ -1,118 +1,151 @@
-      - name: Run backtest + Telegram notify
+name: backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      underlying:
+        description: "NIFTY or BANKNIFTY"
+        required: true
+        default: "BANKNIFTY"
+      start_date:
+        description: "YYYY-MM-DD"
+        required: true
+        default: "2025-07-01"
+      end_date:
+        description: "YYYY-MM-DD"
+        required: true
+        default: "2025-08-01"
+      interval:
+        description: "1m,3m,5m,10m,15m"
+        required: true
+        default: "5m"
+      # strategy/risk knobs (forwarded to your CLI)
+      capital_rs:
+        required: true
+        default: "100000"
+      order_qty:
+        required: true
+        default: "1"
+      leg_sl_percent:
+        required: true
+        default: "25"
+      combined_target_percent:
+        required: true
+        default: "0"
+      reentry_max:
+        required: true
+        default: "0"
+      reentry_cooldown:
+        required: true
+        default: "0"
+      trailing_enabled:
+        required: true
+        default: "false"
+      trail_type:
+        required: true
+        default: "atr"
+      trail_atr_mult:
+        required: true
+        default: "1.5"
+      adx_min:
+        required: true
+        default: "10"
+      telegram_notify:
+        required: true
+        default: "true"
+      mode:
+        description: "offline (default) or online"
+        required: true
+        default: "offline"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      # Zerodha + Telegram (only used in online mode / notifications)
+      ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
+      ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
+      ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+      TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show tree
         run: |
-          python - <<'PY'
-          import os, json, sys
-          from datetime import datetime, timedelta
-          import pandas as pd
-          import requests
+          pwd && ls -la
+          echo "---- tools/ ----"; ls -la tools || true
+          echo "---- bot/ ----";   ls -la bot || true
 
-          from kiteconnect import KiteConnect
-          from bot.backtest import run_backtest, save_reports
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-          # ----------------- constants -----------------
-          INDEX_TOKENS = {"NIFTY": 256265, "BANKNIFTY": 260105}
-          INTERVAL_MAP = {
-              "1m": "minute", "3m": "3minute", "5m": "5minute",
-              "10m": "10minute", "15m": "15minute", "30m": "30minute",
-              "60m": "60minute", "1d": "day", "day": "day"
-          }
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
-          def get_kite():
-            api_key = (os.getenv("ZERODHA_API_KEY") or "").strip()
-            access  = (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
-            if not api_key or not access:
-              sys.exit("❌ Missing ZERODHA_API_KEY / ZERODHA_ACCESS_TOKEN (set repo secrets).")
-            kite = KiteConnect(api_key=api_key)
-            kite.set_access_token(access)
-            try:
-              prof = kite.profile()
-              print("✅ Zerodha token OK for:", prof.get("user_name", "unknown"))
-            except Exception as e:
-              sys.exit(f"❌ Token/profile check failed: {e}")
-            return kite
+      - name: Install deps
+        run: |
+          python -V
+          pip install -r requirements.txt
 
-          def fetch_index_ohlc(kite, token, start_dt, end_dt, iv):
-            # Kite requires NAIVE datetimes (no tzinfo)
-            if start_dt.tzinfo or end_dt.tzinfo:
-              raise SystemExit("❌ Start/End must be naive datetimes (no tzinfo).")
-            iv = INTERVAL_MAP.get(iv, "5minute")
-            try:
-              data = kite.historical_data(token, start_dt, end_dt, iv)
-            except Exception as e:
-              # Most common: 403 if Historical Data add-on not enabled
-              raise SystemExit(f"❌ historical_data failed (interval={iv}). "
-                               f"Likely causes: no Historical add-on / token expired / bad range. Error: {e}")
-            df = pd.DataFrame(data or [])
-            if df.empty:
-              raise SystemExit("❌ No historical data returned. Check instrument, dates, add-on & interval.")
-            df.rename(columns={"date":"Date","open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"}, inplace=True)
-            df["Date"] = pd.to_datetime(df["Date"])
-            return df
+      # --- Optional: sanity check Zerodha token (safe to run even in offline mode) ---
+      - name: Verify Kite (optional)
+        continue-on-error: true
+        run: |
+          if [ "${{ github.event.inputs.mode }}" = "online" ]; then
+            echo "Running verify_kite.py…"
+            python verify_kite.py
+          else
+            echo "Offline mode: skip verify_kite.py"
+          fi
 
-          def send_telegram(text):
-            tok = os.getenv("TELEGRAM_BOT_TOKEN","").strip()
-            chat= os.getenv("TELEGRAM_CHAT_ID","").strip()
-            if not tok or not chat:
-              print("ℹ️ Telegram not configured; skipping.")
-              return
-            try:
-              requests.get(f"https://api.telegram.org/bot{tok}/sendMessage",
-                           params={"chat_id": chat, "text": text, "parse_mode": "HTML"},
-                           timeout=10)
-              print("✅ Telegram sent.")
-            except Exception as e:
-              print("⚠️ Telegram failed:", e)
+      - name: Run backtest
+        run: |
+          mkdir -p reports logs
+          echo "▶ Inputs: ${{ toJson(github.event.inputs) }}"
+          # offline by default; your script should ignore Zerodha when offline
+          python tools/run_backtest.py \
+            --underlying "${{ github.event.inputs.underlying }}" \
+            --start "${{ github.event.inputs.start_date }}" \
+            --end "${{ github.event.inputs.end_date }}" \
+            --interval "${{ github.event.inputs.interval }}" \
+            --capital_rs "${{ github.event.inputs.capital_rs }}" \
+            --order_qty "${{ github.event.inputs.order_qty }}" \
+            --leg_sl_percent "${{ github.event.inputs.leg_sl_percent }}" \
+            --combined_target_percent "${{ github.event.inputs.combined_target_percent }}" \
+            --reentry_max "${{ github.event.inputs.reentry_max }}" \
+            --reentry_cooldown "${{ github.event.inputs.reentry_cooldown }}" \
+            --trailing_enabled "${{ github.event.inputs.trailing_enabled }}" \
+            --trail_type "${{ github.event.inputs.trail_type }}" \
+            --trail_atr_mult "${{ github.event.inputs.trail_atr_mult }}" \
+            --adx_min "${{ github.event.inputs.adx_min }}" \
+            --telegram_notify "${{ github.event.inputs.telegram_notify }}" \
+            --mode "${{ github.event.inputs.mode }}" \
+            --out_dir "./reports" \
+            | tee logs/backtest.log
 
-          # ----------------- inputs -----------------
-          gh = ${{
-            toJson(github.event.inputs)
-          }}
-          sym    = (gh.get("underlying") or "BANKNIFTY").upper()
-          iv     = (gh.get("interval") or "5m").lower()
-          # NAIVE datetimes – no tzinfo
-          start  = datetime.strptime(gh.get("start_date"), "%Y-%m-%d")
-          end    = datetime.strptime(gh.get("end_date"),   "%Y-%m-%d") + timedelta(hours=23, minutes=59)
+      - name: Show reports
+        if: always()
+        run: |
+          ls -la reports || true
+          [ -f reports/latest.json ] && head -n 60 reports/latest.json || true
 
-          cfg = {
-            "capital_rs": float(gh.get("capital_rs") or 100000),
-            "order_qty": int(gh.get("order_qty") or 1),
-            "leg_sl_percent": float(gh.get("leg_sl_percent") or 25),
-            "combined_target_percent": float(gh.get("combined_target_percent") or 0),
-            "reentry_max": int(gh.get("reentry_max") or 0),
-            "reentry_cooldown": int(gh.get("reentry_cooldown") or 0),
-            "trailing_enabled": (str(gh.get("trailing_enabled")).lower()=="true"),
-            "trail_type": gh.get("trail_type") or "atr",
-            "trail_atr_mult": float(gh.get("trail_atr_mult") or 1.5),
-            "adx_min": int(gh.get("adx_min") or 10),
-          }
-
-          print(f"▶ Underlying={sym}  Interval={iv}  Range={start.date()}→{end.date()}")
-          token = INDEX_TOKENS.get(sym)
-          if not token:
-            sys.exit(f"❌ Unsupported underlying: {sym}")
-
-          kite = get_kite()
-          prices = fetch_index_ohlc(kite, token, start, end, iv)
-          print(f"✅ Got {len(prices)} bars.")
-
-          # ----------------- backtest -----------------
-          print("▶ Running backtest…")
-          summary, trades, equity = run_backtest(prices, cfg)
-
-          out_dir = "./reports"
-          os.makedirs(out_dir, exist_ok=True)
-          save_reports(out_dir, summary, trades, equity)
-          print("📦 Wrote reports to ./reports (latest.json, latest_signals.csv etc.)")
-
-          if (str(gh.get("telegram_notify")).lower()=="true"):
-            txt = (
-              "📊 <b>Backtest Summary</b>\n"
-              f"• Index: <b>{sym}</b> | {start.date()} → {end.date()}\n"
-              f"• Bars: {len(prices)} | Interval: {iv}\n"
-              f"• Trades: <b>{summary.get('n_trades',0)}</b>\n"
-              f"• Win-rate: <b>{summary.get('win_rate',0)}%</b>\n"
-              f"• ROI: <b>{summary.get('roi_pct',0)}%</b>\n"
-              f"• Max DD: <b>{summary.get('max_dd_pct',0)}%</b>"
-            )
-            send_telegram(txt)
-          PY
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-artifacts
+          path: |
+            reports/**
+            logs/**
