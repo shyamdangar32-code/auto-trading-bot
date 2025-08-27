@@ -30,7 +30,7 @@ on:
         required: true
         default: "offline"
       params_json:
-        description: "Extra params as JSON (e.g. {\"leg_sl_percent\":25,\"reentry_max\":0})"
+        description: "Extra params as JSON (e.g. {\"leg_sl_percent\":25,\"tele...\":true})"
         required: false
         default: "{}"
 
@@ -39,6 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
+    # Secrets are available for ONLINE mode and Telegram notifications
     env:
       ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
       ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
@@ -55,14 +56,32 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
       - name: Install deps
-        run: pip install -r requirements.txt
+        run: |
+          python -V
+          pip install -r requirements.txt
+
+      - name: Add repo to PYTHONPATH (fix imports)
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
+
+      # Optional: verify Zerodha profile only when mode=online
+      - name: Verify Kite (optional)
+        if: ${{ github.event.inputs.mode == 'online' }}
+        continue-on-error: true
+        run: python verify_kite.py
 
       - name: Run backtest
         run: |
           mkdir -p reports logs
           echo "▶ Inputs: ${{ toJson(github.event.inputs) }}"
-
           python tools/run_backtest.py \
             --underlying "${{ github.event.inputs.underlying }}" \
             --start "${{ github.event.inputs.start_date }}" \
@@ -75,7 +94,13 @@ jobs:
             --out_dir "./reports" \
             | tee logs/backtest.log
 
-      - name: Upload artifacts
+      - name: Show reports (preview)
+        if: always()
+        run: |
+          ls -la reports || true
+          [ -f reports/latest.json ] && head -n 60 reports/latest.json || true
+
+      - name: Upload artifacts (reports + logs)
         if: always()
         uses: actions/upload-artifact@v4
         with:
