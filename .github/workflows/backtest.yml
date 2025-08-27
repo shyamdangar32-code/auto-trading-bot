@@ -1,149 +1,50 @@
-name: backtest
-
-on:
-  workflow_dispatch:
-    inputs:
-      underlying:
-        description: "Index to backtest (NIFTY or BANKNIFTY)"
-        required: true
-        default: "BANKNIFTY"
-      start_date:
-        description: "Backtest start date (YYYY-MM-DD)"
-        required: true
-        default: "2025-07-01"
-      end_date:
-        description: "Backtest end date (YYYY-MM-DD)"
-        required: true
-        default: "2025-08-01"
-      interval:
-        description: "Bar interval (1m,3m,5m,10m,15m)"
-        required: true
-        default: "5m"
-      capital_rs:
-        description: "Starting capital (₹)"
-        required: true
-        default: "100000"
-      order_qty:
-        description: "Order quantity (units per trade)"
-        required: true
-        default: "1"
-      leg_sl_percent:
-        description: "Stoploss % per leg"
-        required: true
-        default: "25"
-      combined_target_percent:
-        description: "Combined target %"
-        required: true
-        default: "0"
-      reentry_max:
-        description: "Max re-entries per day (0 = unlimited)"
-        required: true
-        default: "0"
-      reentry_cooldown:
-        description: "Cooldown bars after an exit"
-        required: true
-        default: "0"
-      trailing_enabled:
-        description: "Enable trailing stop? (true/false)"
-        required: true
-        default: "false"
-      trail_type:
-        description: "Trailing type (atr)"
-        required: true
-        default: "atr"
-      trail_atr_mult:
-        description: "ATR multiple for trailing"
-        required: true
-        default: "1.5"
-      adx_min:
-        description: "Minimum ADX for trailing"
-        required: true
-        default: "10"
-      telegram_notify:
-        description: "Send Telegram summary? (true/false)"
-        required: true
-        default: "true"
-
-jobs:
-  run:
-    runs-on: ubuntu-latest
-
-    env:
-      # Zerodha (already in your repo secrets)
-      ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
-      ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
-
-      # Telegram (either keep in secrets, or set in config later)
-      TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: ${{ runner.os }}-pip-
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Debug inputs
-        run: |
-          echo "▶ Underlying:        ${{ github.event.inputs.underlying }}"
-          echo "▶ Range:             ${{ github.event.inputs.start_date }} → ${{ github.event.inputs.end_date }}"
-          echo "▶ Interval:          ${{ github.event.inputs.interval }}"
-          echo "▶ Capital:           ₹${{ github.event.inputs.capital_rs }}"
-          echo "▶ SL% per leg:       ${{ github.event.inputs.leg_sl_percent }}"
-          echo "▶ Target% combined:  ${{ github.event.inputs.combined_target_percent }}"
-          echo "▶ Re-entry max:      ${{ github.event.inputs.reentry_max }}"
-          echo "▶ Trailing enabled:  ${{ github.event.inputs.trailing_enabled }}"
-
       - name: Run backtest + Telegram notify
         run: |
           python - <<'PY'
-          import os, json
-          from datetime import datetime, timedelta, timezone
+          import os, json, sys
+          from datetime import datetime, timedelta
           import pandas as pd
           import requests
 
           from kiteconnect import KiteConnect
           from bot.backtest import run_backtest, save_reports
 
-          # ----------------- helpers -----------------
-          IST = timezone(timedelta(hours=5, minutes=30))
-
+          # ----------------- constants -----------------
           INDEX_TOKENS = {"NIFTY": 256265, "BANKNIFTY": 260105}
-          INTERVAL_MAP = {"1m": "minute", "3m": "3minute", "5m": "5minute",
-                          "10m": "10minute", "15m": "15minute"}
+          INTERVAL_MAP = {
+              "1m": "minute", "3m": "3minute", "5m": "5minute",
+              "10m": "10minute", "15m": "15minute", "30m": "30minute",
+              "60m": "60minute", "1d": "day", "day": "day"
+          }
 
           def get_kite():
             api_key = (os.getenv("ZERODHA_API_KEY") or "").strip()
             access  = (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
             if not api_key or not access:
-              raise SystemExit("❌ Missing ZERODHA_API_KEY / ZERODHA_ACCESS_TOKEN")
+              sys.exit("❌ Missing ZERODHA_API_KEY / ZERODHA_ACCESS_TOKEN (set repo secrets).")
             kite = KiteConnect(api_key=api_key)
             kite.set_access_token(access)
-            kite.profile()  # sanity
-            print("✅ Zerodha token OK.")
+            try:
+              prof = kite.profile()
+              print("✅ Zerodha token OK for:", prof.get("user_name", "unknown"))
+            except Exception as e:
+              sys.exit(f"❌ Token/profile check failed: {e}")
             return kite
 
           def fetch_index_ohlc(kite, token, start_dt, end_dt, iv):
+            # Kite requires NAIVE datetimes (no tzinfo)
+            if start_dt.tzinfo or end_dt.tzinfo:
+              raise SystemExit("❌ Start/End must be naive datetimes (no tzinfo).")
             iv = INTERVAL_MAP.get(iv, "5minute")
-            data = kite.historical_data(token, start_dt, end_dt, iv)
+            try:
+              data = kite.historical_data(token, start_dt, end_dt, iv)
+            except Exception as e:
+              # Most common: 403 if Historical Data add-on not enabled
+              raise SystemExit(f"❌ historical_data failed (interval={iv}). "
+                               f"Likely causes: no Historical add-on / token expired / bad range. Error: {e}")
             df = pd.DataFrame(data or [])
             if df.empty:
-              raise SystemExit("❌ No historical data returned.")
+              raise SystemExit("❌ No historical data returned. Check instrument, dates, add-on & interval.")
             df.rename(columns={"date":"Date","open":"Open","high":"High","low":"Low","close":"Close","volume":"Volume"}, inplace=True)
             df["Date"] = pd.to_datetime(df["Date"])
             return df
@@ -152,24 +53,25 @@ jobs:
             tok = os.getenv("TELEGRAM_BOT_TOKEN","").strip()
             chat= os.getenv("TELEGRAM_CHAT_ID","").strip()
             if not tok or not chat:
-              print("ℹ️  Telegram secrets not set; skipping notify.")
+              print("ℹ️ Telegram not configured; skipping.")
               return
             try:
               requests.get(f"https://api.telegram.org/bot{tok}/sendMessage",
                            params={"chat_id": chat, "text": text, "parse_mode": "HTML"},
                            timeout=10)
-              print("✅ Sent Telegram.")
+              print("✅ Telegram sent.")
             except Exception as e:
-              print("⚠️  Telegram send failed:", e)
+              print("⚠️ Telegram failed:", e)
 
           # ----------------- inputs -----------------
           gh = ${{
             toJson(github.event.inputs)
           }}
           sym    = (gh.get("underlying") or "BANKNIFTY").upper()
-          iv     = gh.get("interval") or "5m"
-          start  = datetime.strptime(gh.get("start_date"), "%Y-%m-%d").replace(tzinfo=IST)
-          end    = datetime.strptime(gh.get("end_date"),   "%Y-%m-%d").replace(tzinfo=IST) + timedelta(hours=23, minutes=59)
+          iv     = (gh.get("interval") or "5m").lower()
+          # NAIVE datetimes – no tzinfo
+          start  = datetime.strptime(gh.get("start_date"), "%Y-%m-%d")
+          end    = datetime.strptime(gh.get("end_date"),   "%Y-%m-%d") + timedelta(hours=23, minutes=59)
 
           cfg = {
             "capital_rs": float(gh.get("capital_rs") or 100000),
@@ -182,27 +84,26 @@ jobs:
             "trail_type": gh.get("trail_type") or "atr",
             "trail_atr_mult": float(gh.get("trail_atr_mult") or 1.5),
             "adx_min": int(gh.get("adx_min") or 10),
-            # any other keys used by strategy.prepare_signals() will be read safely
           }
 
-          print(f"▶ Fetching {sym} {iv} OHLC {start.date()} → {end.date()}")
-          kite = get_kite()
+          print(f"▶ Underlying={sym}  Interval={iv}  Range={start.date()}→{end.date()}")
           token = INDEX_TOKENS.get(sym)
           if not token:
-            raise SystemExit(f"❌ Unsupported underlying: {sym}")
+            sys.exit(f"❌ Unsupported underlying: {sym}")
 
+          kite = get_kite()
           prices = fetch_index_ohlc(kite, token, start, end, iv)
+          print(f"✅ Got {len(prices)} bars.")
 
           # ----------------- backtest -----------------
-          print(f"▶ Running backtest on {len(prices)} bars…")
+          print("▶ Running backtest…")
           summary, trades, equity = run_backtest(prices, cfg)
 
           out_dir = "./reports"
           os.makedirs(out_dir, exist_ok=True)
           save_reports(out_dir, summary, trades, equity)
-          print("📦 Wrote reports to ./reports")
+          print("📦 Wrote reports to ./reports (latest.json, latest_signals.csv etc.)")
 
-          # ----------------- Telegram -----------------
           if (str(gh.get("telegram_notify")).lower()=="true"):
             txt = (
               "📊 <b>Backtest Summary</b>\n"
@@ -211,15 +112,7 @@ jobs:
               f"• Trades: <b>{summary.get('n_trades',0)}</b>\n"
               f"• Win-rate: <b>{summary.get('win_rate',0)}%</b>\n"
               f"• ROI: <b>{summary.get('roi_pct',0)}%</b>\n"
-              f"• Max DD: <b>{summary.get('max_dd_pct',0)}%</b>\n"
-              f"• Time DD (bars): <b>{summary.get('time_dd_bars',0)}</b>\n"
-              f"• R:R: <b>{summary.get('rr',0)}</b>"
+              f"• Max DD: <b>{summary.get('max_dd_pct',0)}%</b>"
             )
             send_telegram(txt)
           PY
-
-      - name: Upload reports
-        uses: actions/upload-artifact@v4
-        with:
-          name: backtest-reports
-          path: reports/
