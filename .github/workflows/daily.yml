@@ -10,28 +10,54 @@ jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
+    env:
+      TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+      ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
+      ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install --prefer-binary -r requirements.txt
 
-      - name: Run intraday options (paper)
-        env:
-          TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
-          ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
-          ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
-        run: |
-          python runner_intraday_options.py
+      - name: Add repo to PYTHONPATH
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
 
-      - name: Upload reports
+      - name: Run intraday options (paper)
+        run: |
+          mkdir -p reports logs
+          python runner_intraday_options.py --out_dir "./reports" | tee logs/daily.log
+
+      - name: Upload artifacts (reports + logs)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: reports
-          path: reports/*
+          name: daily-artifacts
+          path: |
+            reports/**
+            logs/**
+
+      - name: Notify Telegram (summary + charts)
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python tools/telegram_notify.py --dir reports
