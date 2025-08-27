@@ -24,7 +24,7 @@ numpy-financial>=1.0.0  # IRR/NPV helpers (optional for risk)
 loguru>=0.7.2
 cachetools>=5.3.3
 
-# Charts (optional; used by reports)
+# Charts (reports)
 matplotlib>=3.8
 
 # Tests (optional)
