@@ -8,11 +8,9 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Zerodha (already working)
       ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
       ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
       ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
-      # Telegram (optional; safe if missing)
       TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
 
@@ -38,6 +36,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Add repo to PYTHONPATH
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
+
       - name: Debug secrets lengths
         run: |
           echo "API_KEY length:     ${#ZERODHA_API_KEY}"
@@ -61,16 +62,24 @@ jobs:
               print("❌ Zerodha preflight failed:", e); sys.exit(3)
           PY
 
-      - name: List repo (sanity)
-        run: ls -1
-
       - name: Run intraday options (paper)
         run: |
-          python runner_intraday_options.py --out_dir "./reports"
+          mkdir -p reports logs
+          python runner_intraday_options.py --out_dir "./reports" | tee logs/intraday.log
 
-      - name: Upload reports
+      - name: Upload artifacts (reports + logs)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: reports
-          path: reports/
+          name: intraday-artifacts
+          path: |
+            reports/**
+            logs/**
+
+      - name: Notify Telegram (summary + charts)
+        if: always()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python tools/telegram_notify.py --dir reports
