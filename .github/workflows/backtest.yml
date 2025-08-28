@@ -30,7 +30,7 @@ on:
         required: true
         default: "offline"
       params_json:
-        description: "Extra params as JSON (e.g. {\"leg_sl_percent\":25,\"tele...\":true})"
+        description: "Extra params as JSON (e.g. {\"leg_sl_percent\":25})"
         required: false
         default: "{}"
 
@@ -98,6 +98,12 @@ jobs:
           ls -la reports || true
           [ -f reports/metrics.json ] && (echo "----- metrics.json -----"; head -n 80 reports/metrics.json) || true
           [ -f reports/latest.json ] && (echo "----- latest.json (legacy) -----"; head -n 60 reports/latest.json) || true
+
+      # Safety: in the unlikely event metrics.json wasn't produced, drop a minimal latest.json
+      - name: Ensure minimal report for Telegram
+        if: always()
+        run: |
+          python tools/ensure_report.py --dir "./reports"
 
       - name: Upload artifacts (reports + logs)
         if: always()
