@@ -1,78 +1,66 @@
 # =========================
-# Quant Bot — Base Config
+# Intraday Options — Pure Repo Config
 # =========================
-
-# ---- General / timezone ----
 tz: "Asia/Kolkata"
 
-# ---- Zerodha only ----
+# ---- Zerodha (env overrides via GitHub Actions secrets) ----
 zerodha_enabled: true
-# (Keys are read from GitHub Secrets during workflow)
 zerodha_api_key: ""
 zerodha_api_secret: ""
 zerodha_access_token: ""
 
-# ---- Daily swing runner (optional; unchanged) ----
-symbol: "^NSEI"
-interval: "1d"
-lookback: "1y"
+# ---- Mode toggle ----
+# "index"  -> fast prototyping on underlying
+# "options"-> realistic CE/PE leg simulation
+mode: "options"
 
-# Strategy params (for daily runner)
-ema_fast: 21
-ema_slow: 50
-rsi_len: 14
-rsi_buy: 30
-rsi_sell: 70
-adx_len: 14
-atr_len: 14
-stop_atr_mult: 2.0
-take_atr_mult: 3.0
+# ---- Underlying / session ----
+underlying: "BANKNIFTY"      # or "NIFTY"
+index_token: 260105          # BANKNIFTY; NIFTY = 256265
+timeframe: "5minute"
+strike_step: 100
+session:
+  start: "09:20"             # IST
+  end:   "15:15"
 
-# ---- Capital & risk ----
+# ---- Capital & sizing ----
 capital_rs: 100000
-order_qty: 1
+order_qty: 1                 # lots or contracts-per-trade (used consistently)
 
-# ---- Modes ----
-send_only_signals: true
-paper_trading: true
-live_trading: false
+# ---- Entry / Exit (shared semantics) ----
+entry:
+  ema_fast: 21
+  ema_slow: 50
+  rsi_len: 14
+  rsi_buy: 30
+  rsi_sell: 70
+  adx_len: 14
+  atr_len: 14
+  adx_min: 10
+
+risk:
+  stop_atr_mult: 1.0         # per leg (options) or per bar ATR (index)
+  take_rr: 1.5               # target = take_rr * risk-per-trade
+
+trailing:
+  enabled: true
+  type: "atr"
+  trail_start_atr: 1.0
+  trail_atr_mult: 1.0
+
+reentry:
+  max_per_day: 2
+  cooldown_bars: 3
+
+# ---- Options specific (used only when mode=options) ----
+options:
+  iv_hint: 0.22              # constant IV fallback for intraday calc
+  rate: 0.06                 # annualized risk-free (Black–Scholes)
+  expiry: "weekly"           # hint for strike selection logic
 
 # ---- Output ----
 out_dir: "reports"
 
-# ---- Telegram (can be filled via Secrets in Actions) ----
+# ---- Telegram (overridden by env in Actions) ----
 telegram_bot_token: ""
 telegram_chat_id: ""
-
-# =========================
-# Intraday Options (NEW) — used by runner_intradary_options.py
-# =========================
-intraday_options:
-  # Underlying & data
-  underlying: "BANKNIFTY"   # or "NIFTY"
-  index_token: 260105       # BANKNIFTY index token
-  timeframe: "5minute"
-  strike_step: 100          # strike rounding
-
-  # Trading window (IST)
-  start_time: "09:20"
-  end_time:   "15:15"
-
-  # Entry/Exit rules (per option leg)
-  ma_len: 20                # entry = price cross above MA
-  atr_len: 14
-  sl_atr_mult: 1.0          # SL distance = 1.0 * ATR
-  tgt_rr: 1.5               # target = 1.5R
-
-  # Trailing stop
-  trail_start_atr: 1.0      # start trailing after +1.0 * ATR profit
-  trail_atr_mult: 1.0       # trail distance = 1.0 * ATR
-
-  # Re-entry (same day)
-  reentry_max: 2
-  reentry_cooldown: 3       # bars to wait after exit
-
-  # Sizing & mode for intraday runner
-  order_qty: 1
-  paper_trading: true
-  live_trading: false
