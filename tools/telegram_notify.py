@@ -1,6 +1,6 @@
 # tools/telegram_notify.py
 from __future__ import annotations
-import os, json, sys, argparse, requests, pathlib
+import os, json, argparse, requests, pathlib
 
 SENSITIVE_KEYS = {"api", "token", "secret", "key", "password", "chat_id"}
 
@@ -32,9 +32,25 @@ def send_file(token: str, chat_id: str, fpath: str, caption: str = "") -> None:
         data = {"chat_id": chat_id, "caption": caption}
         requests.post(url, files=files, data=data, timeout=30)
 
+def pick_title(metrics: dict, cli_title: str | None) -> str:
+    # Priority: CLI --title > ENV REPORT_TITLE > metrics.report_title > workflow name heuristic > default
+    if cli_title:
+        return cli_title
+    if os.getenv("REPORT_TITLE"):
+        return os.getenv("REPORT_TITLE").strip()
+    if isinstance(metrics, dict) and metrics.get("report_title"):
+        return str(metrics["report_title"])
+    wf = (os.getenv("GITHUB_WORKFLOW") or "").lower()
+    if "intraday" in wf or "paper" in wf:
+        return "Intraday Summary"
+    if "backtest" in wf:
+        return "Backtest Summary"
+    return "Run Summary"
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default="reports", help="reports directory")
+    ap.add_argument("--title", default=None, help="override title for Telegram card")
     args = ap.parse_args()
 
     token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
@@ -44,15 +60,16 @@ def main():
         return
 
     rdir = pathlib.Path(args.dir)
-    # Prefer our new metrics; fallback to legacy latest.json
     metrics = load_any_json(str(rdir / "metrics.json"))
     legacy  = load_any_json(str(rdir / "latest.json"))
+
+    title = pick_title(metrics, args.title)
 
     # Build summary text
     if metrics:
         m = metrics
         text = (
-            "📊 <b>Backtest Summary</b>\n"
+            f"📊 <b>{title}</b>\n"
             f"• Trades: <b>{m.get('n_trades', 0)}</b>\n"
             f"• Win-rate: <b>{m.get('win_rate', 0)}%</b>\n"
             f"• ROI: <b>{m.get('roi_pct', 0)}%</b>\n"
@@ -62,9 +79,10 @@ def main():
             f"• Time DD (bars): <b>{m.get('time_dd_bars', 0)}</b>\n"
             f"• Sharpe: <b>{m.get('sharpe_ratio', 0)}</b>\n"
         )
+        if m.get("note"):
+            text += f"• Note: <i>{m['note']}</i>\n"
     else:
-        # very compact fallback
-        text = "📊 <b>Run Summary</b>\n"
+        text = f"📊 <b>{title}</b>\n"
         if legacy:
             cfg = redact(legacy.get("config", {}))
             meta = {k:v for k,v in legacy.items() if k != "config"}
