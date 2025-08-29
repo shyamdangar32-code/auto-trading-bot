@@ -1,83 +1,72 @@
 #!/usr/bin/env python3
 # runner_intraday_options.py
-# ==========================
-# Intraday Options Algo Trading Runner (BANKNIFTY/NIFTY)
-# Handles live/paper trading, entry/exit, SL/target, trailing, re-entry
-
-import os
-import sys
-import yaml
-import time
+from __future__ import annotations
+import os, sys, json, argparse, pathlib
 import pandas as pd
-from datetime import datetime, timedelta, timezone
-from kiteconnect import KiteConnect
-from bot.strategy import IntradayOptionsStrategy
-from bot.execution import ExecutionEngine
-from bot.data_io import get_index_data
-from bot.evaluation import save_daily_metrics
-from tools.ensure_report import ensure_report_dir
-from tools.ensure_metrics import ensure_metrics_file
-from bot.utils import ist_now, parse_time, logger
+import matplotlib.pyplot as plt
 
-# Load config
-with open("config.yaml", "r") as f:
-    CONFIG = yaml.safe_load(f)
+from bot.config import load_config, debug_fingerprint
+from bot.data_io import prices as load_prices
+from bot.evaluation import plot_equity_and_drawdown, write_quick_report
 
-IST = timezone(timedelta(hours=5, minutes=30))
+from core_backtest.index_level import run as run_index
+from core_backtest.options_legs import simulate as run_options
+
+def _save_metrics(out_dir: str, summary: dict):
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(summary or {}, f, indent=2)
 
 def main():
-    ensure_report_dir()
-    ensure_metrics_file()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out_dir", default="reports")
+    ap.add_argument("--period", default="30d", help="download window if needed (Zerodha)")
+    ap.add_argument("--interval", default="5m")
+    args = ap.parse_args()
 
-    # --- Setup Zerodha (paper or live) ---
-    kite = None
-    if CONFIG["zerodha_enabled"] and CONFIG["intraday_options"]["live_trading"]:
-        kite = KiteConnect(api_key=CONFIG["zerodha_api_key"])
-        kite.set_access_token(CONFIG["zerodha_access_token"])
+    cfg = load_config("config.yaml")
+    out_dir = args.out_dir
 
-    # --- Init strategy + execution engine ---
-    strategy = IntradayOptionsStrategy(CONFIG)
-    executor = ExecutionEngine(CONFIG, kite)
+    # ---- data ----
+    df = load_prices(
+        symbol=cfg["underlying"],
+        period=args.period,
+        interval=args.interval,
+        zerodha_enabled=cfg.get("zerodha_enabled", True),
+        zerodha_instrument_token=cfg.get("index_token"),
+    )
 
-    # --- Trading window ---
-    start = parse_time(CONFIG["intraday_options"]["start_time"])
-    end = parse_time(CONFIG["intraday_options"]["end_time"])
+    # normalize columns for our engines
+    need = ["Open","High","Low","Close"]
+    missing = [c for c in need if c not in df.columns]
+    if missing:
+        raise SystemExit(f"prices() missing cols: {missing}")
 
-    logger.info("Intraday Options Runner started.")
+    # ---- run chosen mode ----
+    mode = (cfg.get("mode") or "options").lower().strip()
+    if mode == "index":
+        summary, trades, equity = run_index(df[need], cfg)
+        summary["mode"] = "index"
+    elif mode == "options":
+        summary, trades, equity = run_options(df[need], cfg)
+        summary["mode"] = "options"
+    else:
+        raise SystemExit(f"Unknown mode: {mode}")
 
-    while True:
-        now = ist_now().time()
-        if now < start:
-            logger.info("⏳ Waiting for market open...")
-            time.sleep(30)
-            continue
-        if now >= end:
-            logger.info("✅ Trading window ended. Closing positions.")
-            executor.square_off_all()
-            break
+    # ---- persist artifacts ----
+    os.makedirs(out_dir, exist_ok=True)
+    if trades is not None and not trades.empty:
+        trades.to_csv(os.path.join(out_dir, "trades.csv"), index=False)
+    if equity is not None and not equity.empty:
+        equity.to_csv(os.path.join(out_dir, "equity.csv"), header=True)
 
-        # --- Fetch latest candle data ---
-        df = get_index_data(CONFIG)
-        if df is None or len(df) < CONFIG["intraday_options"]["ma_len"]:
-            time.sleep(10)
-            continue
+    _save_metrics(out_dir, summary)
+    if equity is not None and not equity.empty:
+        plot_equity_and_drawdown(equity, out_dir)
+    write_quick_report(summary, trades, out_dir)
 
-        # --- Generate signals (Entry / Exit / Re-entry / Trailing) ---
-        signals = strategy.generate_signals(df)
-
-        # --- Execute signals ---
-        for sig in signals:
-            executor.handle_signal(sig)
-
-        # --- Update metrics ---
-        save_daily_metrics(executor.trades, CONFIG)
-
-        time.sleep(60)  # Run every candle
+    print("✅ Done. Artifacts in:", out_dir)
+    print("🔒 Secrets:", debug_fingerprint(cfg))
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        logger.info("⚠️ Stopped manually.")
-    except Exception as e:
-        logger.exception(f"❌ Runner crashed: {e}")
+    main()
