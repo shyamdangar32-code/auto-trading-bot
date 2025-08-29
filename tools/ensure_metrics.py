@@ -1,6 +1,6 @@
 # tools/ensure_metrics.py
 from __future__ import annotations
-import json, os, pathlib, csv, argparse, datetime as dt
+import json, pathlib, csv, argparse, datetime as dt, os
 
 def is_nonempty(p: pathlib.Path) -> bool:
     try:
@@ -17,13 +17,13 @@ def write_empty_signals_csv(p: pathlib.Path) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     headers = ["timestamp","action","symbol","price","qty","pnl"]
     with open(p, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(headers)  # headers only
+        csv.writer(f).writerow(headers)
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default="reports")
     ap.add_argument("--note", default="No signals generated today.")
+    ap.add_argument("--title", default=None)
     args = ap.parse_args()
 
     rdir = pathlib.Path(args.dir)
@@ -33,14 +33,14 @@ def main():
     latest_p  = rdir / "latest.json"
     signals_p = rdir / "latest_signals.csv"
 
-    # If nothing substantial exists, create minimal, well-formed artifacts
     need_fallback = not any(map(is_nonempty, [metrics_p, latest_p, signals_p]))
 
     if not is_nonempty(signals_p):
         write_empty_signals_csv(signals_p)
 
+    report_title = args.title or os.getenv("REPORT_TITLE") or None
+
     if not is_nonempty(metrics_p):
-        # Minimal metrics for "no-trade" day
         metrics = {
             "ts": dt.datetime.utcnow().isoformat() + "Z",
             "n_trades": 0,
@@ -53,6 +53,8 @@ def main():
             "sharpe_ratio": 0.0,
             "note": args.note,
         }
+        if report_title:
+            metrics["report_title"] = report_title
         write_json(metrics_p, metrics)
 
     if not is_nonempty(latest_p):
