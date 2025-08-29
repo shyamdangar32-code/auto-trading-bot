@@ -1,3 +1,4 @@
+# .github/workflows/intraday_opt.yml
 name: intraday-options-paper
 
 on:
@@ -40,34 +41,22 @@ jobs:
       - name: Add repo to PYTHONPATH
         run: echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
 
-      - name: Preflight Zerodha profile (non-fatal for paper)
-        continue-on-error: true
-        run: |
-          python - <<'PY'
-          import os
-          try:
-              from kiteconnect import KiteConnect
-              api_key = (os.getenv("ZERODHA_API_KEY") or "").strip()
-              access  = (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
-              if api_key and access:
-                  kite = KiteConnect(api_key=api_key); kite.set_access_token(access)
-                  p = kite.profile()
-                  print("✅ Token OK for:", p.get("user_name"), p.get("user_id"))
-              else:
-                  print("ℹ️ Missing Zerodha envs; continuing in paper mode.")
-          except Exception as e:
-              print("ℹ️ Preflight failed (paper run can continue):", e)
-          PY
-
       - name: Run intraday options (paper)
         run: |
           mkdir -p reports logs
           python runner_intraday_options.py --out_dir "./reports" | tee logs/intraday.log
 
-      # NEW: ensure a minimal report exists so Telegram never says "No summary available."
+      # ✅ correct fallback step (filename is ensure_metrics.py)
       - name: Ensure minimal report for Telegram
         run: |
-          python tools/ensure_report.py --dir "./reports"
+          python tools/ensure_metrics.py --dir "./reports"
+
+      # (optional) Preview so we can see what's inside reports before Telegram
+      - name: Show reports (preview)
+        if: always()
+        run: |
+          ls -la reports || true
+          [ -f reports/metrics.json ] && (echo "----- metrics.json -----"; cat reports/metrics.json) || true
 
       - name: Upload artifacts (reports + logs)
         if: always()
