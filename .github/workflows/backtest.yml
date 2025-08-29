@@ -40,6 +40,9 @@ jobs:
     timeout-minutes: 20
 
     env:
+      # Title used by ensure_metrics/telegram_notify to label Telegram cards
+      REPORT_TITLE: "Backtest Summary"
+
       ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
       ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
       ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
@@ -99,11 +102,10 @@ jobs:
           [ -f reports/metrics.json ] && (echo "----- metrics.json -----"; head -n 80 reports/metrics.json) || true
           [ -f reports/latest.json ] && (echo "----- latest.json (legacy) -----"; head -n 60 reports/latest.json) || true
 
-      # Safety: in the unlikely event metrics.json wasn't produced, drop a minimal latest.json
-      - name: Ensure minimal report for Telegram
+      - name: Ensure minimal report (never send 'No summary available')
         if: always()
         run: |
-          python tools/ensure_report.py --dir "./reports"
+          python tools/ensure_metrics.py --dir "./reports"
 
       - name: Upload artifacts (reports + logs)
         if: always()
