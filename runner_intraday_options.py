@@ -2,71 +2,95 @@
 # runner_intraday_options.py
 
 import os
+import json
+import math
 import argparse
-import pandas as pd
-from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from datetime import datetime, date, time, timedelta, timezone
 
-from src.broker.zerodha import ZerodhaClient
-from src.strategy.signals import prepare_signals
-from src.utils.telegram import send_telegram_message
+import pandas as pd
+from kiteconnect import KiteConnect
+
+# ---------------- utils ----------------
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# ---------------- utils ----------------
+def ensure_date(x):
+    return x.date() if isinstance(x, datetime) else x
 
 def ist_now():
     return datetime.now(IST)
 
-def ensure_datetime_index(df):
-    """Ensure candle dataframe has proper datetime index with tzinfo (IST)."""
-    if not isinstance(df.index, pd.DatetimeIndex):
-        df.index = pd.to_datetime(df.index, utc=True, errors="coerce")
-    # Convert UTC → IST
-    df.index = df.index.tz_convert(IST)
-    return df
+def is_weekend(d: date) -> bool:
+    return d.weekday() >= 5  # Sat=5, Sun=6
 
-# ---------------- runner ----------------
+def prev_trading_day(d: date) -> date:
+    while True:
+        d -= timedelta(days=1)
+        if not is_weekend(d):
+            return d
+
+# ---------------- imports ----------------
+# 🔹 અહીંથી "src." કાઢી નાખ્યું
+from broker.zerodha import ZerodhaClient
+from strategies.intraday_rsi import IntradayRSIStrategy
+from utils.telegram import TelegramNotifier
+from utils.report import save_report
+
+# ---------------- main ----------------
 
 def run_intraday(config):
-    # init broker
     client = ZerodhaClient(
         api_key=config.api_key,
-        api_secret=config.api_secret,
         access_token=config.access_token,
-        paper=True
     )
 
-    # download candles
-    print("⬇️ Downloading index candles…")
-    df = client.download_index("NIFTY", interval="5minute", lookback_days=30)
+    notifier = TelegramNotifier(config.tg_token, config.tg_chat)
 
-    if df is None or len(df) == 0:
-        raise ValueError("No data downloaded from Zerodha.")
+    # Download index data
+    symbol = config.symbol
+    interval = config.interval
+    start = config.start_date
+    end = config.end_date
 
-    print(f"✅ Zerodha OK: {len(df)} rows")
-    df = ensure_datetime_index(df)
+    print(f"📥 Downloading {symbol} {interval} data {start}→{end} ...")
+    df = client.download_index(symbol, interval, start, end)
 
-    # run strategy signals
-    print("🧮 Running intraday backtest (index-level)…")
-    signals = prepare_signals(df)
+    if df.empty:
+        print("⚠️ No data downloaded.")
+        return
 
-    # summary
-    print(f"✅ Generated {len(signals)} signals")
-    send_telegram_message(f"Intraday run complete ✅\nSignals: {len(signals)}")
+    print(f"✅ Got {len(df)} rows.")
 
-    return signals
+    # Run strategy
+    strat = IntradayRSIStrategy(
+        rsi_period=config.rsi_period,
+        ema_period=config.ema_period,
+        sl=config.stop_loss,
+        tp=config.take_profit,
+    )
+    trades, summary = strat.run(df)
+
+    # Save report
+    report_file = save_report(trades, summary, df, config.output_dir)
+
+    # Notify
+    notifier.send_message(f"Intraday run complete ✅\n{summary}")
+    notifier.send_file(report_file)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--config", type=str, default="config.yaml")
     args = parser.parse_args()
 
-    # load config
+    # Load config
     import yaml
     with open(args.config, "r") as f:
-        raw = yaml.safe_load(f)
-    config = SimpleNamespace(**raw)
+        config_dict = yaml.safe_load(f)
+
+    config = SimpleNamespace(**config_dict)
+
+    os.makedirs(config.output_dir, exist_ok=True)
 
     run_intraday(config)
