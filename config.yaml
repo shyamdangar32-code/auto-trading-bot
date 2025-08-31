@@ -1,66 +1,51 @@
-# =========================
-# Intraday Options — Pure Repo Config
-# =========================
-tz: "Asia/Kolkata"
-
-# ---- Zerodha (env overrides via GitHub Actions secrets) ----
-zerodha_enabled: true
-zerodha_api_key: ""
-zerodha_api_secret: ""
-zerodha_access_token: ""
-
-# ---- Mode toggle ----
-# "index"  -> fast prototyping on underlying
-# "options"-> realistic CE/PE leg simulation
-mode: "options"
-
-# ---- Underlying / session ----
-underlying: "BANKNIFTY"      # or "NIFTY"
-index_token: 260105          # BANKNIFTY; NIFTY = 256265
-timeframe: "5minute"
-strike_step: 100
-session:
-  start: "09:20"             # IST
-  end:   "15:15"
-
-# ---- Capital & sizing ----
+# === GLOBAL (common) ===
 capital_rs: 100000
-order_qty: 1                 # lots or contracts-per-trade (used consistently)
+order_qty: 1
 
-# ---- Entry / Exit (shared semantics) ----
-entry:
-  ema_fast: 21
-  ema_slow: 50
-  rsi_len: 14
-  rsi_buy: 30
-  rsi_sell: 70
-  adx_len: 14
-  atr_len: 14
-  adx_min: 10
+# === INTRADAY OPTIONS (STRATEGY PARAMS) ===
+intraday_options:
+  timeframe: "5minute"
 
-risk:
-  stop_atr_mult: 1.0         # per leg (options) or per bar ATR (index)
-  take_rr: 1.5               # target = take_rr * risk-per-trade
+  # ENTRY (ORB + VWAP)
+  entry:
+    orb_first_minutes: 15         # ORB window (e.g., 09:15–09:30 IST)
+    use_vwap_filter: true         # enable VWAP context filter
+    vwap_side: "with_trend"       # "with_trend" or "both"
 
-trailing:
-  enabled: true
-  type: "atr"
-  trail_start_atr: 1.0
-  trail_atr_mult: 1.0
+  # EXITS (SL/Target/Trailing)
+  exits:
+    sl_atr_mult: 1.0              # stop distance = ATR * mult
+    tgt_rr: 1.5                   # target = entry ± (RR * stop_distance)
+    trail_start_rr: 1.0           # start trailing after ≥ 1R in profit
+    trail_atr_mult: 1.0           # trail distance = ATR * mult
 
-reentry:
-  max_per_day: 2
-  cooldown_bars: 3
+  # RE-ENTRY (same day)
+  reentry:
+    max_per_day: 3
+    cooldown_bars: 2
 
-# ---- Options specific (used only when mode=options) ----
-options:
-  iv_hint: 0.22              # constant IV fallback for intraday calc
-  rate: 0.06                 # annualized risk-free (Black–Scholes)
-  expiry: "weekly"           # hint for strike selection logic
+  # DAY GUARDRAILS
+  guardrails:
+    max_trades_per_day: 10        # hard cap on trades/day
+    max_daily_loss_rs: 3000       # stop new entries after this loss
+    stop_after_target_rs: 5000    # optionally stop after daily target hit
 
-# ---- Output ----
-out_dir: "reports"
-
-# ---- Telegram (overridden by env in Actions) ----
-telegram_bot_token: ""
-telegram_chat_id: ""
+# === BACKTEST BLOCK (same rules as intraday) ===
+backtest:
+  timeframe: "5minute"
+  entry:
+    orb_first_minutes: 15
+    use_vwap_filter: true
+    vwap_side: "with_trend"
+  exits:
+    sl_atr_mult: 1.0
+    tgt_rr: 1.5
+    trail_start_rr: 1.0
+    trail_atr_mult: 1.0
+  reentry:
+    max_per_day: 3
+    cooldown_bars: 2
+  guardrails:
+    max_trades_per_day: 10
+    max_daily_loss_rs: 3000
+    stop_after_target_rs: 5000
