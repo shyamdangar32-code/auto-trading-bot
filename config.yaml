@@ -1,14 +1,11 @@
 # =========================
-# Intraday Options Algo — Config
+# Global / Common
 # =========================
-
-# ---- General ----
 tz: "Asia/Kolkata"
 out_dir: "reports"
 
-# ---- Zerodha ----
+# ---- Zerodha (optional for backtest) ----
 zerodha_enabled: true
-# Values are normally injected via GitHub Secrets / env in Actions
 ZERODHA_API_KEY: ""
 ZERODHA_API_SECRET: ""
 ZERODHA_ACCESS_TOKEN: ""
@@ -17,31 +14,32 @@ ZERODHA_ACCESS_TOKEN: ""
 TELEGRAM_BOT_TOKEN: ""
 TELEGRAM_CHAT_ID: ""
 
-# ---- Capital & sizing ----
+# ---- Capital & sizing (common) ----
 capital_rs: 100000
 order_qty: 1
 
-# ---- Signal / risk knobs (global) ----
-# Entry engine mode: strict | balanced | aggressive
+# =========================
+# Intraday Options Algo — Tunables (as-is)
+# =========================
+# Global signal knobs (used by intraday runner)
 signal_mode: "balanced"
 
-# Indicator lengths
 ema_fast: 21
 ema_slow: 50
 rsi_len: 14
 adx_len: 14
 atr_len: 14
 
-# Momentum thresholds (loosened slightly to get more intraday trades)
+# Momentum thresholds
 rsi_buy: 52
 rsi_sell: 48
-ema_poke_pct: 0.0005   # 0.05% above/below EMA fast
+ema_poke_pct: 0.0005   # 0.05%
 
 # ADX thresholds
 adx_min_bal: 10
 adx_min_strict: 18
 
-# Risk/targets (tighter to finish intraday)
+# Risk/targets
 stop_atr_mult: 1.2
 take_atr_mult: 1.6
 
@@ -54,17 +52,14 @@ trail_atr_mult: 1.0
 reentry_max: 3
 reentry_cooldown: 2
 
-# =========================
-# Intraday Options block (index-level sourcing)
-# =========================
+# ---- Intraday Options block (index-level sourcing) ----
 intraday_options:
-  # Underlying & data
   underlying: "BANKNIFTY"     # NIFTY or BANKNIFTY
-  index_token: 260105          # BANKNIFTY index token
+  index_token: 260105
   timeframe: "5minute"
   strike_step: 100
 
-  # (Legacy keys kept for compatibility with tools, not used directly by runner)
+  # legacy keys (kept for tools compatibility)
   ma_len: 20
   atr_len: 14
   sl_atr_mult: 1.2
@@ -78,3 +73,23 @@ intraday_options:
 send_only_signals: true
 paper_trading: true
 live_trading: false
+
+# =========================
+# Backtest runner settings (read by run_backtest.py)
+# =========================
+backtest:
+  # Trading session (IST)
+  session_start: "09:20"
+  session_end:   "15:20"
+
+  # Execution frictions
+  max_trades_per_day: 6
+  slippage_bps: 2.0           # 2 bps each side
+  brokerage_flat: 20.0        # INR per leg (min)
+  brokerage_pct: 0.0003       # 3 bps per leg
+
+  # Strategy parameters for index-level backtest
+  ema_fast: 20
+  ema_slow: 50
+  rsi_len: 14
+  rsi_buy: 55
