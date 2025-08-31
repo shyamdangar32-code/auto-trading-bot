@@ -1,1 +1,59 @@
+name: kite-diagnostics
 
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+
+    env:
+      ZERODHA_API_KEY: ${{ secrets.ZERODHA_API_KEY }}
+      ZERODHA_API_SECRET: ${{ secrets.ZERODHA_API_SECRET }}
+      ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install kiteconnect
+
+      - name: Debug secrets
+        run: |
+          echo "API_KEY length: ${#ZERODHA_API_KEY}"
+          echo "API_SECRET length: ${#ZERODHA_API_SECRET}"
+          echo "ACCESS_TOKEN length: ${#ZERODHA_ACCESS_TOKEN}"
+
+      - name: Test Zerodha profile
+        run: |
+          python - <<'PY'
+          import os
+          from kiteconnect import KiteConnect
+
+          api_key = os.getenv("ZERODHA_API_KEY", "").strip()
+          access = os.getenv("ZERODHA_ACCESS_TOKEN", "").strip()
+
+          print("API Key length:", len(api_key))
+          print("Access Token length:", len(access))
+
+          if not api_key or not access:
+              raise SystemExit("❌ API key or token missing!")
+
+          kite = KiteConnect(api_key=api_key)
+          kite.set_access_token(access)
+
+          try:
+              profile = kite.profile()
+              print("✅ Token works! User:", profile.get("user_name"), "| ID:", profile.get("user_id"))
+          except Exception as e:
+              print("❌ Token invalid:", e)
+              raise
+          PY
