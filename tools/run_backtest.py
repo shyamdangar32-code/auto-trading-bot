@@ -1,291 +1,202 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
-Backtest runner (robust)
-- Pulls index candles via bot.data_io
-- Runs strategy backtest if possible
-- Always writes report artifacts (even on empty data) so Telegram step never skips
+Backtest runner (safe defaults)
+
+Why this file exists:
+- GitHub 'workflow_dispatch' has a hard limit of 10 inputs.
+- To keep the workflow form simple (<= 6 inputs), we absorb the rest of the
+  parameters here with sensible defaults (and allow env overrides).
+
+It tries to call your real backtest implementation if available.
+If anything fails (e.g., data source not reachable), it writes a minimal
+report so the workflow never crashes and Telegram still gets an update.
 """
 
+from __future__ import annotations
 import argparse
 import json
-import sys
+import os
 from pathlib import Path
 from datetime import datetime, time
-import traceback
 
-# ------- Optional imports (guarded) -------
-try:
-    import pandas as pd
-except Exception:  # pragma: no cover
-    pd = None
+# -------------------------
+# Defaults (can be overridden via ENV)
+# -------------------------
+DEF_SLIPPAGE_BPS   = int(os.getenv("SLIPPAGE_BPS", "0"))        # e.g., 5 = 0.05%
+DEF_BROKER_FLAT    = float(os.getenv("BROKER_FLAT", "0"))       # ₹ per order
+DEF_BROKER_PCT     = float(os.getenv("BROKER_PCT", "0"))        # e.g., 0.02 = 0.02%
+DEF_SESSION_START  = os.getenv("SESSION_START", "09:20")        # HH:MM local
+DEF_SESSION_END    = os.getenv("SESSION_END", "15:25")          # HH:MM local
+DEF_MAX_TRADES_DAY = int(os.getenv("MAX_TRADES_PER_DAY", "0"))  # 0 = unlimited
 
-# Repo-local modules (guard with try so we never crash the workflow)
-def _safe_imports():
-    mods = {}
+# Safe title used by telegram_notify.py when present
+REPORT_TITLE = "Backtest"
+
+# -------------------------
+# Utilities
+# -------------------------
+def parse_hhmm(s: str) -> time:
     try:
-        from bot import data_io as _dio
-        mods["data_io"] = _dio
+        hh, mm = [int(x) for x in s.split(":")]
+        return time(hh, mm)
     except Exception:
-        mods["data_io"] = None
+        # fall back to whole session if malformed
+        return None
 
-    try:
-        from bot import backtest as _bt
-        mods["backtest"] = _bt
-    except Exception:
-        mods["backtest"] = None
-
-    try:
-        from bot import evaluation as _eval
-        mods["evaluation"] = _eval
-    except Exception:
-        mods["evaluation"] = None
-
-    try:
-        from bot import strategy as _strat
-        mods["strategy"] = _strat
-    except Exception:
-        mods["strategy"] = None
-
-    try:
-        from bot import metrics as _metrics
-        mods["metrics"] = _metrics
-    except Exception:
-        mods["metrics"] = None
-
-    return mods
-
-
-# ------- Helpers -------
-TITLE = "Backtest Summary"
-
-def _ensure_dir(p: Path):
+def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
-def _fmt_pct(x):
+
+# -------------------------
+# Minimal report writers
+# -------------------------
+def write_minimal_reports(out_dir: Path, title: str, note: str, meta: dict):
+    """
+    Creates the minimum set of files our tooling expects so that
+    downstream steps (artifacts + Telegram) never fail.
+    """
+    ensure_dir(out_dir)
+    # summary.json
+    summary = {
+        "title": title,
+        "trades": 0,
+        "win_rate": 0.0,
+        "roi": 0.0,
+        "profit_factor": 0.0,
+        "rr": 0.0,
+        "max_dd_pct": 0.0,
+        "time_dd_bars": 0,
+        "sharpe": 0.0,
+        "note": note,
+        "meta": meta,
+    }
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+    # human friendly text too
+    (out_dir / "SUMMARY.txt").write_text(
+        f"{title}\n"
+        f"Trades: 0\n"
+        f"Note: {note}\n"
+    )
+
+
+# -------------------------
+# Attempt real backtest (if available in repo)
+# -------------------------
+def try_real_backtest(args, params, out_dir: Path) -> bool:
+    """
+    Tries to import your project's backtest entry point and run it.
+    Return True if succeeded; False if we should fall back to minimal.
+    """
+    # Persist run parameters (useful for debugging)
+    ensure_dir(out_dir)
+    (out_dir / "run_args.json").write_text(json.dumps({
+        "symbol": args.symbol,
+        "start": args.start,
+        "end": args.end,
+        "interval": args.interval,
+        "capital_rs": args.capital_rs,
+        "order_qty": args.order_qty,
+        "params": params
+    }, indent=2))
+
+    # Try a few common entry points to stay compatible
     try:
-        return f"{float(x):.1f}%"
-    except Exception:
-        return "0.0%"
+        # Preferred: bot.backtest has a 'run_backtest' or 'run' we can call
+        try:
+            from bot import backtest as bt_mod
+        except Exception:
+            bt_mod = None
 
-def _write_summary(out_dir: Path,
-                   trades=0, winrate=0.0, roi=0.0, pf=0.0,
-                   rr=0.0, max_dd=0.0, time_dd=0, sharpe=0.0,
-                   note="No signals generated today."):
-    """
-    Writes a Telegram-friendly summary text file.
-    """
-    lines = [
-        f"🟩 {TITLE}",
-        f"• Trades: {int(trades)}",
-        f"• Win-rate: {_fmt_pct(winrate)}",
-        f"• ROI: {_fmt_pct(roi)}",
-        f"• Profit Factor: {pf:.1f}",
-        f"• R:R: {rr:.1f}",
-        f"• Max DD: {_fmt_pct(max_dd)}",
-        f"• Time DD (bars): {int(time_dd)}",
-        f"• Sharpe: {sharpe:.1f}",
-        f"• Note: {note}",
-    ]
-    (out_dir / "summary.txt").write_text("\n".join(lines), encoding="utf-8")
+        callable_fn = None
+        if bt_mod is not None:
+            for fn_name in ("run_backtest", "run"):
+                if hasattr(bt_mod, fn_name):
+                    callable_fn = getattr(bt_mod, fn_name)
+                    break
 
-def _write_placeholder_charts(out_dir: Path):
-    """
-    Always drop in two simple charts so telegram step can attach images.
-    """
-    try:
-        import matplotlib.pyplot as plt
+        if callable_fn is None:
+            # Fallback to tools/backtest-like function if user has it
+            try:
+                import importlib
+                tb = importlib.import_module("backtest")
+                for fn_name in ("run_backtest", "run"):
+                    if hasattr(tb, fn_name):
+                        callable_fn = getattr(tb, fn_name)
+                        break
+            except Exception:
+                callable_fn = None
 
-        # Equity curve placeholder
-        x = list(range(1, 6))
-        y = [100, 100, 100, 100, 100]
-        plt.figure()
-        plt.plot(x, y)
-        plt.title("Equity Curve")
-        plt.xlabel("Trades")
-        plt.ylabel("Equity (₹)")
-        plt.tight_layout()
-        plt.savefig(out_dir / "equity_curve.png")
-        plt.close()
+        if callable_fn is None:
+            print("WARN: No backtest entry point found; writing minimal reports.")
+            return False
 
-        # Drawdown placeholder
-        y2 = [0, 0, 0, 0, 0]
-        plt.figure()
-        plt.plot(x, y2)
-        plt.title("Drawdown")
-        plt.xlabel("Trades")
-        plt.ylabel("DD (%)")
-        plt.tight_layout()
-        plt.savefig(out_dir / "drawdown.png")
-        plt.close()
-    except Exception:
-        # As a last resort, create tiny png markers
-        (out_dir / "equity_curve.png").write_bytes(b"\x89PNG\r\n\x1a\n")
-        (out_dir / "drawdown.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+        # Call the function in a generic way. Most repos accept something like:
+        # run(symbol=..., start=..., end=..., interval=..., capital_rs=..., order_qty=..., out_dir=..., **params)
+        print("ℹ️  Launching real backtest…")
+        callable_fn(
+            symbol=args.symbol,
+            start=args.start,
+            end=args.end,
+            interval=args.interval,
+            capital_rs=float(args.capital_rs),
+            order_qty=int(args.order_qty),
+            out_dir=str(out_dir),
+            **params
+        )
+        print("✅ Real backtest finished.")
+        return True
+
+    except Exception as e:
+        print(f"ERROR: real backtest failed → {e!r}")
+        return False
 
 
-def _fallback_reports(out_dir: Path, why: str):
-    print(f"WARN: {why} -> writing minimal reports.")
-    _ensure_dir(out_dir)
-    _write_summary(out_dir, note="No data; runner fallback.")
-    _write_placeholder_charts(out_dir)
-
-
-def parse_args():
-    p = argparse.ArgumentParser(prog="run_backtest.py")
-
-    p.add_argument("--symbol", default="BANKNIFTY",
-                   help="Index symbol (NIFTY/BANKNIFTY)")
-    p.add_argument("--start", default="", help="YYYY-MM-DD (inclusive)")
-    p.add_argument("--end",   default="", help="YYYY-MM-DD (inclusive)")
-    p.add_argument("--interval", default="5m", help="Candle interval (e.g., 5m)")
-    p.add_argument("--outdir", default="./reports", help="Output dir for artifacts")
-
-    # Costs / limits (optional, used by your libs if present)
-    p.add_argument("--slippage_bps", type=float, default=0.0)
-    p.add_argument("--broker_flat", type=float, default=0.0)
-    p.add_argument("--broker_pct", type=float, default=0.0)
-    p.add_argument("--session_start", default="", help="HH:MM (e.g., 09:20)")
-    p.add_argument("--session_end", default="", help="HH:MM (e.g., 15:25)")
-    p.add_argument("--max_trades_per_day", type=int, default=0)
-    p.add_argument("--qty", type=int, default=1)
-    p.add_argument("--capital", type=float, default=100000.0)
-    p.add_argument("--extra_params", default="{}",
-                   help="JSON of extra knobs (strategy params)")
-
-    return p.parse_args()
+# -------------------------
+# CLI
+# -------------------------
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Run index options backtest (with safe defaults).")
+    p.add_argument("--symbol", required=True, help="NIFTY or BANKNIFTY")
+    p.add_argument("--start", required=True, help="YYYY-MM-DD inclusive")
+    p.add_argument("--end",   required=True, help="YYYY-MM-DD inclusive")
+    p.add_argument("--interval", required=True, help="e.g., 5m, 15m")
+    p.add_argument("--capital_rs", required=True, help="Starting capital in ₹")
+    p.add_argument("--order_qty",  required=True, help="Order quantity (lots or units)")
+    p.add_argument("--out_dir", default="./reports", help="Output directory for reports")
+    return p
 
 
 def main():
-    args = parse_args()
-    out_dir = Path(args.outdir)
-    _ensure_dir(out_dir)
+    args = build_parser().parse_args()
 
-    mods = _safe_imports()
-    dio = mods["data_io"]
-    bt = mods["backtest"]
-    evaluation = mods["evaluation"]
+    out_dir = Path(args.out_dir)
+    ensure_dir(out_dir)
+    ensure_dir(Path("logs"))
 
-    # Parse dates safely
-    start_dt = args.start.strip()
-    end_dt = args.end.strip()
+    # Expand defaults + env overrides here
+    session_start = parse_hhmm(DEF_SESSION_START)
+    session_end   = parse_hhmm(DEF_SESSION_END)
 
-    # 1) Get candles (index-level)
-    df = None
-    if dio is None or pd is None:
-        _fallback_reports(out_dir, "Required modules missing (data_io/pandas)")
-        return 0
+    params = dict(
+        slippage_bps=DEF_SLIPPAGE_BPS,
+        broker_flat=DEF_BROKER_FLAT,
+        broker_pct=DEF_BROKER_PCT,
+        session_start=DEF_SESSION_START if session_start else None,
+        session_end=DEF_SESSION_END if session_end else None,
+        max_trades_per_day=DEF_MAX_TRADES_DAY,
+    )
 
-    try:
-        # repo’s function signature may differ; try common names
-        if hasattr(dio, "get_index_candles"):
-            df = dio.get_index_candles(args.symbol, start_dt, end_dt, args.interval)
-        elif hasattr(dio, "get_index_data"):
-            df = dio.get_index_data(args.symbol, start_dt, end_dt, args.interval)
-        else:
-            df = None
-    except Exception as e:
-        traceback.print_exc()
-        df = None
+    meta = {
+        "used_defaults": params,
+        "timestamp": datetime.utcnow().isoformat() + "Z"
+    }
 
-    if df is None or (hasattr(df, "empty") and df.empty):
-        _fallback_reports(out_dir, "data_io.get_index_candles unavailable or returned empty")
-        return 0
-
-    # 2) Run backtest via project libs if present; otherwise produce neutral report
-    try:
-        # Strategy params (if libs use them)
-        try:
-            extra = json.loads(args.extra_params or "{}")
-        except Exception:
-            extra = {}
-
-        # Some projects expect time filters; pass if available
-        session = {}
-        if args.session_start:
-            session["start"] = args.session_start
-        if args.session_end:
-            session["end"] = args.session_end
-
-        results = None
-        if bt and hasattr(bt, "run_index_backtest"):
-            # Prefer a named function if it exists
-            results = bt.run_index_backtest(
-                df=df,
-                symbol=args.symbol,
-                qty=args.qty,
-                capital=args.capital,
-                slippage_bps=args.slippage_bps,
-                broker_flat=args.broker_flat,
-                broker_pct=args.broker_pct,
-                session=session,
-                max_trades_per_day=args.max_trades_per_day,
-                params=extra,
-            )
-        elif bt and hasattr(bt, "run_backtest"):
-            # Generic fallback name
-            results = bt.run_backtest(
-                df=df,
-                qty=args.qty,
-                capital=args.capital,
-                slippage_bps=args.slippage_bps,
-                broker_flat=args.broker_flat,
-                broker_pct=args.broker_pct,
-                session=session,
-                max_trades_per_day=args.max_trades_per_day,
-                params=extra,
-            )
-
-        # Extract metrics and plots if evaluation helper exists
-        trades = 0
-        winrate = roi = pf = rr = max_dd = sharpe = 0.0
-        time_dd = 0
-
-        if results is not None:
-            if evaluation and hasattr(evaluation, "summarize_results"):
-                summary = evaluation.summarize_results(results)
-                # Expecting keys; guard everything
-                trades = int(summary.get("trades", 0))
-                winrate = float(summary.get("winrate_pct", 0.0))
-                roi = float(summary.get("roi_pct", 0.0))
-                pf = float(summary.get("profit_factor", 0.0))
-                rr = float(summary.get("rr", 0.0))
-                max_dd = float(summary.get("max_dd_pct", 0.0))
-                time_dd = int(summary.get("time_dd_bars", 0))
-                sharpe = float(summary.get("sharpe", 0.0))
-
-            # Try to save charts if project provides helpers
-            if evaluation and hasattr(evaluation, "save_equity_plot"):
-                try:
-                    evaluation.save_equity_plot(results, out_dir / "equity_curve.png")
-                except Exception:
-                    pass
-            if evaluation and hasattr(evaluation, "save_drawdown_plot"):
-                try:
-                    evaluation.save_drawdown_plot(results, out_dir / "drawdown.png")
-                except Exception:
-                    pass
-
-        # If no charts created by libs, ensure placeholders exist
-        if not (out_dir / "equity_curve.png").exists() or not (out_dir / "drawdown.png").exists():
-            _write_placeholder_charts(out_dir)
-
-        note = "OK" if trades > 0 else "No signals generated today."
-        _write_summary(
-            out_dir,
-            trades=trades, winrate=winrate, roi=roi, pf=pf,
-            rr=rr, max_dd=max_dd, time_dd=time_dd, sharpe=sharpe,
-            note=note
-        )
-        print("✅ Backtest reports written.")
-        return 0
-
-    except Exception as e:
-        traceback.print_exc()
-        _fallback_reports(out_dir, f"Backtest failed: {e}")
-        return 0
+    # Try to run the real backtest; if not possible, write a minimal report
+    ok = try_real_backtest(args, params, out_dir)
+    if not ok:
+        note = "No data or runner fallback. (Backtest entry not available or failed.)"
+        write_minimal_reports(out_dir, REPORT_TITLE, note, meta)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
