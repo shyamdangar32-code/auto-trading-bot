@@ -2,157 +2,102 @@
 from __future__ import annotations
 import numpy as np
 import pandas as pd
+from .indicators import add_indicators  # uses ta to add ema/rsi/adx/atr
 
-from .indicators import add_indicators  # must add ATR + VWAP (or we calc VWAP here)
+LONG = 1
+SHORT = -1
+FLAT = 0
 
-LONG, SHORT, FLAT = 1, -1, 0
-
-
-def _intraday_session_key(ts: pd.Timestamp) -> tuple:
-    d = ts.tz_localize(None) if ts.tzinfo else ts
-    return (d.date(),)  # simple day splitter
-
-
-def _compute_orb(df: pd.DataFrame, first_minutes: int) -> pd.DataFrame:
+def _entry_conditions(d: pd.DataFrame, cfg: dict):
     """
-    For each trading day, compute the ORB high/low from first N minutes bars.
-    Assumes df.index is a DatetimeIndex (IST) and has High/Low.
+    Boolean series for long/short entries.
+    We support three modes to control trade frequency:
+      - strict:   old logic (EMA trend + RSI + ADX)
+      - balanced: EMA trend AND (RSI momentum OR price>EMA_fast), lower ADX
+      - aggressive: (EMA cross OR RSI momentum), no ADX requirement
     """
-    d = df.copy()
-    day_keys = d.index.map(_intraday_session_key)
-    d["day_key"] = day_keys
+    mode = (cfg.get("signal_mode") or "balanced").lower()
+    adx_min_strict = cfg.get("adx_min_strict", 18)
+    adx_min_bal    = cfg.get("adx_min_bal", 10)
 
-    orb_hi = []
-    orb_lo = []
-    seen = set()
+    ema_f = d["ema_fast"]
+    ema_s = d["ema_slow"]
+    rsi   = d["rsi"]
+    adx   = d["adx"]
+    px    = d["Close"]
 
-    for k in d["day_key"].unique():
-        day_mask = d["day_key"] == k
-        day_df = d.loc[day_mask]
+    # momentum thresholds (slightly loose to get more trades)
+    rsi_buy  = float(cfg.get("rsi_buy", 52))   # long if RSI > 52
+    rsi_sell = float(cfg.get("rsi_sell", 48))  # short if RSI < 48
 
-        # select bars within first N minutes of that day
-        day_start = day_df.index[0]
-        cutoff = day_start + pd.Timedelta(minutes=first_minutes)
-        orb_window = day_df.loc[(day_df.index >= day_start) & (day_df.index < cutoff)]
+    # price poke above/below fast EMA (tiny buffer ~0.05%)
+    poke = cfg.get("ema_poke_pct", 0.0005)
+    above_f = px > (ema_f * (1.0 + poke))
+    below_f = px < (ema_f * (1.0 - poke))
 
-        hi = float(orb_window["High"].max()) if not orb_window.empty else np.nan
-        lo = float(orb_window["Low"].min())  if not orb_window.empty else np.nan
+    if mode == "strict":
+        long_ok  = (ema_f > ema_s) & (rsi >= rsi_buy)  & (adx >= adx_min_strict)
+        short_ok = (ema_f < ema_s) & (rsi <= rsi_sell) & (adx >= adx_min_strict)
 
-        orb_hi.append(pd.Series(hi, index=day_df.index))
-        orb_lo.append(pd.Series(lo, index=day_df.index))
+    elif mode == "aggressive":
+        # Either EMA cross OR RSI momentum, ignore ADX to get more signals
+        long_ok  = ((ema_f > ema_s) | (above_f)) & (rsi >= rsi_buy)
+        short_ok = ((ema_f < ema_s) | (below_f)) & (rsi <= rsi_sell)
 
-    d["orb_high"] = pd.concat(orb_hi).sort_index()
-    d["orb_low"]  = pd.concat(orb_lo).sort_index()
-    return d.drop(columns=["day_key"])
+    else:  # "balanced" (default)
+        # EMA trend and (momentum from RSI OR small poke above/below fast EMA)
+        long_ok  = (ema_f > ema_s) & ((rsi >= rsi_buy) | (above_f)) & (adx >= adx_min_bal)
+        short_ok = (ema_f < ema_s) & ((rsi <= rsi_sell) | (below_f)) & (adx >= adx_min_bal)
+
+    return long_ok.fillna(False), short_ok.fillna(False)
 
 
-def _compute_intraday_vwap(df: pd.DataFrame) -> pd.Series:
+def prepare_signals(prices: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     """
-    Simple per-day VWAP using typical price and volume.
+    Returns a dataframe with indicators and 'long_entry', 'short_entry'.
+    Expected columns: ['Open','High','Low','Close']
     """
-    d = df.copy()
-    tp = (d["High"] + d["Low"] + d["Close"]) / 3.0
-    vol = d.get("Volume", pd.Series(index=d.index, data=1.0))
-    day = d.index.normalize()
-
-    # cumulative within day
-    num = (tp * vol).groupby(day).cumsum()
-    den = vol.groupby(day).cumsum()
-    vwap = num / den.replace(0, np.nan)
-    return vwap
-
-
-def prepare_signals(prices: pd.DataFrame, cfg: dict, use_block: str = "intraday_options") -> pd.DataFrame:
-    """
-    Build dataframe with:
-      - ORB high/low (first N minutes)
-      - VWAP
-      - Entry signals (long/short)
-      - 'signal' column in {1, -1, 0}
-    Expected columns: ['Open','High','Low','Close','Volume?'] with DatetimeIndex (IST).
-    """
-    block = (cfg.get(use_block) or {})
-    entry_cfg = block.get("entry", {})
-    exits_cfg = block.get("exits", {})
-
-    d = prices.copy()
-    d = add_indicators(d, {  # ensure ATR available; EMA/ADX optional
-        "atr_len": exits_cfg.get("atr_len", 14) if "atr_len" in exits_cfg else 14
-    })
-
-    # ORB
-    first_min = int(entry_cfg.get("orb_first_minutes", 15))
-    d = _compute_orb(d, first_min)
-
-    # VWAP
-    d["vwap"] = _compute_intraday_vwap(d)
-
-    # ENTRY logic
-    use_vwap = bool(entry_cfg.get("use_vwap_filter", True))
-    vwap_side = str(entry_cfg.get("vwap_side", "with_trend")).lower()
-
-    # breakout conditions
-    long_ok = (d["Close"] > d["orb_high"])
-    short_ok = (d["Close"] < d["orb_low"])
-
-    if use_vwap:
-        if vwap_side == "with_trend":
-            long_ok = long_ok & (d["Close"] >= d["vwap"])
-            short_ok = short_ok & (d["Close"] <= d["vwap"])
-        elif vwap_side == "both":
-            # allow both-sided trades but still reference VWAP to avoid whipsaws
-            pass
-        else:
-            # unknown -> default to with_trend
-            long_ok = long_ok & (d["Close"] >= d["vwap"])
-            short_ok = short_ok & (d["Close"] <= d["vwap"])
-
-    d["long_entry"]  = long_ok.fillna(False)
-    d["short_entry"] = short_ok.fillna(False)
-
+    d = add_indicators(prices.copy(), cfg)
+    long_ok, short_ok = _entry_conditions(d, cfg)
+    d["long_entry"] = long_ok
+    d["short_entry"] = short_ok
     d["signal"] = 0
     d.loc[d["long_entry"], "signal"] = LONG
     d.loc[d["short_entry"], "signal"] = SHORT
     return d
 
 
-def initial_stop_target(side: int, entry_price: float, atr: float, exits_cfg: dict):
-    """
-    Stop = entry ± ATR * sl_atr_mult
-    Target = entry ± RR * (stop distance)
-    """
-    sl_mult = float(exits_cfg.get("sl_atr_mult", 1.0))
-    rr      = float(exits_cfg.get("tgt_rr", 1.5))
-    stop_dist = sl_mult * atr
-
+def initial_stop_target(side: int, entry_price: float, atr: float, cfg: dict):
+    stop_mult = float(cfg.get("stop_atr_mult", 1.2))   # tighter default
+    take_mult = float(cfg.get("take_atr_mult", 1.6))   # modest take to book more trades
     if side == LONG:
-        stop   = entry_price - stop_dist
-        target = entry_price + rr * stop_dist
+        stop   = entry_price - stop_mult * atr
+        target = entry_price + take_mult * atr
     else:
-        stop   = entry_price + stop_dist
-        target = entry_price - rr * stop_dist
+        stop   = entry_price + stop_mult * atr
+        target = entry_price - take_mult * atr
     return float(stop), float(target)
 
 
-def trail_stop(side: int, price: float, atr: float, current_stop: float, entry: float, exits_cfg: dict):
+def trail_stop(side: int, px: float, atr: float, curr_stop: float, entry: float, cfg: dict):
     """
-    ATR trailing:
-      - Start after unrealized >= trail_start_rr * R (R = ATR*sl_mult)
-      - Then trail by trail_atr_mult * ATR
+    ATR trailing. Starts earlier to keep trades active but protected.
     """
-    trail_start_rr  = float(exits_cfg.get("trail_start_rr", 1.0))
-    trail_atr_mult  = float(exits_cfg.get("trail_atr_mult", 1.0))
-    sl_mult         = float(exits_cfg.get("sl_atr_mult", 1.0))
-    trigger_points  = trail_start_rr * sl_mult * atr
-    trail_dist      = trail_atr_mult  * atr
+    if not cfg.get("trailing_enabled", True):
+        return curr_stop
+    if cfg.get("trail_type", "atr") != "atr":
+        return curr_stop
+
+    start_trigger = float(cfg.get("trail_start_atr", 0.6)) * atr   # start earlier
+    trail_dist    = float(cfg.get("trail_atr_mult", 1.0)) * atr    # closer trail
 
     if side == LONG:
-        if (price - entry) >= trigger_points:
-            new_stop = price - trail_dist
-            return max(current_stop, new_stop)
-        return current_stop
+        if (px - entry) >= start_trigger:
+            new_stop = px - trail_dist
+            return max(curr_stop, new_stop) if not np.isnan(curr_stop) else new_stop
+        return curr_stop
     else:
-        if (entry - price) >= trigger_points:
-            new_stop = price + trail_dist
-            return min(current_stop, new_stop)
-        return current_stop
+        if (entry - px) >= start_trigger:
+            new_stop = px + trail_dist
+            return min(curr_stop, new_stop) if not np.isnan(curr_stop) else new_stop
+        return curr_stop
