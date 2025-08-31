@@ -27,30 +27,6 @@ on:
         description: "Order quantity"
         required: true
         default: "1"
-      slippage_bps:
-        description: "e.g., 5 = 0.05%"
-        required: false
-        default: "0"
-      broker_flat:
-        description: "Flat fee (₹ per order)"
-        required: false
-        default: "0"
-      broker_pct:
-        description: "Percent fee (e.g., 0.02 = 0.02%)"
-        required: false
-        default: "0"
-      session_start:
-        description: "HH:MM (e.g., 09:20)"
-        required: false
-        default: ""
-      session_end:
-        description: "HH:MM (e.g., 15:25)"
-        required: false
-        default: ""
-      max_trades_per_day:
-        description: "0 = unlimited"
-        required: false
-        default: "0"
 
 jobs:
   run:
@@ -92,20 +68,14 @@ jobs:
             --interval "${{ github.event.inputs.interval }}" \
             --capital_rs "${{ github.event.inputs.capital }}" \
             --order_qty "${{ github.event.inputs.qty }}" \
-            --slippage_bps "${{ github.event.inputs.slippage_bps }}" \
-            --broker_flat "${{ github.event.inputs.broker_flat }}" \
-            --broker_pct "${{ github.event.inputs.broker_pct }}" \
-            --session_start "${{ github.event.inputs.session_start }}" \
-            --session_end "${{ github.event.inputs.session_end }}" \
-            --max_trades_per_day "${{ github.event.inputs.max_trades_per_day }}" \
             --out_dir "./reports"
 
-      - name: Ensure minimal report (never send 'No summary')
+      - name: Ensure minimal report
         if: always()
         run: |
           python tools/ensure_report.py --dir "./reports"
 
-      - name: Upload artifacts (reports + logs)
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -114,7 +84,7 @@ jobs:
             reports/**
             logs/**
 
-      - name: Notify Telegram (summary + charts)
+      - name: Notify Telegram
         if: always()
         run: |
           python tools/telegram_notify.py --dir "./reports" --title "Backtest Complete"
