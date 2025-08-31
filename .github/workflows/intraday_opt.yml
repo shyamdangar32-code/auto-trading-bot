@@ -2,22 +2,36 @@ name: intraday-options-paper
 
 on:
   workflow_dispatch:
+    inputs:
+      symbol:
+        description: "Index symbol (NIFTY/BANKNIFTY)"
+        required: false
+        default: "NIFTY"
+      start:
+        description: "Start date (YYYY-MM-DD) — leave blank to use yesterday"
+        required: false
+        default: ""
+      end:
+        description: "End date (YYYY-MM-DD) — leave blank to use yesterday"
+        required: false
+        default: ""
+      interval:
+        description: "Candle interval"
+        required: false
+        default: "5m"
+      mode:
+        description: "Run mode (paper/live)"
+        required: false
+        default: "paper"
+      outdir:
+        description: "Reports output directory"
+        required: false
+        default: "./reports"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
-    env:
-      # Title used by ensure_metrics/telegram_notify to label Telegram cards
-      REPORT_TITLE: "Intraday Summary"
-
-      # Broker / Telegram secrets
-      ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
-      ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
-      ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
-      TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -33,8 +47,7 @@ jobs:
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          restore-keys: ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
@@ -42,38 +55,44 @@ jobs:
           pip install -r requirements.txt
 
       - name: Add repo to PYTHONPATH
-        run: echo "PYTHONPATH=$GITHUB_WORKSPACE:$PYTHONPATH" >> $GITHUB_ENV
+        run: echo "PYTHONPATH=$PWD:$PYTHONPATH" >> $GITHUB_ENV
 
+      # Optional: verify Zerodha profile if you keep this helper
       - name: Preflight Zerodha profile (non-fatal for paper)
         continue-on-error: true
         run: |
-          python - <<'PY'
-          import os
-          try:
-              from kiteconnect import KiteConnect
-              api_key = (os.getenv("ZERODHA_API_KEY") or "").strip()
-              access  = (os.getenv("ZERODHA_ACCESS_TOKEN") or "").strip()
-              if api_key and access:
-                  kite = KiteConnect(api_key=api_key); kite.set_access_token(access)
-                  p = kite.profile()
-                  print("✅ Token OK for:", p.get("user_name"), p.get("user_id"))
-              else:
-                  print("ℹ️ Missing Zerodha envs; continuing in paper mode.")
-          except Exception as e:
-              print("ℹ️ Preflight failed (paper run can continue):", e)
-          PY
+          python verify_kite.py || true
+
+      - name: Compute default dates (yesterday) if inputs empty
+        shell: bash
+        run: |
+          # yesterday in UTC; good enough for backfill. Adjust to IST if you prefer.
+          YESTERDAY="$(date -u -d 'yesterday' +%F)"
+          if [ -z "${{ github.event.inputs.start }}" ]; then echo "START_DATE=$YESTERDAY" >> $GITHUB_ENV; else echo "START_DATE=${{ github.event.inputs.start }}" >> $GITHUB_ENV; fi
+          if [ -z "${{ github.event.inputs.end }}" ]; then echo "END_DATE=$YESTERDAY" >> $GITHUB_ENV; else echo "END_DATE=${{ github.event.inputs.end }}" >> $GITHUB_ENV; fi
 
       - name: Run intraday options (paper)
+        env:
+          SYMBOL: ${{ github.event.inputs.symbol || 'NIFTY' }}
+          INTERVAL: ${{ github.event.inputs.interval || '5m' }}
+          MODE: ${{ github.event.inputs.mode || 'paper' }}
+          OUTDIR: ${{ github.event.inputs.outdir || './reports' }}
         run: |
           mkdir -p reports logs
-          python runner_intraday_options.py --out_dir "./reports" | tee logs/intraday.log
+          echo "Using: symbol=$SYMBOL $START_DATE..$END_DATE interval=$INTERVAL mode=$MODE outdir=$OUTDIR"
+          python runner_intraday_options.py \
+            --symbol "$SYMBOL" \
+            --start "$START_DATE" \
+            --end "$END_DATE" \
+            --interval "$INTERVAL" \
+            --mode "$MODE" \
+            --outdir "$OUTDIR" || true
 
-      - name: Ensure minimal report (never send 'No summary available')
+      - name: Ensure minimal report (never send 'No summary')
         run: |
           python tools/ensure_metrics.py --dir "./reports"
 
       - name: Upload artifacts (reports + logs)
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: intraday-artifacts
@@ -83,8 +102,5 @@ jobs:
 
       - name: Notify Telegram (summary + charts)
         if: always()
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python tools/telegram_notify.py --dir reports
+          python tools/telegram_notify.py --dir "./reports"
