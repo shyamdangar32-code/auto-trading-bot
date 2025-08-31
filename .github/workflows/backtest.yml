@@ -1,10 +1,10 @@
 name: backtest
 
-"on":
+on:
   workflow_dispatch:
     inputs:
       symbol:
-        description: "Index symbol (NIFTY or BANKNIFTY)"
+        description: "NIFTY or BANKNIFTY"
         required: true
         default: "BANKNIFTY"
       start:
@@ -16,10 +16,10 @@ name: backtest
         required: true
         default: "2025-08-01"
       interval:
-        description: "Candle interval (e.g., 5m, 15m)"
+        description: "Candle interval"
         required: true
         default: "5m"
-      capital:
+      capital_rs:
         description: "Starting capital (₹)"
         required: true
         default: "100000"
@@ -29,16 +29,24 @@ name: backtest
         default: "1"
       slippage_bps:
         description: "Slippage in bps (e.g., 5 = 0.05%)"
-        required: false
+        required: true
         default: "0"
       broker_flat:
         description: "Broker flat fee (₹ per order)"
-        required: false
+        required: true
         default: "0"
       broker_pct:
         description: "Brokerage percent (e.g., 0.02 = 0.02%)"
-        required: false
+        required: true
         default: "0"
+      max_trades_per_day:
+        description: "Hard cap on daily trades (0 = unlimited)"
+        required: true
+        default: "0"
+
+concurrency:
+  group: backtest-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   run:
@@ -50,13 +58,15 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
@@ -64,56 +74,26 @@ jobs:
           pip install -r requirements.txt
 
       - name: Add repo to PYTHONPATH
-        run: echo "$PWD" >> $GITHUB_PATH
+        run: echo "PYTHONPATH=$PWD" >> $GITHUB_ENV
 
       - name: Run backtest
-        env:
-          SYMBOL:        ${{ github.event.inputs.symbol }}
-          START:         ${{ github.event.inputs.start }}
-          END:           ${{ github.event.inputs.end }}
-          INTERVAL:      ${{ github.event.inputs.interval }}
-          CAPITAL_RS:    ${{ github.event.inputs.capital }}
-          QTY:           ${{ github.event.inputs.qty }}
-          SLIPPAGE_BPS:  ${{ github.event.inputs.slippage_bps }}
-          BROKER_FLAT:   ${{ github.event.inputs.broker_flat }}
-          BROKER_PCT:    ${{ github.event.inputs.broker_pct }}
         run: |
-          mkdir -p reports logs
-          EXTRA=""
-          if [ -n "${SLIPPAGE_BPS}" ] && [ "${SLIPPAGE_BPS}" != "0" ]; then
-            EXTRA="$EXTRA --slippage_bps ${SLIPPAGE_BPS}"
-          fi
-          if [ -n "${BROKER_FLAT}" ] && [ "${BROKER_FLAT}" != "0" ]; then
-            EXTRA="$EXTRA --broker_flat ${BROKER_FLAT}"
-          fi
-          if [ -n "${BROKER_PCT}" ] && [ "${BROKER_PCT}" != "0" ]; then
-            EXTRA="$EXTRA --broker_pct ${BROKER_PCT}"
-          fi
-
-          echo "Config:"
-          echo "  symbol=${SYMBOL}  start=${START}  end=${END}  interval=${INTERVAL}"
-          echo "  capital_rs=${CAPITAL_RS}  qty=${QTY}"
-          echo "  extra=${EXTRA}"
-
           python tools/run_backtest.py \
-            --symbol "${SYMBOL}" \
-            --start "${START}" \
-            --end "${END}" \
-            --interval "${INTERVAL}" \
-            --capital "${CAPITAL_RS}" \
-            --qty "${QTY}" \
-            --outdir ./reports \
-            ${EXTRA} | tee logs/backtest.log
-
-      - name: Show reports (preview)
-        if: always()
-        run: |
-          echo "reports/ contains:"
-          ls -lah reports || true
+            --symbol "${{ github.event.inputs.symbol }}" \
+            --start "${{ github.event.inputs.start }}" \
+            --end   "${{ github.event.inputs.end }}" \
+            --interval "${{ github.event.inputs.interval }}" \
+            --outdir "./reports" \
+            --slippage_bps "${{ github.event.inputs.slippage_bps }}" \
+            --broker_flat  "${{ github.event.inputs.broker_flat }}" \
+            --broker_pct   "${{ github.event.inputs.broker_pct }}" \
+            --max_trades_per_day "${{ github.event.inputs.max_trades_per_day }}" \
+            --qty "${{ github.event.inputs.qty }}"
+        env:
+          CAPITAL_RS: ${{ github.event.inputs.capital_rs }}
 
       - name: Ensure minimal report (never send 'No summary')
         run: |
-          python tools/ensure_report.py --dir "./reports"
           python tools/ensure_metrics.py --dir "./reports"
 
       - name: Upload artifacts (reports + logs)
@@ -123,9 +103,14 @@ jobs:
           path: |
             reports/**
             logs/**
-            !**/*.ipynb_checkpoints/**
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Notify Telegram (summary + charts)
-        if: always()
+        if: success() || failure()
         run: |
           python tools/telegram_notify.py --dir "./reports"
+        env:
+          # fallbacks: prefer TG_*; else TELEGRAM_*
+          TG_TOKEN: ${{ secrets.TG_BOT_TOKEN != '' && secrets.TG_BOT_TOKEN || secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT:  ${{ secrets.TG_CHAT_ID  != '' && secrets.TG_CHAT_ID  || secrets.TELEGRAM_CHAT_ID  }}
