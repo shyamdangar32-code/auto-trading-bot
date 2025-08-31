@@ -1,51 +1,80 @@
-# === GLOBAL (common) ===
+# =========================
+# Intraday Options Algo — Config
+# =========================
+
+# ---- General ----
+tz: "Asia/Kolkata"
+out_dir: "reports"
+
+# ---- Zerodha ----
+zerodha_enabled: true
+# Values are normally injected via GitHub Secrets / env in Actions
+ZERODHA_API_KEY: ""
+ZERODHA_API_SECRET: ""
+ZERODHA_ACCESS_TOKEN: ""
+
+# ---- Telegram (optional) ----
+TELEGRAM_BOT_TOKEN: ""
+TELEGRAM_CHAT_ID: ""
+
+# ---- Capital & sizing ----
 capital_rs: 100000
 order_qty: 1
 
-# === INTRADAY OPTIONS (STRATEGY PARAMS) ===
+# ---- Signal / risk knobs (global) ----
+# Entry engine mode: strict | balanced | aggressive
+signal_mode: "balanced"
+
+# Indicator lengths
+ema_fast: 21
+ema_slow: 50
+rsi_len: 14
+adx_len: 14
+atr_len: 14
+
+# Momentum thresholds (loosened slightly to get more intraday trades)
+rsi_buy: 52
+rsi_sell: 48
+ema_poke_pct: 0.0005   # 0.05% above/below EMA fast
+
+# ADX thresholds
+adx_min_bal: 10
+adx_min_strict: 18
+
+# Risk/targets (tighter to finish intraday)
+stop_atr_mult: 1.2
+take_atr_mult: 1.6
+
+# Trailing
+trailing_enabled: true
+trail_start_atr: 0.6
+trail_atr_mult: 1.0
+
+# Re-entries
+reentry_max: 3
+reentry_cooldown: 2
+
+# =========================
+# Intraday Options block (index-level sourcing)
+# =========================
 intraday_options:
+  # Underlying & data
+  underlying: "BANKNIFTY"     # NIFTY or BANKNIFTY
+  index_token: 260105          # BANKNIFTY index token
   timeframe: "5minute"
+  strike_step: 100
 
-  # ENTRY (ORB + VWAP)
-  entry:
-    orb_first_minutes: 15         # ORB window (e.g., 09:15–09:30 IST)
-    use_vwap_filter: true         # enable VWAP context filter
-    vwap_side: "with_trend"       # "with_trend" or "both"
+  # (Legacy keys kept for compatibility with tools, not used directly by runner)
+  ma_len: 20
+  atr_len: 14
+  sl_atr_mult: 1.2
+  tgt_rr: 1.6
+  trail_start_atr: 0.6
+  trail_atr_mult: 1.0
+  reentry_max: 3
+  reentry_cooldown: 2
 
-  # EXITS (SL/Target/Trailing)
-  exits:
-    sl_atr_mult: 1.0              # stop distance = ATR * mult
-    tgt_rr: 1.5                   # target = entry ± (RR * stop_distance)
-    trail_start_rr: 1.0           # start trailing after ≥ 1R in profit
-    trail_atr_mult: 1.0           # trail distance = ATR * mult
-
-  # RE-ENTRY (same day)
-  reentry:
-    max_per_day: 3
-    cooldown_bars: 2
-
-  # DAY GUARDRAILS
-  guardrails:
-    max_trades_per_day: 10        # hard cap on trades/day
-    max_daily_loss_rs: 3000       # stop new entries after this loss
-    stop_after_target_rs: 5000    # optionally stop after daily target hit
-
-# === BACKTEST BLOCK (same rules as intraday) ===
-backtest:
-  timeframe: "5minute"
-  entry:
-    orb_first_minutes: 15
-    use_vwap_filter: true
-    vwap_side: "with_trend"
-  exits:
-    sl_atr_mult: 1.0
-    tgt_rr: 1.5
-    trail_start_rr: 1.0
-    trail_atr_mult: 1.0
-  reentry:
-    max_per_day: 3
-    cooldown_bars: 2
-  guardrails:
-    max_trades_per_day: 10
-    max_daily_loss_rs: 3000
-    stop_after_target_rs: 5000
+# ---- Modes (safety) ----
+send_only_signals: true
+paper_trading: true
+live_trading: false
