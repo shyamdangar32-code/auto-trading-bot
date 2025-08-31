@@ -8,18 +8,18 @@ on:
         required: true
         default: "BANKNIFTY"
       start:
-        description: "Start date (YYYY-MM-DD, inclusive)"
+        description: "YYYY-MM-DD (inclusive)"
         required: true
         default: "2025-07-01"
       end:
-        description: "End date (YYYY-MM-DD, inclusive)"
+        description: "YYYY-MM-DD (inclusive)"
         required: true
         default: "2025-08-01"
       interval:
         description: "Candle interval"
         required: true
         default: "5m"
-      capital_rs:
+      capital:
         description: "Starting capital (₹)"
         required: true
         default: "100000"
@@ -28,29 +28,38 @@ on:
         required: true
         default: "1"
       slippage_bps:
-        description: "Slippage in bps (e.g., 5 = 0.05%)"
-        required: true
+        description: "e.g., 5 = 0.05%"
+        required: false
         default: "0"
       broker_flat:
-        description: "Broker flat fee (₹ per order)"
-        required: true
+        description: "Flat fee (₹ per order)"
+        required: false
         default: "0"
       broker_pct:
-        description: "Brokerage percent (e.g., 0.02 = 0.02%)"
-        required: true
+        description: "Percent fee (e.g., 0.02 = 0.02%)"
+        required: false
         default: "0"
+      session_start:
+        description: "HH:MM (e.g., 09:20)"
+        required: false
+        default: ""
+      session_end:
+        description: "HH:MM (e.g., 15:25)"
+        required: false
+        default: ""
       max_trades_per_day:
-        description: "Hard cap on daily trades (0 = unlimited)"
-        required: true
+        description: "0 = unlimited"
+        required: false
         default: "0"
-
-concurrency:
-  group: backtest-${{ github.ref }}
-  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,59 +67,54 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
+          python -m pip install -U pip
           pip install -r requirements.txt
 
       - name: Add repo to PYTHONPATH
-        run: echo "PYTHONPATH=$PWD" >> $GITHUB_ENV
+        run: echo "${{ github.workspace }}" >> $GITHUB_PATH
 
       - name: Run backtest
         run: |
           python tools/run_backtest.py \
             --symbol "${{ github.event.inputs.symbol }}" \
             --start "${{ github.event.inputs.start }}" \
-            --end   "${{ github.event.inputs.end }}" \
+            --end "${{ github.event.inputs.end }}" \
             --interval "${{ github.event.inputs.interval }}" \
-            --outdir "./reports" \
+            --capital_rs "${{ github.event.inputs.capital }}" \
+            --order_qty "${{ github.event.inputs.qty }}" \
             --slippage_bps "${{ github.event.inputs.slippage_bps }}" \
-            --broker_flat  "${{ github.event.inputs.broker_flat }}" \
-            --broker_pct   "${{ github.event.inputs.broker_pct }}" \
+            --broker_flat "${{ github.event.inputs.broker_flat }}" \
+            --broker_pct "${{ github.event.inputs.broker_pct }}" \
+            --session_start "${{ github.event.inputs.session_start }}" \
+            --session_end "${{ github.event.inputs.session_end }}" \
             --max_trades_per_day "${{ github.event.inputs.max_trades_per_day }}" \
-            --qty "${{ github.event.inputs.qty }}"
-        env:
-          CAPITAL_RS: ${{ github.event.inputs.capital_rs }}
+            --out_dir "./reports"
 
       - name: Ensure minimal report (never send 'No summary')
+        if: always()
         run: |
-          python tools/ensure_metrics.py --dir "./reports"
+          python tools/ensure_report.py --dir "./reports"
 
       - name: Upload artifacts (reports + logs)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: backtest-artifacts
           path: |
             reports/**
             logs/**
-          if-no-files-found: warn
-          retention-days: 7
 
       - name: Notify Telegram (summary + charts)
-        if: success() || failure()
+        if: always()
         run: |
-          python tools/telegram_notify.py --dir "./reports"
-        env:
-          # fallbacks: prefer TG_*; else TELEGRAM_*
-          TG_TOKEN: ${{ secrets.TG_BOT_TOKEN != '' && secrets.TG_BOT_TOKEN || secrets.TELEGRAM_BOT_TOKEN }}
-          TG_CHAT:  ${{ secrets.TG_CHAT_ID  != '' && secrets.TG_CHAT_ID  || secrets.TELEGRAM_CHAT_ID  }}
+          python tools/telegram_notify.py --dir "./reports" --title "Backtest Complete"
