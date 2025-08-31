@@ -1,216 +1,182 @@
-#!/usr/bin/env python3
 # runner_intraday_options.py
 from __future__ import annotations
-import os, json, argparse
-from datetime import datetime, time
+import os, sys, json, argparse
 import pandas as pd
-import numpy as np
 
-# TA
-from ta.trend import EMAIndicator, ADXIndicator
-from ta.volatility import AverageTrueRange
+# Local imports
+from bot.config import load_config, debug_fingerprint
+from bot.data_io import prices
+from bot.backtest import run_backtest, save_reports
+from bot.utils import ensure_dir, save_json, send_telegram
 
-# Our helpers
-from bot.config import load_config
-from bot.data_io import zerodha_prices
-from bot.metrics import compute_metrics
-from bot.evaluation import plot_equity_and_drawdown
+"""
+Intraday options (index-level) paper runner
 
-LONG, SHORT, FLAT = 1, -1, 0
+• Loads config.yaml
+• Pulls index candles from Zerodha (BANKNIFTY/NIFTY)
+• Generates signals via bot/strategy.py (config-driven)
+• Simulates entries with ATR SL/Target + trailing & re-entries
+• Saves reports (trades.csv, equity.csv, metrics.json, charts, report.md)
+• (Optional) Telegram summary handled by tools/telegram_notify.py workflow step
+"""
 
-def within_trading_window(ts: pd.Timestamp, start_str: str, end_str: str) -> bool:
-    t = ts.tz_convert("Asia/Kolkata").time()
-    h1, m1 = map(int, start_str.split(":"))
-    h2, m2 = map(int, end_str.split(":"))
-    return (time(h1, m1) <= t <= time(h2, m2))
+def build_cfg(base: dict) -> dict:
+    """Merge safe defaults that increase intraday trade frequency."""
+    cfg = dict(base or {})
+    io = cfg.get("intraday_options") or {}
+    cfg["intraday_options"] = io
+
+    # ---------- Intraday source ----------
+    io.setdefault("underlying", "BANKNIFTY")
+    io.setdefault("index_token", 260105)   # BANKNIFTY
+    io.setdefault("timeframe", "5minute")
+    io.setdefault("strike_step", 100)
+
+    # ---------- Entry engine (loosened a bit) ----------
+    cfg.setdefault("ema_fast", 21)
+    cfg.setdefault("ema_slow", 50)
+    cfg.setdefault("rsi_len", 14)
+    cfg.setdefault("adx_len", 14)
+    cfg.setdefault("atr_len", 14)
+
+    # Trading mode for signal engine
+    cfg.setdefault("signal_mode", "balanced")    # strict | balanced | aggressive
+    cfg.setdefault("rsi_buy", 52)                # long trigger
+    cfg.setdefault("rsi_sell", 48)               # short trigger
+    cfg.setdefault("ema_poke_pct", 0.0005)       # 0.05% above/below EMA fast
+    cfg.setdefault("adx_min_bal", 10)            # relaxed ADX for balanced
+    cfg.setdefault("adx_min_strict", 18)
+
+    # ---------- Risk / exits ----------
+    cfg.setdefault("stop_atr_mult", 1.2)         # tighter so trades finish intraday
+    cfg.setdefault("take_atr_mult", 1.6)
+    cfg.setdefault("trailing_enabled", True)
+    cfg.setdefault("trail_start_atr", 0.6)       # start trailing earlier
+    cfg.setdefault("trail_atr_mult", 1.0)
+
+    # ---------- Re-entries ----------
+    cfg.setdefault("reentry_max", 3)             # up to 3 fresh attempts same day
+    cfg.setdefault("reentry_cooldown", 2)        # bars to wait after exit
+
+    # ---------- Capital / sizing ----------
+    cfg.setdefault("capital_rs", 100000.0)
+    cfg.setdefault("order_qty", 1)
+
+    # ---------- Output ----------
+    cfg.setdefault("out_dir", "reports")
+
+    # ---------- Zerodha toggles ----------
+    cfg.setdefault("zerodha_enabled", True)
+    # (API secrets are injected via env in Actions)
+
+    return cfg
+
+
+def fetch_index_prices(cfg: dict, period: str = "30d") -> pd.DataFrame:
+    """Pull index candles from Zerodha."""
+    io = cfg["intraday_options"]
+    token = int(io["index_token"])
+    interval = io.get("timeframe", "5minute")
+    df = prices(
+        symbol=io.get("underlying", "BANKNIFTY"),
+        period=period,
+        interval=interval,
+        zerodha_enabled=True,
+        zerodha_instrument_token=token,
+    )
+    need_cols = {"Open","High","Low","Close"}
+    if not need_cols.issubset(set(df.columns)):
+        raise RuntimeError("Downloaded candles missing OHLC columns.")
+    return df
+
+
+def write_latest_summary(out_dir: str, meta: dict):
+    ensure_dir(out_dir)
+    save_json(meta, os.path.join(out_dir, "latest.json"))
+
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out_dir", default="reports")
+    ap.add_argument("--period", default=os.getenv("INTRADAY_PERIOD", "30d"),
+                    help="Zerodha history lookback like 7d/30d/6mo/1y")
+    ap.add_argument("--mode", default=os.getenv("SIGNAL_MODE", ""),
+                    help="strict|balanced|aggressive (overrides config)")
+    ap.add_argument("--out_dir", default="", help="override output dir")
     args = ap.parse_args()
-    os.makedirs(args.out_dir, exist_ok=True)
 
-    # ---- Load config ----
-    cfg = load_config()
-    icfg = cfg.get("intraday_options", {})
-    capital = float(cfg.get("capital_rs", 100000))
-    qty = int(icfg.get("order_qty", 1))
+    # Load + merge defaults
+    cfg = build_cfg(load_config("config.yaml"))
+    if args.mode.strip():
+        cfg["signal_mode"] = args.mode.strip().lower()
+    if args.out_dir.strip():
+        cfg["out_dir"] = args.out_dir.strip()
 
-    # trading window & params
-    start_t = icfg.get("start_time", "09:20")
-    end_t   = icfg.get("end_time",   "15:15")
-    ema_len = int(icfg.get("ma_len", 20))
-    adx_len = int(icfg.get("adx_len", 14))
-    atr_len = int(icfg.get("atr_len", 14))
-    adx_min = int(icfg.get("adx_min", 10)) if "adx_min" in icfg else 10
+    out_dir = cfg["out_dir"]
+    ensure_dir(out_dir)
 
-    sl_mult   = float(icfg.get("sl_atr_mult", 1.0))
-    tgt_rr    = float(icfg.get("tgt_rr", 1.5))
-    trail_on  = bool(icfg.get("trail_start_atr", 1.0) is not None)
-    trail_trg = float(icfg.get("trail_start_atr", 1.0))
-    trail_mul = float(icfg.get("trail_atr_mult", 1.0))
+    print("🔧 Config fingerprint:", debug_fingerprint(cfg))
+    print("⚙️  Signal mode:", cfg.get("signal_mode"))
 
-    re_max    = int(icfg.get("reentry_max", 2))
-    cooldown  = int(icfg.get("reentry_cooldown", 3))
+    # 1) Data
+    print("⬇️  Downloading index candles…")
+    df = fetch_index_prices(cfg, period=args.period)
+    print(f"✅ Got {len(df)} bars.")
 
-    # ---- Fetch last 5d, 5m candles from Zerodha (index token) ----
-    token = int(icfg.get("index_token", 260105))  # BANKNIFTY default
-    df = zerodha_prices(token, period="5d", interval="5m")
-    df = df.set_index(pd.DatetimeIndex(df["Date"])).sort_index()
+    # 2) Backtest on index-level
+    print("🏃 Running intraday backtest (index-level)…")
+    summary, trades, equity = run_backtest(df, cfg)
 
-    # ---- Indicators ----
-    close = df["Close"]
-    high  = df["High"]
-    low   = df["Low"]
+    # 3) Save artifacts
+    print("💾 Saving reports…")
+    save_reports(out_dir, summary, trades, equity)
 
-    ema   = EMAIndicator(close, window=ema_len).ema_indicator()
-    adx   = ADXIndicator(high, low, close, window=adx_len).adx()
-    atr   = AverageTrueRange(high, low, close, window=atr_len).average_true_range()
+    # 4) Write latest.json (used by Telegram step)
+    write_latest_summary(out_dir, {
+        "runner": "intraday_index",
+        "signal_mode": cfg.get("signal_mode"),
+        "period": args.period,
+        "n_rows": int(len(df)),
+    })
 
-    d = pd.DataFrame({
-        "Close": close,
-        "High": high,
-        "Low": low,
-        "ema": ema,
-        "adx": adx,
-        "atr": atr,
-    }).dropna()
+    # 5) (Optional) print quick line for Actions log
+    print("📊 Summary:", json.dumps(summary, indent=2))
 
-    # basic cross conditions inside trading window
-    d["cross_up"]   = (d["Close"].shift(1) <= d["ema"].shift(1)) & (d["Close"] > d["ema"])
-    d["cross_down"] = (d["Close"].shift(1) >= d["ema"].shift(1)) & (d["Close"] < d["ema"])
-    d["in_time"]    = [within_trading_window(ts, start_t, end_t) for ts in d.index]
-    d["adx_ok"]     = d["adx"] >= adx_min
+    # Optional direct Telegram (usually workflow calls tools/telegram_notify.py)
+    if os.getenv("SEND_TG_NOW", "").lower() == "true":
+        msg = (
+            "📈 Intraday Summary\n"
+            f"• Trades: {summary.get('n_trades',0)}\n"
+            f"• Win-rate: {summary.get('win_rate',0)}%\n"
+            f"• ROI: {summary.get('roi_pct',0)}%\n"
+            f"• Profit Factor: {summary.get('profit_factor',0)}\n"
+            f"• R:R: {summary.get('rr',0)}\n"
+            f"• Max DD: {summary.get('max_dd_pct',0)}%\n"
+            f"• Time DD (bars): {summary.get('time_dd_bars',0)}\n"
+            f"• Sharpe: {summary.get('sharpe_ratio',0)}"
+        )
+        send_telegram(msg, cfg.get("TELEGRAM_BOT_TOKEN"), cfg.get("TELEGRAM_CHAT_ID"))
 
-    # ---- Walk forward sim (index-level) ----
-    position = FLAT
-    entry_px = stop = target = np.nan
-    last_exit_idx = -10**9
-    re_count_today = 0
-    eq_val = capital
-    eq_curve = []
-    trades = []
-
-    idx = list(d.index)
-    for i, ts in enumerate(idx):
-        row = d.loc[ts]
-        px  = float(row.Close)
-        atr_val = float(row.atr)
-
-        # day change => reset re-entries
-        if i > 0 and ts.date() != idx[i-1].date():
-            re_count_today = 0
-
-        # trailing stop
-        if position != FLAT and trail_on:
-            if position == LONG:
-                # trail only after profit >= trail_trg * ATR
-                if (px - entry_px) >= trail_trg * atr_val:
-                    new_stop = px - trail_mul * atr_val
-                    stop = max(stop, new_stop)
-            else:
-                if (entry_px - px) >= trail_trg * atr_val:
-                    new_stop = px + trail_mul * atr_val
-                    stop = min(stop, new_stop)
-
-        # exits
-        did_exit = False
-        if position == LONG:
-            if row.Low <= stop:
-                trades[-1]["exit_time"] = ts; trades[-1]["exit"] = stop
-                trades[-1]["reason"] = "STOP"
-                pnl = (stop - entry_px) * qty; trades[-1]["pnl"] = pnl
-                eq_val += pnl; position = FLAT; did_exit = True
-            elif row.High >= target:
-                trades[-1]["exit_time"] = ts; trades[-1]["exit"] = target
-                trades[-1]["reason"] = "TARGET"
-                pnl = (target - entry_px) * qty; trades[-1]["pnl"] = pnl
-                eq_val += pnl; position = FLAT; did_exit = True
-
-        elif position == SHORT:
-            if row.High >= stop:
-                trades[-1]["exit_time"] = ts; trades[-1]["exit"] = stop
-                trades[-1]["reason"] = "STOP"
-                pnl = (entry_px - stop) * qty; trades[-1]["pnl"] = pnl
-                eq_val += pnl; position = FLAT; did_exit = True
-            elif row.Low <= target:
-                trades[-1]["exit_time"] = ts; trades[-1]["exit"] = target
-                trades[-1]["reason"] = "TARGET"
-                pnl = (entry_px - target) * qty; trades[-1]["pnl"] = pnl
-                eq_val += pnl; position = FLAT; did_exit = True
-
-        if did_exit:
-            last_exit_idx = i
-
-        # entries
-        if position == FLAT and d.loc[ts, "in_time"] and d.loc[ts, "adx_ok"]:
-            ok_cd = (i - last_exit_idx) >= cooldown
-            ok_re = (re_count_today < re_max) or (re_max == 0)
-            if ok_cd and ok_re:
-                if d.loc[ts, "cross_up"]:
-                    position = LONG
-                    entry_px = px
-                    stop   = entry_px - sl_mult * atr_val
-                    target = entry_px + tgt_rr * sl_mult * atr_val  # RR on ATR distance
-                    trades.append({
-                        "side": "LONG", "entry_time": ts, "entry": entry_px,
-                        "exit_time": None, "exit": None, "reason": "", "pnl": 0.0
-                    })
-                    if last_exit_idx > -10**8: re_count_today += 1
-
-                elif d.loc[ts, "cross_down"]:
-                    position = SHORT
-                    entry_px = px
-                    stop   = entry_px + sl_mult * atr_val
-                    target = entry_px - tgt_rr * sl_mult * atr_val
-                    trades.append({
-                        "side": "SHORT", "entry_time": ts, "entry": entry_px,
-                        "exit_time": None, "exit": None, "reason": "", "pnl": 0.0
-                    })
-                    if last_exit_idx > -10**8: re_count_today += 1
-
-        eq_curve.append(eq_val)
-
-    # close any open at last bar price
-    if position != FLAT:
-        last_ts = idx[-1]
-        last_px = float(d.loc[last_ts, "Close"])
-        if position == LONG:
-            pnl = (last_px - entry_px) * qty
-        else:
-            pnl = (entry_px - last_px) * qty
-        trades[-1]["exit_time"] = last_ts
-        trades[-1]["exit"] = last_px
-        trades[-1]["reason"] = "EOD"
-        trades[-1]["pnl"] = pnl
-        eq_val += pnl
-        eq_curve[-1] = eq_val  # update last point
-
-    # ---- Persist artifacts (always) ----
-    trades_df = pd.DataFrame(trades)
-    equity_ser = pd.Series(eq_curve, index=d.index, name="equity")
-
-    # metrics (even if zero trades/equity)
-    summary = compute_metrics(trades_df if not trades_df.empty else pd.DataFrame(),
-                              equity_ser if not equity_ser.empty else pd.Series([capital]),
-                              starting_capital=capital)
-
-    # write files
-    trades_out = os.path.join(args.out_dir, "trades.csv")
-    equity_out = os.path.join(args.out_dir, "equity.csv")
-    metrics_out= os.path.join(args.out_dir, "metrics.json")
-    trades_df.to_csv(trades_out, index=False)
-    equity_ser.to_csv(equity_out, header=True)
-    with open(metrics_out, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-
-    # charts
-    if not equity_ser.empty:
-        plot_equity_and_drawdown(equity_ser, args.out_dir)
-
-    print("✅ Intraday paper run done.")
-    print("   Trades:", len(trades_df), "| ROI:", summary.get("roi_pct"), "%")
-    print("   Files written to:", args.out_dir)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        # Make sure CI still uploads artifacts even if something fails
+        print("❌ Runner error:", repr(e))
+        # Write minimal files so telegram step shows a message
+        out_dir = "reports"
+        ensure_dir(out_dir)
+        save_json({"error": str(e)}, os.path.join(out_dir, "latest.json"))
+        save_json({
+            "ts": pd.Timestamp.utcnow().isoformat() + "Z",
+            "n_trades": 0,
+            "win_rate": 0.0,
+            "roi_pct": 0.0,
+            "profit_factor": 0.0,
+            "rr": 0.0,
+            "max_dd_pct": 0.0,
+            "time_dd_bars": 0,
+            "sharpe_ratio": 0.0,
+            "note": "Runner failed; see logs.",
+        }, os.path.join(out_dir, "metrics.json"))
+        sys.exit(1)
