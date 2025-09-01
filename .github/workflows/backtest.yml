@@ -3,68 +3,40 @@ name: backtest
 on:
   workflow_dispatch:
     inputs:
-      symbol:
-        description: "Index symbol (NIFTY / BANKNIFTY)"
-        required: false
+      underlying:
+        description: "Underlying (NIFTY / BANKNIFTY)"
+        required: true
         default: "BANKNIFTY"
       start:
         description: "Start date (YYYY-MM-DD)"
-        required: false
+        required: true
         default: "2025-07-01"
       end:
         description: "End date (YYYY-MM-DD)"
-        required: false
+        required: true
         default: "2025-08-01"
       interval:
-        description: "Candle interval"
-        required: false
+        description: "Candle interval (e.g., 5m, 15m, 1d)"
+        required: true
         default: "5m"
       capital_rs:
         description: "Starting capital (₹)"
         required: false
         default: "100000"
       order_qty:
-        description: "Order quantity (lots/contracts)"
+        description: "Order quantity"
         required: false
         default: "1"
-      slippage_bps:
-        description: "Slippage in bps (e.g., 5 = 0.05%)"
+      mode:
+        description: "Mode (backtest/paper)"
         required: false
-        default: "0"
-      broker_flat:
-        description: "Broker flat fee (₹ per order)"
-        required: false
-        default: "0"
-      broker_pct:
-        description: "Brokerage percent (e.g., 0.02 for 0.02%)"
-        required: false
-        default: "0"
-      max_trades_per_day:
-        description: "Hard cap on daily trades (0 = unlimited)"
-        required: false
-        default: "0"
-
-  push:
-    paths:
-      - ".github/workflows/backtest.yml"
-      - "tools/**"
-      - "bot/**"
-      - "strategies/**"
+        default: "backtest"
 
 jobs:
   run:
     runs-on: ubuntu-latest
 
-    # expose secrets as env and keep PYTHONPATH simple
-    env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      PYTHONPATH: ${{ github.workspace }}
-
     steps:
-      - name: Set up job
-        run: echo "Starting backtest workflow…"
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -78,41 +50,32 @@ jobs:
         with:
           path: ~/.cache/pip
           key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Add repo to PYTHONPATH
-        run: |
-          echo "PYTHONPATH=$PYTHONPATH" >> "$GITHUB_ENV"
+        run: echo "PYTHONPATH=$PWD" >> $GITHUB_ENV
 
       - name: Run backtest
+        id: runbt
         run: |
-          mkdir -p "./reports" "logs"
+          mkdir -p reports logs
           python tools/run_backtest.py \
-            --symbol "${{ github.event.inputs.symbol || 'BANKNIFTY' }}" \
-            --start  "${{ github.event.inputs.start  || '2025-07-01' }}" \
-            --end    "${{ github.event.inputs.end    || '2025-08-01' }}" \
+            --underlying "${{ github.event.inputs.underlying || 'BANKNIFTY' }}" \
+            --start "${{ github.event.inputs.start || '2025-07-01' }}" \
+            --end "${{ github.event.inputs.end || '2025-08-01' }}" \
             --interval "${{ github.event.inputs.interval || '5m' }}" \
+            --capital_rs "${{ github.event.inputs.capital_rs || 100000 }}" \
+            --order_qty "${{ github.event.inputs.order_qty || 1 }}" \
+            --mode "${{ github.event.inputs.mode || 'backtest' }}" \
             --outdir "./reports" \
-            --capital_rs "${{ github.event.inputs.capital_rs || '100000' }}" \
-            --order_qty "${{ github.event.inputs.order_qty || '1' }}" \
-            --slippage_bps "${{ github.event.inputs.slippage_bps || '0' }}" \
-            --broker_flat "${{ github.event.inputs.broker_flat || '0' }}" \
-            --broker_pct "${{ github.event.inputs.broker_pct || '0' }}" \
-            --max_trades_per_day "${{ github.event.inputs.max_trades_per_day || '0' }}" \
-          || echo "WARN: real backtest not available → writing minimal reports"
+          || echo "::warning :: Real engine failed → creating minimal report"
 
       - name: Ensure minimal report (never send 'No summary')
         run: |
-          python - <<'PY'
-          from tools.ensure_report import ensure_report
-          ensure_report("./reports")
-          PY
+          python tools/ensure_report.py --dir "./reports"
 
       - name: Upload artifacts (reports + logs)
         uses: actions/upload-artifact@v4
@@ -121,10 +84,12 @@ jobs:
           path: |
             reports/**
             logs/**
-          if-no-files-found: ignore
-          retention-days: 7
+          if-no-files-found: warn
 
       - name: Notify Telegram (summary + charts)
-        if: ${{ always() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
+        if: ${{ secrets.TELEGRAM_BOT_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != '' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python tools/telegram_notify.py --dir "./reports" --title "Backtest Results"
