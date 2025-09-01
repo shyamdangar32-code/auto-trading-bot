@@ -1,198 +1,118 @@
-# tools/run_backtest.py
-# Backtest driver: fetches index-level OHLC from Zerodha and calls bot.backtest
+name: backtest
 
-from __future__ import annotations
-import os, sys, argparse, json
-from datetime import datetime, date, timedelta
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: "NIFTY or BANKNIFTY"
+        required: true
+        default: "BANKNIFTY"
+      start:
+        description: "Start date (YYYY-MM-DD)"
+        required: true
+        default: "2025-07-01"
+      end:
+        description: "End date (YYYY-MM-DD)"
+        required: true
+        default: "2025-08-01"
+      interval:
+        description: "Candle interval"
+        required: true
+        default: "5m"
+      capital_rs:
+        description: "Starting capital (₹)"
+        required: true
+        default: "100000"
+      order_qty:
+        description: "Order quantity"
+        required: true
+        default: "1"
+      slippage_bps:
+        description: "Slippage in bps (5 = 0.05%)"
+        required: true
+        default: "0"
+      broker_flat:
+        description: "Broker flat fee (₹ per order)"
+        required: true
+        default: "0"
+      broker_pct:
+        description: "Brokerage percent (0.02 = 0.02%)"
+        required: true
+        default: "0"
+      max_trades_per_day:
+        description: "Hard cap on daily trades (0 = unlimited)"
+        required: true
+        default: "0"
 
-import pandas as pd
-from kiteconnect import KiteConnect
+jobs:
+  run:
+    runs-on: ubuntu-latest
 
-# our repo modules
-try:
-    from bot.backtest import run_backtest, save_reports
-except Exception as e:
-    print("❌ Import bot.backtest failed:", e)
-    raise
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-def ist_day_bounds(d: date):
-    # Zerodha candles are IST; naive datetimes okay on Actions
-    start = datetime(d.year, d.month, d.day, 9, 15, 0)
-    end   = datetime(d.year, d.month, d.day, 15, 30, 0)
-    return start, end
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-def daterange(d0: date, d1: date):
-    d = d0
-    while d <= d1:
-        yield d
-        d += timedelta(days=1)
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
-def map_interval(arg: str) -> str:
-    m = (arg or "").lower().strip()
-    return {
-        "1m": "minute",
-        "3m": "3minute",
-        "5m": "5minute",
-        "10m": "10minute",
-        "15m": "15minute",
-        "1minute": "minute",
-        "3minute": "3minute",
-        "5minute": "5minute",
-        "10minute": "10minute",
-        "15minute": "15minute",
-    }.get(m, "5minute")
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-def fetch_range_ohlc(kite: KiteConnect, token: int, d0: date, d1: date, interval: str) -> pd.DataFrame:
-    """Loop day by day to avoid window limits; concat to one DataFrame."""
-    frames: list[pd.DataFrame] = []
-    for d in daterange(d0, d1):
-        # skip weekends quickly
-        if d.weekday() >= 5:  # 5=Sat,6=Sun
-            continue
-        start, end = ist_day_bounds(d)
-        try:
-            raw = kite.historical_data(token, start, end, interval=interval)
-        except Exception as e:
-            print(f"⚠️  Skip {d}: {e}")
-            continue
-        if not raw:
-            continue
-        df = pd.DataFrame(raw)
-        # Normalize columns for backtester
-        df["datetime"] = pd.to_datetime(df["date"])
-        df = df.rename(columns={
-            "open": "Open", "high": "High", "low": "Low",
-            "close": "Close", "volume": "Volume"
-        })
-        frames.append(df[["datetime", "Open", "High", "Low", "Close", "Volume"]])
-    if not frames:
-        return pd.DataFrame(columns=["datetime","Open","High","Low","Close","Volume"]).set_index("datetime")
-    out = pd.concat(frames, ignore_index=True)
-    out = out.sort_values("datetime").drop_duplicates("datetime").set_index("datetime")
-    return out
+      - name: Add repo to PYTHONPATH
+        run: echo "PYTHONPATH=$PWD" >> $GITHUB_ENV
 
-def load_cfg():
-    # single source of truth
-    try:
-        from bot.config import load_config  # type: ignore
-        return load_config()
-    except Exception:
-        import yaml
-        with open("config.yaml", "r") as f:
-            return yaml.safe_load(f) or {}
+      - name: Run backtest
+        id: backtest
+        env:
+          # Telegram envs will be empty strings if not set; step below is gated.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '' }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || '' }}
+        run: |
+          set -e
+          mkdir -p "./reports" "logs"
+          python tools/run_backtest.py \
+            --symbol "${{ github.event.inputs.symbol }}" \
+            --start "${{ github.event.inputs.start }}" \
+            --end "${{ github.event.inputs.end }}" \
+            --interval "${{ github.event.inputs.interval }}" \
+            --outdir "./reports" \
+            --capital_rs "${{ github.event.inputs.capital_rs }}" \
+            --order_qty "${{ github.event.inputs.order_qty }}" \
+            --slippage_bps "${{ github.event.inputs.slippage_bps }}" \
+            --broker_flat "${{ github.event.inputs.broker_flat }}" \
+            --broker_pct "${{ github.event.inputs.broker_pct }}" \
+            --max_trades_per_day "${{ github.event.inputs.max_trades_per_day }}"
 
-def main():
-    parser = argparse.ArgumentParser(description="Run index-level backtest via Zerodha OHLC")
+      - name: Ensure minimal report (never send 'No summary' to Telegram)
+        if: always()
+        run: |
+          python - <<'PY'
+          from tools.ensure_report import ensure_report
+          ensure_report("./reports")
+          PY
 
-    # Primary inputs (kept compatible with your workflow)
-    parser.add_argument("--underlying", required=True, help="NIFTY or BANKNIFTY")
-    parser.add_argument("--start", required=True, help="YYYY-MM-DD")
-    parser.add_argument("--end", required=True, help="YYYY-MM-DD")
-    parser.add_argument("--interval", default="5m", help="1m,3m,5m,10m,15m")
-    parser.add_argument("--capital_rs", type=float, default=100000)
-    parser.add_argument("--order_qty", type=int, default=1)
-    parser.add_argument("--mode", default="offline")
+      - name: Upload artifacts (reports + logs)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-artifacts
+          path: |
+            reports/**
+            logs/**
 
-    # --- CI placeholders / compat flags (ignored by engine but accepted so errors stop) ---
-    parser.add_argument("--fees_json", default="{}", help="(CI placeholder) ignored")
-    parser.add_argument("--session_json", default="{}", help="(CI placeholder) ignored")
-    parser.add_argument("--extra_params", default="{}", help="(CI placeholder) ignored")
-
-    # Both spellings supported (old --out_dir vs new --outdir)
-    parser.add_argument("--outdir", default="./reports", dest="outdir", help="Output directory")
-    parser.add_argument("--out_dir", dest="outdir")  # keep compatibility with older workflow
-
-    # Optional risk knobs (if passed from workflow; safe defaults)
-    parser.add_argument("--slippage_bps", type=float, default=0.0)
-    parser.add_argument("--broker_flat", type=float, default=0.0)
-    parser.add_argument("--broker_pct", type=float, default=0.0)
-    parser.add_argument("--session_start", default="09:15")
-    parser.add_argument("--session_end", default="15:30")
-    parser.add_argument("--max_trades_per_day", type=int, default=9999)
-
-    # IMPORTANT: be tolerant to unknown args from workflows
-    args, _unknown = parser.parse_known_args()
-
-    # Dates
-    d0 = datetime.fromisoformat(args.start).date()
-    d1 = datetime.fromisoformat(args.end).date()
-    if d1 < d0:
-        raise SystemExit("End date must be >= start date")
-
-    os.makedirs(args.outdir, exist_ok=True)
-
-    # Config
-    cfg = load_cfg() or {}
-    # ensure capital/qty override from inputs
-    cfg["capital_rs"] = args.capital_rs
-    cfg["order_qty"]  = args.order_qty
-
-    # Zerodha auth (env-driven on Actions)
-    api_key = (os.getenv("ZERODHA_API_KEY") or cfg.get("ZERODHA_API_KEY") or "").strip()
-    access  = (os.getenv("ZERODHA_ACCESS_TOKEN") or cfg.get("ZERODHA_ACCESS_TOKEN") or "").strip()
-    if not api_key or not access:
-        raise SystemExit("Missing ZERODHA_API_KEY / ZERODHA_ACCESS_TOKEN (GitHub Secrets).")
-
-    kite = KiteConnect(api_key=api_key)
-    kite.set_access_token(access)
-
-    # Index token (from config.intraday_options)
-    idx_token = None
-    try:
-        idx_token = int((cfg.get("intraday_options") or {}).get("index_token") or 0)
-    except Exception:
-        idx_token = 0
-
-    # Basic fallback if not present
-    if not idx_token:
-        u = (args.underlying or "").upper()
-        if u == "BANKNIFTY":
-            idx_token = 260105
-        elif u == "NIFTY":
-            idx_token = 256265
-        else:
-            raise SystemExit("No index_token in config.yaml and unknown underlying; please set intraday_options.index_token")
-
-    kc_interval = map_interval(args.interval)
-    print(f"📥 Fetching Zerodha OHLC: token={idx_token} interval={kc_interval} {d0} → {d1}")
-    prices = fetch_range_ohlc(kite, idx_token, d0, d1, kc_interval)
-    if prices.empty:
-        raise SystemExit("No candles fetched for the chosen range.")
-
-    # Echo minimal trade config for traceability
-    print("⚙️  Trade config:", {
-        "order_qty": cfg.get("order_qty"),
-        "capital_rs": cfg.get("capital_rs"),
-        "reentry_max": cfg.get("reentry_max", 0),
-        "reentry_cooldown": cfg.get("reentry_cooldown", 0),
-        "stop_atr_mult": cfg.get("stop_atr_mult", 1.2),
-        "take_atr_mult": cfg.get("take_atr_mult", 1.6),
-    })
-
-    # Run backtest (your strategy/indicators are wired inside bot.strategy / bot.backtest)
-    summary, trades_df, equity_ser = run_backtest(prices, cfg)
-
-    # Persist reports
-    save_reports(args.outdir, summary, trades_df, equity_ser)
-
-    # Small metadata echo for CI logs
-    try:
-        meta = {
-            "underlying": args.underlying,
-            "start": args.start,
-            "end": args.end,
-            "interval": args.interval,
-            "n_rows": int(prices.shape[0]),
-            "n_trades": int(summary.get("n_trades", 0)) if isinstance(summary, dict) else None,
-        }
-        with open(os.path.join(args.outdir, "latest.json"), "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2)
-    except Exception as e:
-        print("ℹ️ Could not write latest.json (non-fatal):", e)
-
-    print("✅ Backtest complete")
-    print("   Summary:", summary)
-    print(f"   Files written in: {args.outdir}")
-
-if __name__ == "__main__":
-    main()
+      - name: Notify Telegram (summary + charts)
+        if: ${{ always() && secrets.TELEGRAM_BOT_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != '' }}
+        run: |
+          python tools/telegram_notify.py --reports "./reports"
