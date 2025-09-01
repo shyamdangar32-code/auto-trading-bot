@@ -16,11 +16,11 @@ on:
         required: true
         default: "2025-08-01"
       interval:
-        description: "Candle interval"
+        description: "Candle interval (e.g., 5m)"
         required: true
         default: "5m"
       capital_rs:
-        description: "Starting capital (₹)"
+        description: "Starting capital in ₹"
         required: true
         default: "100000"
       order_qty:
@@ -29,24 +29,26 @@ on:
         default: "1"
       slippage_bps:
         description: "Slippage in bps (5 = 0.05%)"
-        required: true
+        required: false
         default: "0"
       broker_flat:
         description: "Broker flat fee (₹ per order)"
-        required: true
+        required: false
         default: "0"
       broker_pct:
-        description: "Brokerage percent (0.02 = 0.02%)"
-        required: true
+        description: "Brokerage percent (e.g., 0.02 for 0.02%)"
+        required: false
         default: "0"
       max_trades_per_day:
         description: "Hard cap on daily trades (0 = unlimited)"
-        required: true
+        required: false
         default: "0"
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: ${{ github.workspace }}
 
     steps:
       - name: Checkout
@@ -55,15 +57,15 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Cache pip
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
           restore-keys: |
-            ${{ runner.os }}-pip-
+            pip-${{ runner.os }}-
 
       - name: Install deps
         run: |
@@ -71,40 +73,34 @@ jobs:
           pip install -r requirements.txt
 
       - name: Add repo to PYTHONPATH
-        run: echo "PYTHONPATH=$PWD" >> $GITHUB_ENV
+        run: echo "${{ github.workspace }}" >> $GITHUB_PATH
 
       - name: Run backtest
-        id: backtest
-        env:
-          # Telegram envs will be empty strings if not set; step below is gated.
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '' }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || '' }}
+        shell: bash
         run: |
           set -e
-          mkdir -p "./reports" "logs"
-          python tools/run_backtest.py \
-            --symbol "${{ github.event.inputs.symbol }}" \
-            --start "${{ github.event.inputs.start }}" \
-            --end "${{ github.event.inputs.end }}" \
-            --interval "${{ github.event.inputs.interval }}" \
-            --outdir "./reports" \
-            --capital_rs "${{ github.event.inputs.capital_rs }}" \
-            --order_qty "${{ github.event.inputs.order_qty }}" \
-            --slippage_bps "${{ github.event.inputs.slippage_bps }}" \
-            --broker_flat "${{ github.event.inputs.broker_flat }}" \
-            --broker_pct "${{ github.event.inputs.broker_pct }}" \
-            --max_trades_per_day "${{ github.event.inputs.max_trades_per_day }}"
+          mkdir -p "./reports" logs
 
-      - name: Ensure minimal report (never send 'No summary' to Telegram)
-        if: always()
+          echo "▶️  Launching real backtest…"
+          python tools/run_backtest.py \
+            --symbol "${{ inputs.symbol }}" \
+            --start "${{ inputs.start }}" \
+            --end "${{ inputs.end }}" \
+            --interval "${{ inputs.interval }}" \
+            --outdir "./reports" \
+            --capital_rs "${{ inputs.capital_rs }}" \
+            --order_qty "${{ inputs.order_qty }}" \
+            --slippage_bps "${{ inputs.slippage_bps }}" \
+            --broker_flat "${{ inputs.broker_flat }}" \
+            --broker_pct "${{ inputs.broker_pct }}" \
+            --max_trades_per_day "${{ inputs.max_trades_per_day }}"
+
+      - name: Ensure minimal report (never send 'No summary')
+        # જો real engine કોઈ કારણથી ચલાયું ન હોય તો આ step summary/chart placeholders મૂકી દે છે
         run: |
-          python - <<'PY'
-          from tools.ensure_report import ensure_report
-          ensure_report("./reports")
-          PY
+          python tools/ensure_report.py --reports "./reports"
 
       - name: Upload artifacts (reports + logs)
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: backtest-artifacts
@@ -114,5 +110,8 @@ jobs:
 
       - name: Notify Telegram (summary + charts)
         if: ${{ always() && secrets.TELEGRAM_BOT_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != '' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python tools/telegram_notify.py --reports "./reports"
