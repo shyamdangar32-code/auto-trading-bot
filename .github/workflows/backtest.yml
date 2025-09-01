@@ -1,23 +1,24 @@
 name: backtest
 
 on:
+  push:
   workflow_dispatch:
     inputs:
       underlying:
-        description: "Underlying (NIFTY / BANKNIFTY)"
-        required: true
+        description: "UNDERLYING (e.g., NIFTY, BANKNIFTY)"
+        required: false
         default: "BANKNIFTY"
       start:
         description: "Start date (YYYY-MM-DD)"
-        required: true
-        default: "2025-07-01"
+        required: false
+        default: ""
       end:
         description: "End date (YYYY-MM-DD)"
-        required: true
-        default: "2025-08-01"
+        required: false
+        default: ""
       interval:
-        description: "Candle interval (e.g., 5m, 15m, 1d)"
-        required: true
+        description: "Candle interval (1m/5m/15m/1d)"
+        required: false
         default: "5m"
       capital_rs:
         description: "Starting capital (₹)"
@@ -27,14 +28,27 @@ on:
         description: "Order quantity"
         required: false
         default: "1"
-      mode:
-        description: "Mode (backtest/paper)"
+      slippage_bps:
+        description: "Slippage in bps (e.g., 5 = 0.05%)"
         required: false
-        default: "backtest"
+        default: "0"
+      broker_flat:
+        description: "Broker flat fee (₹ per order)"
+        required: false
+        default: "0"
+      broker_pct:
+        description: "Brokerage percent (e.g., 0.02 for 0.02%)"
+        required: false
+        default: "0"
+      max_trades_per_day:
+        description: "Hard cap on daily trades (0 = unlimited)"
+        required: false
+        default: "0"
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -49,33 +63,54 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
 
       - name: Install deps
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Add repo to PYTHONPATH
-        run: echo "PYTHONPATH=$PWD" >> $GITHUB_ENV
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
 
       - name: Run backtest
-        id: runbt
+        env:
+          # pick values from workflow_dispatch when present; else sensible defaults
+          UNDERLYING: ${{ github.event.inputs.underlying || 'BANKNIFTY' }}
+          START: ${{ github.event.inputs.start || '' }}
+          END: ${{ github.event.inputs.end || '' }}
+          INTERVAL: ${{ github.event.inputs.interval || '5m' }}
+          CAPITAL_RS: ${{ github.event.inputs.capital_rs || '100000' }}
+          ORDER_QTY: ${{ github.event.inputs.order_qty || '1' }}
+          SLIPPAGE_BPS: ${{ github.event.inputs.slippage_bps || '0' }}
+          BROKER_FLAT: ${{ github.event.inputs.broker_flat || '0' }}
+          BROKER_PCT: ${{ github.event.inputs.broker_pct || '0' }}
+          MAX_TRADES_PER_DAY: ${{ github.event.inputs.max_trades_per_day || '0' }}
         run: |
-          mkdir -p reports logs
+          set -eo pipefail
+          mkdir -p "./reports" "logs"
+
+          echo "▶ Launching real backtest…"
+          # NOTE: tools/run_backtest.py must accept these flags; we only pass what it knows.
           python tools/run_backtest.py \
-            --underlying "${{ github.event.inputs.underlying || 'BANKNIFTY' }}" \
-            --start "${{ github.event.inputs.start || '2025-07-01' }}" \
-            --end "${{ github.event.inputs.end || '2025-08-01' }}" \
-            --interval "${{ github.event.inputs.interval || '5m' }}" \
-            --capital_rs "${{ github.event.inputs.capital_rs || 100000 }}" \
-            --order_qty "${{ github.event.inputs.order_qty || 1 }}" \
-            --mode "${{ github.event.inputs.mode || 'backtest' }}" \
+            --underlying "${UNDERLYING}" \
+            --start "${START}" \
+            --end "${END}" \
+            --interval "${INTERVAL}" \
+            --capital_rs "${CAPITAL_RS}" \
+            --order_qty "${ORDER_QTY}" \
+            --slippage_bps "${SLIPPAGE_BPS}" \
+            --broker_flat "${BROKER_FLAT}" \
+            --broker_pct "${BROKER_PCT}" \
+            --max_trades_per_day "${MAX_TRADES_PER_DAY}" \
             --outdir "./reports" \
-          || echo "::warning :: Real engine failed → creating minimal report"
+          || { echo "WARN: real backtest failed → writing minimal reports"; }
 
       - name: Ensure minimal report (never send 'No summary')
         run: |
-          python tools/ensure_report.py --dir "./reports"
+          python tools/ensure_report.py --dir "./reports" --note "No data; runner fallback."
 
       - name: Upload artifacts (reports + logs)
         uses: actions/upload-artifact@v4
@@ -85,6 +120,7 @@ jobs:
             reports/**
             logs/**
           if-no-files-found: warn
+          retention-days: 7
 
       - name: Notify Telegram (summary + charts)
         if: ${{ secrets.TELEGRAM_BOT_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != '' }}
