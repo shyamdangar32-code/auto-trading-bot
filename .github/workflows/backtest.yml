@@ -1,32 +1,30 @@
 name: backtest
 
 on:
-  push:
-    branches: ["main"]
   workflow_dispatch:
     inputs:
       symbol:
-        description: "NIFTY or BANKNIFTY"
-        required: true
+        description: "Index symbol (NIFTY / BANKNIFTY)"
+        required: false
         default: "BANKNIFTY"
       start:
         description: "Start date (YYYY-MM-DD)"
-        required: true
+        required: false
         default: "2025-07-01"
       end:
         description: "End date (YYYY-MM-DD)"
-        required: true
+        required: false
         default: "2025-08-01"
       interval:
-        description: "Candle interval (e.g., 5m)"
-        required: true
+        description: "Candle interval"
+        required: false
         default: "5m"
       capital_rs:
         description: "Starting capital (₹)"
         required: false
         default: "100000"
       order_qty:
-        description: "Order quantity"
+        description: "Order quantity (lots/contracts)"
         required: false
         default: "1"
       slippage_bps:
@@ -46,16 +44,27 @@ on:
         required: false
         default: "0"
 
+  push:
+    paths:
+      - ".github/workflows/backtest.yml"
+      - "tools/**"
+      - "bot/**"
+      - "strategies/**"
+
 jobs:
   run:
     runs-on: ubuntu-latest
 
-    # Map GitHub secrets -> env first (so we can safely reference in `if:`)
+    # expose secrets as env and keep PYTHONPATH simple
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      PYTHONPATH: ${{ github.workspace }}
 
     steps:
+      - name: Set up job
+        run: echo "Starting backtest workflow…"
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -78,42 +87,32 @@ jobs:
           pip install -r requirements.txt
 
       - name: Add repo to PYTHONPATH
-        run: echo "PYTHONPATH=$PWD" >> "$GITHUB_ENV"
+        run: |
+          echo "PYTHONPATH=$PYTHONPATH" >> "$GITHUB_ENV"
 
       - name: Run backtest
-        id: runbt
-        shell: bash
         run: |
-          set -euo pipefail
           mkdir -p "./reports" "logs"
+          python tools/run_backtest.py \
+            --symbol "${{ github.event.inputs.symbol || 'BANKNIFTY' }}" \
+            --start  "${{ github.event.inputs.start  || '2025-07-01' }}" \
+            --end    "${{ github.event.inputs.end    || '2025-08-01' }}" \
+            --interval "${{ github.event.inputs.interval || '5m' }}" \
+            --outdir "./reports" \
+            --capital_rs "${{ github.event.inputs.capital_rs || '100000' }}" \
+            --order_qty "${{ github.event.inputs.order_qty || '1' }}" \
+            --slippage_bps "${{ github.event.inputs.slippage_bps || '0' }}" \
+            --broker_flat "${{ github.event.inputs.broker_flat || '0' }}" \
+            --broker_pct "${{ github.event.inputs.broker_pct || '0' }}" \
+            --max_trades_per_day "${{ github.event.inputs.max_trades_per_day || '0' }}" \
+          || echo "WARN: real backtest not available → writing minimal reports"
 
-          ARGS=()
-          ARGS+=("--symbol" "${{ github.event.inputs.symbol }}")
-          ARGS+=("--start"  "${{ github.event.inputs.start }}")
-          ARGS+=("--end"    "${{ github.event.inputs.end }}")
-          ARGS+=("--interval" "${{ github.event.inputs.interval }}")
-          ARGS+=("--outdir" "./reports")
-
-          # Optional knobs (pass even if zero; your script accepts them)
-          ARGS+=("--capital_rs"       "${{ github.event.inputs.capital_rs }}")
-          ARGS+=("--order_qty"        "${{ github.event.inputs.order_qty }}")
-          ARGS+=("--slippage_bps"     "${{ github.event.inputs.slippage_bps }}")
-          ARGS+=("--broker_flat"      "${{ github.event.inputs.broker_flat }}")
-          ARGS+=("--broker_pct"       "${{ github.event.inputs.broker_pct }}")
-          ARGS+=("--max_trades_per_day" "${{ github.event.inputs.max_trades_per_day }}")
-
-          echo "▶ Launching real backtest…"
-          set +e
-          python tools/run_backtest.py "${ARGS[@]}"
-          rc=$?
-          set -e
-
-          if [[ $rc -ne 0 ]]; then
-            echo "WARN: real backtest failed (rc=$rc) → writing minimal reports"
-          fi
-
-          # Always ensure we have at least a minimal report for downstream steps
-          python tools/ensure_report.py --reports "./reports" || true
+      - name: Ensure minimal report (never send 'No summary')
+        run: |
+          python - <<'PY'
+          from tools.ensure_report import ensure_report
+          ensure_report("./reports")
+          PY
 
       - name: Upload artifacts (reports + logs)
         uses: actions/upload-artifact@v4
@@ -122,11 +121,10 @@ jobs:
           path: |
             reports/**
             logs/**
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Notify Telegram (summary + charts)
         if: ${{ always() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ env.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ env.TELEGRAM_CHAT_ID }}
         run: |
-          python tools/telegram_notify.py --reports "./reports"
+          python tools/telegram_notify.py --dir "./reports" --title "Backtest Results"
