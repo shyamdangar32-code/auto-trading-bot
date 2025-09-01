@@ -1,110 +1,159 @@
 # tools/run_backtest.py
-# ---------------------------------------
-# Safe CLI wrapper for backtests.
-# - Accepts all workflow inputs (symbol, start, end, etc.)
-# - Tries to run a real backtest if engine is present.
-# - If engine/modules not available, writes a minimal report and exits 0.
-# ---------------------------------------
+# -*- coding: utf-8 -*-
+"""
+Launch real backtest from GitHub Actions (or local),
+save reports to ./reports and a compact summary to ./logs/summary.txt
 
-from __future__ import annotations
+CLI:
+  python tools/run_backtest.py \
+    --symbol BANKNIFTY --start 2025-07-01 --end 2025-08-01 \
+    --interval 5m --outdir ./reports \
+    --capital_rs 100000 --order_qty 1 \
+    --slippage_bps 0 --broker_flat 0 --broker_pct 0 \
+    --session_start "" --session_end "" --max_trades_per_day 0 \
+    --extra "{}"
+"""
 
 import argparse
 import json
 import os
-import sys
-from datetime import datetime
 from pathlib import Path
+from datetime import datetime
 
-REPORTS_FILES = [
-    "summary.txt",
-    "metrics.json",
-    "equity_curve.csv",
-]
+import pandas as pd
 
-def _ensure_dir(p: str | Path) -> Path:
-    p = Path(p)
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+# our package
+from bot import data_io
+from bot import backtest as backtest_mod
+from tools.ensure_report import ensure_report  # keeps telegram step happy
 
-def _dump_minimal_reports(outdir: Path, note: str) -> None:
-    outdir = _ensure_dir(outdir)
-    (outdir / "summary.txt").write_text(
-        "Backtest Summary\n"
-        "Trades: 0\nWin-rate: 0.0%\nROI: 0.0%\nProfit Factor: 0.0\nR:R: 0.0\n"
-        "Max DD: 0.0%\nTime DD (bars): 0\nSharpe: 0.0\n"
-        f"Note: {note}\n",
-        encoding="utf-8",
-    )
-    (outdir / "metrics.json").write_text(
-        json.dumps({"trades": 0, "roi": 0.0, "note": note}, indent=2),
-        encoding="utf-8",
-    )
-    # Optional empty equity curve
-    (outdir / "equity_curve.csv").write_text("date,eq\n", encoding="utf-8")
+
+def _mk_dir(p: str) -> Path:
+    d = Path(p).resolve()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run backtest safely")
+    p = argparse.ArgumentParser()
     p.add_argument("--symbol", required=True, help="NIFTY or BANKNIFTY")
     p.add_argument("--start", required=True, help="YYYY-MM-DD")
     p.add_argument("--end", required=True, help="YYYY-MM-DD")
-    p.add_argument("--interval", required=True, help="e.g. 5m")
-    p.add_argument("--outdir", required=True, help="Output reports directory")
-    p.add_argument("--capital_rs", type=float, required=True)
-    p.add_argument("--order_qty", type=int, required=True)
-    p.add_argument("--fees_json", default="{}",
-                   help='JSON: {"slippage_bps":0, "broker_flat":0, "broker_pct":0}')
-    p.add_argument("--session_json", default="{}",
-                   help='JSON: {"start":"09:20", "end":"15:25", "max_trades_per_day":0}')
-    p.add_argument("--extra_params", default="{}",
-                   help="Strategy extra parameters as JSON")
+    p.add_argument("--interval", default="5m", help="5m/10m/15m…")
+    p.add_argument("--outdir", default="./reports")
+    p.add_argument("--capital_rs", type=float, default=100000)
+    p.add_argument("--order_qty", type=int, default=1)
+    p.add_argument("--slippage_bps", type=float, default=0.0)
+    p.add_argument("--broker_flat", type=float, default=0.0)
+    p.add_argument("--broker_pct", type=float, default=0.0)
+    p.add_argument("--session_start", default="")
+    p.add_argument("--session_end", default="")
+    p.add_argument("--max_trades_per_day", type=int, default=0)
+    p.add_argument("--extra", default="{}",
+                   help='JSON string for future flags, e.g. \'{"signal_mode":"balanced"}\'')
     return p.parse_args()
 
-def main() -> int:
+
+def _none_if_blank(x: str):
+    x = (x or "").strip()
+    return None if x == "" else x
+
+
+def main():
     args = parse_args()
+    outdir = _mk_dir(args.outdir)
+    _mk_dir("./logs")
 
-    # Parse JSON blobs
+    # 1) Download/index data via Zerodha (uses your active token)
+    #    for index-level candles; falls back to minimal if API truly fails.
     try:
-        fees = json.loads(args.fees_json or "{}")
-    except Exception:
-        fees = {}
-    try:
-        sess = json.loads(args.session_json or "{}")
-    except Exception:
-        sess = {}
-    try:
-        extra = json.loads(args.extra_params or "{}")
-    except Exception:
-        extra = {}
-
-    outdir = _ensure_dir(args.outdir)
-
-    # Try to import the "real" engine
-    try:
-        from bot.backtest import run_backtest as real_run_backtest  # type: ignore
-        print("🔷 Launching real backtest…")
-        real_run_backtest(
+        # data_io has helpers to fetch index candles by symbol + dates
+        prices = data_io.get_index_candles(
             symbol=args.symbol,
             start=args.start,
             end=args.end,
             interval=args.interval,
-            outdir=str(outdir),
-            capital_rs=float(args.capital_rs),
-            order_qty=int(args.order_qty),
-            slippage_bps=float(fees.get("slippage_bps", 0) or 0),
-            broker_flat=float(fees.get("broker_flat", 0) or 0),
-            broker_pct=float(fees.get("broker_pct", 0) or 0),
-            session_start=sess.get("start"),
-            session_end=sess.get("end"),
-            max_trades_per_day=int(sess.get("max_trades_per_day", 0) or 0),
-            **extra,
         )
-        return 0
-
+        if prices is None or len(prices) == 0:
+            raise RuntimeError("Empty price dataframe")
     except Exception as e:
-        # If the engine/module is missing or raises, write minimal reports
-        print(f"WARN: real backtest not available -> {e!r} -> writing minimal reports")
-        _dump_minimal_reports(outdir, "Real engine not wired yet")
-        return 0
+        # write minimal report & exit nicely, so workflow doesn't crash
+        print(f"WARN: data_io.get_index_candles unavailable or returned empty -> {e}")
+        ensure_report(outdir=str(outdir), note="No data; wrote minimal reports.")
+        return
+
+    # 2) Build compact config for backtest engine
+    cfg = {
+        "capital_rs": float(args.capital_rs),
+        "order_qty": int(args.order_qty),
+        "slippage_bps": float(args.slippage_bps),
+        "broker_flat": float(args.broker_flat),
+        "broker_pct": float(args.broker_pct),
+        "session_start": _none_if_blank(args.session_start),
+        "session_end": _none_if_blank(args.session_end),
+        "max_trades_per_day": int(args.max_trades_per_day),
+        "symbol": args.symbol,
+        "interval": args.interval,
+    }
+    try:
+        extra = json.loads(args.extra) if args.extra else {}
+        if isinstance(extra, dict):
+            cfg.update(extra)
+    except Exception:
+        pass
+
+    # 3) Run real backtest
+    try:
+        # expected to return dict with trades/metrics and possibly per-trade dataframe
+        result = backtest_mod.run_backtest(
+            prices=prices,
+            config=cfg,
+        )
+    except TypeError as te:
+        # signature mismatch → surface clearly
+        print(f"ERROR: real backtest failed -> {repr(te)}")
+        ensure_report(outdir=str(outdir), note=f"Backtest error: {te}")
+        return
+    except Exception as e:
+        print(f"ERROR: real backtest crashed -> {repr(e)}")
+        ensure_report(outdir=str(outdir), note=f"Backtest error: {e}")
+        return
+
+    # 4) Persist outputs
+    #    - trades.csv
+    #    - metrics.json
+    #    - summary.txt (for logs + telegram)
+    trades_df: pd.DataFrame = result.get("trades", pd.DataFrame())
+    metrics: dict = result.get("metrics", {})
+
+    # save trades if available
+    if isinstance(trades_df, pd.DataFrame) and not trades_df.empty:
+        trades_df.to_csv(outdir / "trades.csv", index=False)
+
+    # save metrics
+    with open(outdir / "metrics.json", "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+
+    # human summary
+    summary_lines = [
+        "Backtest Summary",
+        f"Symbol: {args.symbol}",
+        f"Interval: {args.interval}",
+        f"Period: {args.start}..{args.end}",
+        f"Trades: {int(metrics.get('trades', 0))}",
+        f"Win-rate: {round(float(metrics.get('win_rate', 0.0))*100, 2)}%",
+        f"ROI: {round(float(metrics.get('roi_pct', 0.0)), 2)}%",
+        f"Profit Factor: {round(float(metrics.get('profit_factor', 0.0)), 2)}",
+        f"R:R: {round(float(metrics.get('rr', 0.0)), 2)}",
+        f"Max DD: {round(float(metrics.get('max_dd_pct', 0.0)), 2)}%",
+        f"Time DD (bars): {int(metrics.get('time_dd_bars', 0))}",
+        f"Sharpe: {round(float(metrics.get('sharpe', 0.0)), 2)}",
+    ]
+    with open("./logs/summary.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(summary_lines) + "\n")
+
+    print("✅ backtest finished; reports written.")
+
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
