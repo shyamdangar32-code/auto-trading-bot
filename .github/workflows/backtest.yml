@@ -4,87 +4,142 @@ on:
   workflow_dispatch:
     inputs:
       symbol:
-        description: "NIFTY or BANKNIFTY"
+        description: "Index symbol (NIFTY | BANKNIFTY)"
         required: true
         default: "BANKNIFTY"
       start:
-        description: "YYYY-MM-DD (inclusive)"
-        required: true
-        default: "2025-07-01"
+        description: "Start date (YYYY-MM-DD)"
+        required: false
+        default: ""
       end:
-        description: "YYYY-MM-DD (inclusive)"
-        required: true
-        default: "2025-08-01"
+        description: "End date (YYYY-MM-DD)"
+        required: false
+        default: ""
       interval:
-        description: "Candle interval"
+        description: "Candle interval (e.g., 5m, 10m, 15m)"
         required: true
         default: "5m"
-      capital:
+      capital_rs:
         description: "Starting capital (₹)"
         required: true
         default: "100000"
-      qty:
+      order_qty:
         description: "Order quantity"
         required: true
         default: "1"
+      slippage_bps:
+        description: "Slippage (basis points) e.g., 5 = 0.05%"
+        required: false
+        default: "0"
+      broker_flat:
+        description: "Broker flat fee (₹ per order)"
+        required: false
+        default: "0"
+      broker_pct:
+        description: "Brokerage percent (e.g., 0.02 for 0.02%)"
+        required: false
+        default: "0"
+      max_trades_per_day:
+        description: "Hard cap on daily trades (0 = unlimited)"
+        required: false
+        default: "0"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      PYTHONPATH: ${{ github.workspace }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
+      - name: Set up job
+        run: echo "Starting backtest workflow"
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v4
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Cache pip
-        uses: actions/cache@v4
+        uses: actions/cache@v3
         with:
           path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install deps
-        run: |
-          python -m pip install -U pip
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
       - name: Add repo to PYTHONPATH
-        run: echo "${{ github.workspace }}" >> $GITHUB_PATH
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE" >> $GITHUB_ENV
+
+      # જો start/end ખાલી હોય તો ગઈકાલની તારીખ ભરી દે
+      - name: Compute default dates (yesterday) if inputs empty
+        id: dates
+        shell: bash
+        run: |
+          START="${{ github.event.inputs.start }}"
+          END="${{ github.event.inputs.end }}"
+          if [[ -z "$START" || -z "$END" ]]; then
+            # ગઈકાલ
+            YEST=$(date -u -d "yesterday" +"%Y-%m-%d")
+            echo "start=${START:-$YEST}" >> $GITHUB_OUTPUT
+            echo "end=${END:-$YEST}" >> $GITHUB_OUTPUT
+          else
+            echo "start=$START" >> $GITHUB_OUTPUT
+            echo "end=$END" >> $GITHUB_OUTPUT
+          fi
 
       - name: Run backtest
+        shell: bash
+        env:
+          SYMBOL: ${{ github.event.inputs.symbol }}
+          START:  ${{ steps.dates.outputs.start }}
+          END:    ${{ steps.dates.outputs.end }}
+          INTERVAL: ${{ github.event.inputs.interval }}
+          CAPITAL_RS: ${{ github.event.inputs.capital_rs }}
+          ORDER_QTY: ${{ github.event.inputs.order_qty }}
+          SLIPPAGE_BPS: ${{ github.event.inputs.slippage_bps }}
+          BROKER_FLAT: ${{ github.event.inputs.broker_flat }}
+          BROKER_PCT:  ${{ github.event.inputs.broker_pct }}
+          MAX_TRADES:  ${{ github.event.inputs.max_trades_per_day }}
         run: |
+          mkdir -p reports
+          # optional flags (ખાલી હોય તો ન મોકલાય)
+          OPTS=""
+          [[ -n "$SLIPPAGE_BPS" && "$SLIPPAGE_BPS" != "0" ]] && OPTS="$OPTS --slippage_bps $SLIPPAGE_BPS"
+          [[ -n "$BROKER_FLAT"  && "$BROKER_FLAT"  != "0" ]] && OPTS="$OPTS --broker_flat $BROKER_FLAT"
+          [[ -n "$BROKER_PCT"   && "$BROKER_PCT"   != "0" ]] && OPTS="$OPTS --broker_pct $BROKER_PCT"
+          [[ -n "$MAX_TRADES" ]] && OPTS="$OPTS --max_trades_per_day $MAX_TRADES"
+
+          echo "▶ Running: $SYMBOL $START..$END interval=$INTERVAL capital=$CAPITAL_RS qty=$ORDER_QTY"
           python tools/run_backtest.py \
-            --symbol "${{ github.event.inputs.symbol }}" \
-            --start "${{ github.event.inputs.start }}" \
-            --end "${{ github.event.inputs.end }}" \
-            --interval "${{ github.event.inputs.interval }}" \
-            --capital_rs "${{ github.event.inputs.capital }}" \
-            --order_qty "${{ github.event.inputs.qty }}" \
-            --out_dir "./reports"
+            --symbol "$SYMBOL" \
+            --start "$START" \
+            --end "$END" \
+            --interval "$INTERVAL" \
+            --capital_rs "$CAPITAL_RS" \
+            --order_qty "$ORDER_QTY" \
+            --outdir ./reports $OPTS
 
-      - name: Ensure minimal report
-        if: always()
+      - name: Ensure minimal report (never send 'No summary')
         run: |
-          python tools/ensure_report.py --dir "./reports"
+          python tools/ensure_report.py --dir ./reports || true
 
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Upload artifacts (reports + logs)
+        uses: actions/upload-artifact@v3
         with:
           name: backtest-artifacts
           path: |
-            reports/**
-            logs/**
+            ./reports/**
+            ./logs/**
 
-      - name: Notify Telegram
-        if: always()
+      # Telegram optional – secrets સેટ કર્યા હોય ત્યારે જ ચાલશે
+      - name: Notify Telegram (summary + charts)
+        if: ${{ secrets.TELEGRAM_BOT_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != '' }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python tools/telegram_notify.py --dir "./reports" --title "Backtest Complete"
+          python tools/telegram_notify.py --dir ./reports || true
