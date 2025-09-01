@@ -4,15 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       symbol:
-        description: "NIFTY or BANKNIFTY"
+        description: "Index symbol (NIFTY/BANKNIFTY)"
         required: true
         default: "BANKNIFTY"
       start:
-        description: "Start date (YYYY-MM-DD)"
+        description: "Start date (YYYY-MM-DD inclusive)"
         required: true
         default: "2025-07-01"
       end:
-        description: "End date (YYYY-MM-DD)"
+        description: "End date (YYYY-MM-DD inclusive)"
         required: true
         default: "2025-08-01"
       interval:
@@ -20,7 +20,7 @@ on:
         required: true
         default: "5m"
       capital_rs:
-        description: "Starting capital in ₹"
+        description: "Starting capital (₹)"
         required: true
         default: "100000"
       order_qty:
@@ -36,7 +36,7 @@ on:
         required: false
         default: "0"
       broker_pct:
-        description: "Brokerage percent (e.g., 0.02 for 0.02%)"
+        description: "Brokerage percent (e.g., 0.02 = 0.02%)"
         required: false
         default: "0"
       max_trades_per_day:
@@ -47,9 +47,6 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      PYTHONPATH: ${{ github.workspace }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -63,9 +60,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
           restore-keys: |
-            pip-${{ runner.os }}-
+            ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
@@ -73,32 +70,33 @@ jobs:
           pip install -r requirements.txt
 
       - name: Add repo to PYTHONPATH
-        run: echo "${{ github.workspace }}" >> $GITHUB_PATH
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE" >> $GITHUB_ENV
 
       - name: Run backtest
-        shell: bash
+        env:
+          OUTDIR: "./reports"
         run: |
           set -e
-          mkdir -p "./reports" logs
-
-          echo "▶️  Launching real backtest…"
+          mkdir -p "$OUTDIR" logs
+          echo "🔷 Launching real backtest…"
           python tools/run_backtest.py \
-            --symbol "${{ inputs.symbol }}" \
-            --start "${{ inputs.start }}" \
-            --end "${{ inputs.end }}" \
-            --interval "${{ inputs.interval }}" \
-            --outdir "./reports" \
-            --capital_rs "${{ inputs.capital_rs }}" \
-            --order_qty "${{ inputs.order_qty }}" \
-            --slippage_bps "${{ inputs.slippage_bps }}" \
-            --broker_flat "${{ inputs.broker_flat }}" \
-            --broker_pct "${{ inputs.broker_pct }}" \
-            --max_trades_per_day "${{ inputs.max_trades_per_day }}"
+            --symbol "${{ github.event.inputs.symbol }}" \
+            --start "${{ github.event.inputs.start }}" \
+            --end "${{ github.event.inputs.end }}" \
+            --interval "${{ github.event.inputs.interval }}" \
+            --outdir "$OUTDIR" \
+            --capital_rs "${{ github.event.inputs.capital_rs }}" \
+            --order_qty "${{ github.event.inputs.order_qty }}" \
+            --slippage_bps "${{ github.event.inputs.slippage_bps }}" \
+            --broker_flat "${{ github.event.inputs.broker_flat }}" \
+            --broker_pct "${{ github.event.inputs.broker_pct }}" \
+            --max_trades_per_day "${{ github.event.inputs.max_trades_per_day }}" \
+          || { echo "WARN: real backtest not available -> writing minimal reports"; \
+               python tools/ensure_report.py --outdir "$OUTDIR" --note "Real engine not wired yet"; }
 
       - name: Ensure minimal report (never send 'No summary')
-        # જો real engine કોઈ કારણથી ચલાયું ન હોય તો આ step summary/chart placeholders મૂકી દે છે
         run: |
-          python tools/ensure_report.py --reports "./reports"
+          python tools/ensure_report.py --outdir "./reports"
 
       - name: Upload artifacts (reports + logs)
         uses: actions/upload-artifact@v4
@@ -109,7 +107,7 @@ jobs:
             logs/**
 
       - name: Notify Telegram (summary + charts)
-        if: ${{ always() && secrets.TELEGRAM_BOT_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != '' }}
+        if: ${{ always() && secrets.TELEGRAM_BOT_TOKEN && secrets.TELEGRAM_CHAT_ID }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
