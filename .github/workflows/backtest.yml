@@ -12,7 +12,7 @@ on:
       - "tools/**"
       - "requirements.txt"
   schedule:
-    - cron: "15 4 * * 1-5"   # Mon–Fri @ 09:45 IST
+    - cron: "15 4 * * 1-5"   # Mon–Fri ~09:45 IST (UTC 04:15)
 
 jobs:
   run-backtest:
@@ -26,7 +26,7 @@ jobs:
       ZERODHA_ACCESS_TOKEN:  ${{ secrets.ZERODHA_ACCESS_TOKEN }}
       TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
-      # Defaults
+      # Defaults for run
       UNDERLYING: NIFTY
       INTERVAL: "5m"
 
@@ -56,7 +56,7 @@ jobs:
           echo "start=$START" >> "$GITHUB_OUTPUT"
           echo "end=$END"   >> "$GITHUB_OUTPUT"
 
-      - name: Run backtest (NIFTY, Zerodha)
+      - name: Run backtest
         run: |
           mkdir -p reports logs
           python -m tools.run_backtest \
@@ -78,7 +78,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # -------- Telegram summary (HTML, safe) --------
+      # -------- Telegram summary (plain JSON; logs response) --------
       - name: Notify Telegram (Summary)
         if: ${{ success() }}
         env:
@@ -86,47 +86,47 @@ jobs:
           END:   ${{ steps.dates.outputs.end }}
         run: |
           python - <<'PY'
-          import json, os, html, pathlib
-          m = json.load(open("reports/metrics.json", "r", encoding="utf-8"))
-
-          und   = os.environ.get("UNDERLYING", "NIFTY")
-          itv   = os.environ.get("INTERVAL", "5m")
-          start = os.environ.get("START", "")
-          end   = os.environ.get("END", "")
-
-          def esc(x): return html.escape(str(x))
-
-          msg = (
-            f"<b>Backtest Summary</b> (SUCCESS)<br/>"
-            f"• Underlying: <b>{esc(und)}</b> &nbsp;• Interval: <b>{esc(itv)}</b><br/>"
-            f"• Period: <b>{esc(start)} → {esc(end)}</b><br/><br/>"
-            f"• Trades: <b>{esc(m.get('n_trades',0))}</b> &nbsp;• Win-rate: <b>{esc(m.get('win_rate',0))}%</b><br/>"
-            f"• ROI: <b>{esc(m.get('roi_pct',0))}%</b> &nbsp;• PF: <b>{esc(m.get('profit_factor',0))}</b><br/>"
-            f"• R:R: <b>{esc(m.get('rr',0))}</b> &nbsp;• Sharpe: <b>{esc(m.get('sharpe_ratio',0))}</b><br/>"
-            f"• Max DD: <b>{esc(m.get('max_dd_pct',0))}%</b> &nbsp;• Time DD: <b>{esc(m.get('time_dd_bars',0))} bars</b>"
-          )
-          pathlib.Path("tgmsg.txt").write_text(msg, encoding="utf-8")
+          import json, os, pathlib
+          # read metrics
+          m = json.load(open("reports/metrics.json","r",encoding="utf-8"))
+          und   = os.environ.get("UNDERLYING","NIFTY")
+          itv   = os.environ.get("INTERVAL","5m")
+          start = os.environ.get("START","")
+          end   = os.environ.get("END","")
+          # compose plain text
+          lines = [
+            "Backtest Summary (SUCCESS)",
+            f"Underlying: {und}   Interval: {itv}",
+            f"Period: {start} -> {end}",
+            f"Trades: {m.get('n_trades',0)}   Win-rate: {m.get('win_rate',0)}%",
+            f"ROI: {m.get('roi_pct',0)}%   PF: {m.get('profit_factor',0)}",
+            f"R:R: {m.get('rr',0)}   Sharpe: {m.get('sharpe_ratio',0)}",
+            f"Max DD: {m.get('max_dd_pct',0)}%   Time DD: {m.get('time_dd_bars',0)} bars",
+          ]
+          msg = "\n".join(lines)
+          payload = {"chat_id": os.environ["TELEGRAM_CHAT_ID"], "text": msg, "disable_web_page_preview": True}
+          pathlib.Path("payload.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
           PY
 
-          TXT="$(cat tgmsg.txt)"
-          curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_CHAT_ID}" \
-            -d parse_mode="HTML" \
-            --data-urlencode text="$TXT" > /dev/null
+          echo "Sending summary to Telegram…"
+          curl -s -X POST -H "Content-Type: application/json" \
+               -d @payload.json \
+               "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" | tee telegram_response.json
+          echo "Telegram response logged above ↑"
 
-      # -------- Telegram charts (optional if present) --------
+      # -------- Telegram charts (if present) --------
       - name: Notify Telegram (Charts)
         if: ${{ success() }}
         run: |
           if [ -f reports/equity_curve.png ]; then
             curl -s -F chat_id="${TELEGRAM_CHAT_ID}" \
                     -F photo="@reports/equity_curve.png" \
-                 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" > /dev/null
+                 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto"
           fi
           if [ -f reports/drawdown.png ]; then
             curl -s -F chat_id="${TELEGRAM_CHAT_ID}" \
                     -F photo="@reports/drawdown.png" \
-                 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" > /dev/null
+                 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto"
           fi
 
       - name: Notify Telegram (Failure)
@@ -135,4 +135,4 @@ jobs:
           MSG="❌ Backtest FAILED\nRepo: $GITHUB_REPOSITORY\nRun: $GITHUB_RUN_NUMBER\nCommit: $GITHUB_SHA"
           curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
-            -d text="$MSG" > /dev/null
+            -d text="$MSG"
