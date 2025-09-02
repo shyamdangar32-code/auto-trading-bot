@@ -1,122 +1,66 @@
-name: backtest
+name: Backtest
 
 on:
+  workflow_dispatch: {}
   push:
+    branches: [ main ]
     paths:
       - ".github/workflows/backtest.yml"
       - "bot/**"
+      - "core_backtest/**"
       - "strategies/**"
       - "tools/**"
-      - "utils/**"
       - "requirements.txt"
-  workflow_dispatch:
-    inputs:
-      underlying:
-        description: "Index: NIFTY or BANKNIFTY"
-        required: true
-        default: "BANKNIFTY"
-      start:
-        description: "Start date (YYYY-MM-DD)"
-        required: true
-        default: "2025-07-01"
-      end:
-        description: "End date (YYYY-MM-DD)"
-        required: true
-        default: "2025-08-01"
-      interval:
-        description: "Candle interval (e.g., 5m, 15m)"
-        required: false
-        default: "5m"
-      capital_rs:
-        description: "Starting capital (₹)"
-        required: false
-        default: "100000"
-      order_qty:
-        description: "Order quantity"
-        required: false
-        default: "1"
-      mode:
-        description: "engine mode (paper/backtest)"
-        required: false
-        default: "backtest"
-      fees_json:
-        description: "Brokerage/fees JSON (optional)"
-        required: false
-        default: "{}"
-      session_json:
-        description: "Session window JSON (optional)"
-        required: false
-        default: "{}"
-      extra_params:
-        description: "Extra params JSON (optional)"
-        required: false
-        default: "{}"
+  schedule:
+    - cron: "15 4 * * 1-5"   # Mon–Fri @ 09:45 IST
 
 jobs:
-  run:
+  run-backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
+
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      ZERODHA_API_KEY: ${{ secrets.ZERODHA_API_KEY }}
+      ZERODHA_API_SECRET: ${{ secrets.ZERODHA_API_SECRET }}
+      ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
 
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Add repo to PYTHONPATH
-        run: echo "PYTHONPATH=$GITHUB_WORKSPACE" >> $GITHUB_ENV
+      - name: Compute date range (last 30 calendar days, UTC ok)
+        id: dates
+        run: |
+          END=$(date -u +%F)
+          START=$(date -u -d "$END -30 days" +%F)
+          echo "start=$START" >> $GITHUB_OUTPUT
+          echo "end=$END" >> $GITHUB_OUTPUT
 
       - name: Run backtest
-        id: backtest
-        env:
-          # workflow_dispatch ઇનપુટ્સને env માં મૂકી દઈએ
-          UNDERLYING: ${{ inputs.underlying }}
-          START: ${{ inputs.start }}
-          END: ${{ inputs.end }}
-          INTERVAL: ${{ inputs.interval }}
-          CAPITAL_RS: ${{ inputs.capital_rs }}
-          ORDER_QTY: ${{ inputs.order_qty }}
-          MODE: ${{ inputs.mode }}
-          FEES_JSON: ${{ inputs.fees_json }}
-          SESSION_JSON: ${{ inputs.session_json }}
-          EXTRA_PARAMS: ${{ inputs.extra_params }}
         run: |
-          set -e
-          mkdir -p "./reports" "logs"
-
-          echo "▶ Launching real backtest…"
+          mkdir -p reports logs
           python tools/run_backtest.py \
-            --underlying "${UNDERLYING:-BANKNIFTY}" \
-            --start "${START:-2025-07-01}" \
-            --end "${END:-2025-08-01}" \
-            --interval "${INTERVAL:-5m}" \
-            --capital_rs "${CAPITAL_RS:-100000}" \
-            --order_qty "${ORDER_QTY:-1}" \
-            --mode "${MODE:-backtest}" \
-            --fees_json '${FEES_JSON:-{}}' \
-            --session_json '${SESSION_JSON:-{}}' \
-            --extra_params '${EXTRA_PARAMS:-{}}' \
-            --outdir "./reports" \
-          || { echo "WARN: real backtest not available -> writing minimal reports"; python tools/ensure_report.py --outdir "./reports"; }
+            --underlying NIFTY \
+            --start "${{ steps.dates.outputs.start }}" \
+            --end   "${{ steps.dates.outputs.end }}" \
+            --interval 5m \
+            --capital_rs 100000 \
+            --order_qty 1 \
+            --outdir ./reports
 
-      - name: Upload artifacts (reports + logs)
-        if: always()
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: backtest-artifacts
@@ -126,10 +70,18 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Notify Telegram (summary + charts)
-        if: ${{ secrets.TELEGRAM_BOT_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != '' }}
-        env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      - name: Notify Telegram (Success)
+        if: ${{ success() }}
         run: |
-          python tools/telegram_notify.py --dir "./reports" --title "Backtest Results"
+          MSG="✅ Backtest SUCCESS\nRepo: $GITHUB_REPOSITORY\nRun: $GITHUB_RUN_NUMBER\nCommit: $GITHUB_SHA"
+          curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="$MSG" > /dev/null
+
+      - name: Notify Telegram (Failure)
+        if: ${{ failure() }}
+        run: |
+          MSG="❌ Backtest FAILED\nRepo: $GITHUB_REPOSITORY\nRun: $GITHUB_RUN_NUMBER\nCommit: $GITHUB_SHA"
+          curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="$MSG" > /dev/null
