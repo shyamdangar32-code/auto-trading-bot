@@ -24,8 +24,28 @@ class Trade:
     pnl: float = 0.0
 
 
-def _day_key(ts: pd.Timestamp) -> pd.Timestamp.date:
-    return (ts.tz_localize(None) if ts.tzinfo else ts).date()
+def _day_key(ts):
+    """
+    Make day key from a timestamp that may be pd.Timestamp, int (epoch),
+    float, str, or numpy datetime64. Zerodha historical API ક્યારેક epoch/int
+    પણ આપી શકે છે; તેને safely datetimeમાં ફેરવો.
+    """
+    # Normalize to pandas.Timestamp
+    if isinstance(ts, (int, float)):
+        # assume seconds since epoch
+        ts = pd.to_datetime(ts, unit="s", errors="coerce")
+    elif isinstance(ts, str):
+        ts = pd.to_datetime(ts, errors="coerce")
+    elif not isinstance(ts, pd.Timestamp):
+        ts = pd.to_datetime(ts, errors="coerce")
+
+    if ts is None or pd.isna(ts):
+        raise ValueError(f"Unsupported/NaT timestamp for _day_key: {ts!r}")
+
+    # Drop timezone if present, then return date
+    if getattr(ts, "tzinfo", None):
+        ts = ts.tz_localize(None)
+    return ts.date()
 
 
 def run_backtest(prices: pd.DataFrame, cfg: dict, use_block: str = "backtest"):
