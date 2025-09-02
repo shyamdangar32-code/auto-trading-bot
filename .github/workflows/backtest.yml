@@ -19,12 +19,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
+    # Zerodha + Telegram: Secrets → Env
     env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      ZERODHA_API_KEY: ${{ secrets.ZERODHA_API_KEY }}
-      ZERODHA_API_SECRET: ${{ secrets.ZERODHA_API_SECRET }}
-      ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+      ZERODHA_API_KEY:       ${{ secrets.ZERODHA_API_KEY }}
+      ZERODHA_API_SECRET:    ${{ secrets.ZERODHA_API_SECRET }}
+      ZERODHA_ACCESS_TOKEN:  ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+      TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
 
     steps:
       - name: Checkout repo
@@ -40,18 +41,23 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Compute date range (last 30 calendar days, UTC ok)
+      # !!! Important: make repo root importable so `bot` package resolves
+      - name: Set PYTHONPATH
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE" >> $GITHUB_ENV
+
+      - name: Compute date range (last 30 calendar days)
         id: dates
+        shell: bash
         run: |
           END=$(date -u +%F)
           START=$(date -u -d "$END -30 days" +%F)
-          echo "start=$START" >> $GITHUB_OUTPUT
-          echo "end=$END" >> $GITHUB_OUTPUT
+          echo "start=$START" >> "$GITHUB_OUTPUT"
+          echo "end=$END" >> "$GITHUB_OUTPUT"
 
-      - name: Run backtest
+      - name: Run backtest (NIFTY, 5m, Zerodha)
         run: |
           mkdir -p reports logs
-          python tools/run_backtest.py \
+          python -m tools.run_backtest \
             --underlying NIFTY \
             --start "${{ steps.dates.outputs.start }}" \
             --end   "${{ steps.dates.outputs.end }}" \
@@ -60,7 +66,7 @@ jobs:
             --order_qty 1 \
             --outdir ./reports
 
-      - name: Upload artifacts
+      - name: Upload artifacts (reports + logs)
         uses: actions/upload-artifact@v4
         with:
           name: backtest-artifacts
