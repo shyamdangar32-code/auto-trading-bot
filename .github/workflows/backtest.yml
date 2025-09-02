@@ -78,7 +78,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # -------- Telegram summary (text) --------
+      # -------- Telegram summary (HTML, safe) --------
       - name: Notify Telegram (Summary)
         if: ${{ success() }}
         env:
@@ -86,7 +86,7 @@ jobs:
           END:   ${{ steps.dates.outputs.end }}
         run: |
           python - <<'PY'
-          import json, os, textwrap, pathlib
+          import json, os, html, pathlib
           m = json.load(open("reports/metrics.json", "r", encoding="utf-8"))
 
           und   = os.environ.get("UNDERLYING", "NIFTY")
@@ -94,24 +94,25 @@ jobs:
           start = os.environ.get("START", "")
           end   = os.environ.get("END", "")
 
-          msg = textwrap.dedent(f"""
-          📈 *Backtest Summary*  (✅ SUCCESS)
-          • Underlying: *{und}*   • Interval: *{itv}*
-          • Period: *{start} → {end}*
-          • Trades: *{m.get('n_trades',0)}*   • Win-rate: *{m.get('win_rate',0)}%*
-          • ROI: *{m.get('roi_pct',0)}%*   • PF: *{m.get('profit_factor',0)}*
-          • R:R: *{m.get('rr',0)}*   • Sharpe: *{m.get('sharpe_ratio',0)}*
-          • Max DD: *{m.get('max_dd_pct',0)}%*   • Time DD: *{m.get('time_dd_bars',0)} bars*
-          _Repo: ${'{'}GITHUB_REPOSITORY{'}'} • Run: ${'{'}GITHUB_RUN_NUMBER{'}'}_
-          """).strip()
+          def esc(x): return html.escape(str(x))
 
+          msg = (
+            f"<b>Backtest Summary</b> (SUCCESS)<br/>"
+            f"• Underlying: <b>{esc(und)}</b> &nbsp;• Interval: <b>{esc(itv)}</b><br/>"
+            f"• Period: <b>{esc(start)} → {esc(end)}</b><br/><br/>"
+            f"• Trades: <b>{esc(m.get('n_trades',0))}</b> &nbsp;• Win-rate: <b>{esc(m.get('win_rate',0))}%</b><br/>"
+            f"• ROI: <b>{esc(m.get('roi_pct',0))}%</b> &nbsp;• PF: <b>{esc(m.get('profit_factor',0))}</b><br/>"
+            f"• R:R: <b>{esc(m.get('rr',0))}</b> &nbsp;• Sharpe: <b>{esc(m.get('sharpe_ratio',0))}</b><br/>"
+            f"• Max DD: <b>{esc(m.get('max_dd_pct',0))}%</b> &nbsp;• Time DD: <b>{esc(m.get('time_dd_bars',0))} bars</b>"
+          )
           pathlib.Path("tgmsg.txt").write_text(msg, encoding="utf-8")
           PY
 
+          TXT="$(cat tgmsg.txt)"
           curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
-            -d parse_mode="Markdown" \
-            --data-urlencode text@"tgmsg.txt" > /dev/null
+            -d parse_mode="HTML" \
+            --data-urlencode text="$TXT" > /dev/null
 
       # -------- Telegram charts (optional if present) --------
       - name: Notify Telegram (Charts)
