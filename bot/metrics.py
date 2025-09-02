@@ -3,12 +3,38 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+def _duration_minutes_safe(r) -> float:
+    """Return holding time in minutes; NaN for open/invalid rows."""
+    et = r.get("exit_time", pd.NaT)
+    st = r.get("entry_time", pd.NaT)
+    if pd.isna(et) or pd.isna(st):
+        return np.nan
+    if not isinstance(et, pd.Timestamp) or not isinstance(st, pd.Timestamp):
+        # try to coerce common types
+        try:
+            et = pd.to_datetime(et, errors="coerce")
+            st = pd.to_datetime(st, errors="coerce")
+        except Exception:
+            return np.nan
+        if pd.isna(et) or pd.isna(st):
+            return np.nan
+    delta = et - st
+    # some libs may return numpy timedelta64
+    try:
+        return float(delta.total_seconds()) / 60.0
+    except AttributeError:
+        # pandas Timedelta supports .total_seconds() too
+        try:
+            return float(pd.to_timedelta(delta).total_seconds()) / 60.0
+        except Exception:
+            return np.nan
+
 def compute_metrics(trades: pd.DataFrame, equity: pd.Series, starting_capital: float):
     """
     Numeric evaluation for backtests/live runs.
     Returns a flat dict safe to JSON.
     """
-    # ROI / drawdown / time in dd
+    # ROI / drawdown / time in drawdown
     if equity is None or equity.empty:
         roi = 0.0
         max_dd_pct = 0.0
@@ -41,7 +67,7 @@ def compute_metrics(trades: pd.DataFrame, equity: pd.Series, starting_capital: f
         win_rate = float(round((len(wins) / n_trades) * 100.0, 2)) if n_trades else 0.0
         avg_win = float(np.mean(wins)) if len(wins) else 0.0
         avg_loss = float(np.mean(losses)) if len(losses) else np.nan
-        rr = float(round((avg_win / avg_loss), 2)) if avg_loss and not np.isnan(avg_loss) and avg_loss > 0 else 0.0
+        rr = float(round((avg_win / avg_loss), 2)) if (np.isfinite(avg_loss) and avg_loss > 0) else 0.0
 
         gross_profit = float(np.sum(wins)) if len(wins) else 0.0
         gross_loss = float(np.sum(losses)) if len(losses) else 0.0
@@ -51,14 +77,22 @@ def compute_metrics(trades: pd.DataFrame, equity: pd.Series, starting_capital: f
         q = 1.0 - p
         expectancy = float(round(p * avg_win - q * (avg_loss if np.isfinite(avg_loss) else 0.0), 2))
 
-        # Sharpe (bar returns) — conservative approximation
-        returns = equity.pct_change().dropna() if equity is not None else pd.Series(dtype=float)
-        sharpe = float(round((returns.mean() / returns.std() * np.sqrt(252)) if not returns.empty else 0.0, 2))
+        # Sharpe (bar returns) — guard std=0
+        if equity is not None and not equity.empty:
+            returns = equity.pct_change().dropna()
+            if not returns.empty and returns.std() > 0:
+                sharpe = float(round((returns.mean() / returns.std() * np.sqrt(252)), 2))
+            else:
+                sharpe = 0.0
+        else:
+            sharpe = 0.0
 
-        # average holding time (minutes)
-        avg_hold_minutes = float(round(
-            trades.apply(lambda r: (r["exit_time"] - r["entry_time"]).total_seconds() / 60, axis=1).mean()
-            , 2)) if ("entry_time" in trades and "exit_time" in trades and not trades.empty) else 0.0
+        # average holding time (minutes) — robust to NaT/open trades
+        if "entry_time" in trades and "exit_time" in trades:
+            durations = trades.apply(_duration_minutes_safe, axis=1)
+            avg_hold_minutes = float(round(np.nanmean(durations) if np.isfinite(np.nanmean(durations)) else 0.0, 2))
+        else:
+            avg_hold_minutes = 0.0
 
     return {
         "n_trades": n_trades,
