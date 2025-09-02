@@ -2,22 +2,29 @@ name: backtest
 
 on:
   push:
+    paths:
+      - ".github/workflows/backtest.yml"
+      - "bot/**"
+      - "strategies/**"
+      - "tools/**"
+      - "utils/**"
+      - "requirements.txt"
   workflow_dispatch:
     inputs:
       underlying:
-        description: "UNDERLYING (e.g., NIFTY, BANKNIFTY)"
-        required: false
+        description: "Index: NIFTY or BANKNIFTY"
+        required: true
         default: "BANKNIFTY"
       start:
         description: "Start date (YYYY-MM-DD)"
-        required: false
-        default: ""
+        required: true
+        default: "2025-07-01"
       end:
         description: "End date (YYYY-MM-DD)"
-        required: false
-        default: ""
+        required: true
+        default: "2025-08-01"
       interval:
-        description: "Candle interval (1m/5m/15m/1d)"
+        description: "Candle interval (e.g., 5m, 15m)"
         required: false
         default: "5m"
       capital_rs:
@@ -28,27 +35,27 @@ on:
         description: "Order quantity"
         required: false
         default: "1"
-      slippage_bps:
-        description: "Slippage in bps (e.g., 5 = 0.05%)"
+      mode:
+        description: "engine mode (paper/backtest)"
         required: false
-        default: "0"
-      broker_flat:
-        description: "Broker flat fee (₹ per order)"
+        default: "backtest"
+      fees_json:
+        description: "Brokerage/fees JSON (optional)"
         required: false
-        default: "0"
-      broker_pct:
-        description: "Brokerage percent (e.g., 0.02 for 0.02%)"
+        default: "{}"
+      session_json:
+        description: "Session window JSON (optional)"
         required: false
-        default: "0"
-      max_trades_per_day:
-        description: "Hard cap on daily trades (0 = unlimited)"
+        default: "{}"
+      extra_params:
+        description: "Extra params JSON (optional)"
         required: false
-        default: "0"
+        default: "{}"
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -63,9 +70,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
           restore-keys: |
-            pip-${{ runner.os }}-
+            ${{ runner.os }}-pip-
 
       - name: Install deps
         run: |
@@ -73,46 +80,43 @@ jobs:
           pip install -r requirements.txt
 
       - name: Add repo to PYTHONPATH
-        run: echo "PYTHONPATH=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE" >> $GITHUB_ENV
 
       - name: Run backtest
+        id: backtest
         env:
-          # pick values from workflow_dispatch when present; else sensible defaults
-          UNDERLYING: ${{ github.event.inputs.underlying || 'BANKNIFTY' }}
-          START: ${{ github.event.inputs.start || '' }}
-          END: ${{ github.event.inputs.end || '' }}
-          INTERVAL: ${{ github.event.inputs.interval || '5m' }}
-          CAPITAL_RS: ${{ github.event.inputs.capital_rs || '100000' }}
-          ORDER_QTY: ${{ github.event.inputs.order_qty || '1' }}
-          SLIPPAGE_BPS: ${{ github.event.inputs.slippage_bps || '0' }}
-          BROKER_FLAT: ${{ github.event.inputs.broker_flat || '0' }}
-          BROKER_PCT: ${{ github.event.inputs.broker_pct || '0' }}
-          MAX_TRADES_PER_DAY: ${{ github.event.inputs.max_trades_per_day || '0' }}
+          # workflow_dispatch ઇનપુટ્સને env માં મૂકી દઈએ
+          UNDERLYING: ${{ inputs.underlying }}
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
+          INTERVAL: ${{ inputs.interval }}
+          CAPITAL_RS: ${{ inputs.capital_rs }}
+          ORDER_QTY: ${{ inputs.order_qty }}
+          MODE: ${{ inputs.mode }}
+          FEES_JSON: ${{ inputs.fees_json }}
+          SESSION_JSON: ${{ inputs.session_json }}
+          EXTRA_PARAMS: ${{ inputs.extra_params }}
         run: |
-          set -eo pipefail
+          set -e
           mkdir -p "./reports" "logs"
 
           echo "▶ Launching real backtest…"
-          # NOTE: tools/run_backtest.py must accept these flags; we only pass what it knows.
           python tools/run_backtest.py \
-            --underlying "${UNDERLYING}" \
-            --start "${START}" \
-            --end "${END}" \
-            --interval "${INTERVAL}" \
-            --capital_rs "${CAPITAL_RS}" \
-            --order_qty "${ORDER_QTY}" \
-            --slippage_bps "${SLIPPAGE_BPS}" \
-            --broker_flat "${BROKER_FLAT}" \
-            --broker_pct "${BROKER_PCT}" \
-            --max_trades_per_day "${MAX_TRADES_PER_DAY}" \
+            --underlying "${UNDERLYING:-BANKNIFTY}" \
+            --start "${START:-2025-07-01}" \
+            --end "${END:-2025-08-01}" \
+            --interval "${INTERVAL:-5m}" \
+            --capital_rs "${CAPITAL_RS:-100000}" \
+            --order_qty "${ORDER_QTY:-1}" \
+            --mode "${MODE:-backtest}" \
+            --fees_json '${FEES_JSON:-{}}' \
+            --session_json '${SESSION_JSON:-{}}' \
+            --extra_params '${EXTRA_PARAMS:-{}}' \
             --outdir "./reports" \
-          || { echo "WARN: real backtest failed → writing minimal reports"; }
-
-      - name: Ensure minimal report (never send 'No summary')
-        run: |
-          python tools/ensure_report.py --dir "./reports" --note "No data; runner fallback."
+          || { echo "WARN: real backtest not available -> writing minimal reports"; python tools/ensure_report.py --outdir "./reports"; }
 
       - name: Upload artifacts (reports + logs)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: backtest-artifacts
