@@ -1,17 +1,6 @@
 name: Backtest
 
 on:
-  # Manual trigger (recommended while developing)
-  workflow_dispatch:
-    inputs:
-      profiles:
-        description: "Profiles to run (comma-separated: loose,medium,strict)"
-        required: false
-        default: "loose,medium,strict"
-  # Nightly / trading days (optional)
-  schedule:
-    - cron: "15 4 * * 1-5"   # Mon–Fri ~09:45 IST
-  # Push trigger (kept, but safe)
   push:
     branches: [ main ]
     paths:
@@ -19,52 +8,46 @@ on:
       - "bot/**"
       - "tools/**"
       - "strategies/**"
-      - "config.yaml"
+      - "core_backtest/**"
       - "requirements.txt"
-
-# ✅ Only one run per branch; older in-progress runs are cancelled (not 'failed')
-concurrency:
-  group: backtest-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_dispatch: {}
+  schedule:
+    - cron: "15 4 * * 1-5"  # ~09:45 IST
 
 jobs:
   run-backtest:
-    # Skip auto run on pushes that explicitly opt out
-    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip bt]') }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
-
     strategy:
-      fail-fast: false
       matrix:
-        profile: ${{ fromJson('["loose","medium","strict"]') }}
-
+        profile: [loose, medium, strict]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
-      ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
-      ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
-      TELEGRAM_BOT_TOKEN:   ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID:     ${{ secrets.TELEGRAM_CHAT_ID }}
+      ZERODHA_API_KEY:       ${{ secrets.ZERODHA_API_KEY }}
+      ZERODHA_API_SECRET:    ${{ secrets.ZERODHA_API_SECRET }}
+      ZERODHA_ACCESS_TOKEN:  ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+      TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
       UNDERLYING: NIFTY
       INTERVAL: "1m"
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Compute date range
+      - name: Make repo importable
+        run: echo "PYTHONPATH=$GITHUB_WORKSPACE" >> $GITHUB_ENV
+
+      - name: Compute date range (last 365 days)
         id: dates
+        shell: bash
         run: |
-          # 365 days for manual runs; for schedule keep same
           END=$(date -u +%F)
           START=$(date -u -d "$END -365 days" +%F)
           echo "start=$START" >> "$GITHUB_OUTPUT"
@@ -81,45 +64,87 @@ jobs:
             --capital_rs 100000 \
             --order_qty 1 \
             --profile "${{ matrix.profile }}" \
-            --outdir "./reports_${{ matrix.profile }}"
+            --use_block "backtest_${{ matrix.profile }}" \
+            --outdir "./reports"
 
       - name: Upload artifacts (${{ matrix.profile }})
         uses: actions/upload-artifact@v4
         with:
           name: backtest-artifacts-${{ matrix.profile }}
-          path: reports_${{ matrix.profile }}/**
+          path: reports/**
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: Telegram summary (${{ matrix.profile }})
-        if: ${{ success() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
+        if: ${{ success() }}
         env:
-          START: ${{ steps.dates.outputs.start }}
-          END:   ${{ steps.dates.outputs.end }}
+          START:   ${{ steps.dates.outputs.start }}
+          END:     ${{ steps.dates.outputs.end }}
           PROFILE: ${{ matrix.profile }}
+          UNDERLYING: ${{ env.UNDERLYING }}
+          INTERVAL:   ${{ env.INTERVAL }}
+          CHAT_ID:    ${{ env.TELEGRAM_CHAT_ID }}
+          BOT_TOKEN:  ${{ env.TELEGRAM_BOT_TOKEN }}
         run: |
           python - <<'PY'
-          import json, os, pathlib
-          prof = os.environ["PROFILE"]
-          m = json.load(open(f"reports_{prof}/metrics.json","r",encoding="utf-8"))
-          und=os.environ.get("UNDERLYING","NIFTY"); itv=os.environ.get("INTERVAL","1m")
-          start=os.environ.get("START",""); end=os.environ.get("END","")
+          import os, json, pathlib
+          m = json.load(open("reports/metrics.json","r",encoding="utf-8"))
           lines = [
-            f"Backtest Summary (SUCCESS) — profile: {prof}",
-            f"Underlying: {und}   Interval: {itv}",
-            f"Period: {start} -> {end}",
+            f"Backtest Summary (SUCCESS) — profile: {os.environ['PROFILE']}",
+            f"Underlying: {os.environ['UNDERLYING']}   Interval: {os.environ['INTERVAL']}",
+            f"Period: {os.environ['START']} -> {os.environ['END']}",
             f"Trades: {m.get('n_trades',0)}   Win-rate: {m.get('win_rate',0)}%",
             f"ROI: {m.get('roi_pct',0)}%   PF: {m.get('profit_factor',0)}",
             f"R:R: {m.get('rr',0)}   Sharpe: {m.get('sharpe_ratio',0)}",
             f"Max DD: {m.get('max_dd_pct',0)}%   Time DD: {m.get('time_dd_bars',0)} bars",
+            f"Bars: {m.get('n_bars',0)}   ATR-bars: {m.get('atr_bars',0)}",
+            f"Setups: long={m.get('setups_long',0)} short={m.get('setups_short',0)}   Trades taken: {m.get('n_trades',0)}",
           ]
-          payload = {"chat_id": os.environ["TELEGRAM_CHAT_ID"], "text": "\n".join(lines)}
+          msg = "\n".join(lines)
+          payload = {"chat_id": os.environ["CHAT_ID"], "text": msg, "disable_web_page_preview": True}
           pathlib.Path("payload.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
           PY
           curl -s -X POST -H "Content-Type: application/json" \
                -d @payload.json \
-               "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" >/dev/null
-          for img in equity_curve.png drawdown.png; do
-            if [ -f "reports_${PROFILE}/$img" ]; then
-              curl -s -F chat_id="${TELEGRAM_CHAT_ID}" -F photo="@reports_${PROFILE}/$img" \
-                "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" >/dev/null
-            fi
-          done
+               "https://api.telegram.org/bot${{ env.TELEGRAM_BOT_TOKEN }}/sendMessage" >/dev/null
+
+          # charts
+          if [ -f reports/equity_curve.png ]; then
+            curl -s -F chat_id="${{ env.TELEGRAM_CHAT_ID }}" -F photo="@reports/equity_curve.png" \
+              "https://api.telegram.org/bot${{ env.TELEGRAM_BOT_TOKEN }}/sendPhoto" >/dev/null
+          fi
+          if [ -f reports/drawdown.png ]; then
+            curl -s -F chat_id="${{ env.TELEGRAM_CHAT_ID }}" -F photo="@reports/drawdown.png" \
+              "https://api.telegram.org/bot${{ env.TELEGRAM_BOT_TOKEN }}/sendPhoto" >/dev/null
+          fi
+
+  compare:
+    needs: run-backtest
+    runs-on: ubuntu-latest
+    if: ${{ always() }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: out }
+      - name: Compose comparison text
+        run: |
+          set -e
+          python - <<'PY'
+          import json, glob, os
+          def load(path):
+            try: return json.load(open(path,"r",encoding="utf-8"))
+            except: return {}
+          parts=[]
+          for prof in ["loose","medium","strict"]:
+            m=load(f"out/backtest-artifacts-{prof}/reports/metrics.json")
+            if not m: continue
+            parts.append(f"{prof}: {m.get('n_trades',0)} | win%={m.get('win_rate',0)} | PF={m.get('profit_factor',0)} | R:R={m.get('rr',0)} | ROI%={m.get('roi_pct',0)} | DD%={m.get('max_dd_pct',0)}")
+          open("compare.txt","w").write("Backtest Comparison (loose | medium | strict)\n"+"\n".join(parts))
+          PY
+      - name: Send comparison to Telegram
+        env:
+          BOT:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          TEXT=$(cat compare.txt)
+          curl -s "https://api.telegram.org/bot${BOT}/sendMessage" \
+            -d chat_id="${CHAT}" -d text="$TEXT" >/dev/null
