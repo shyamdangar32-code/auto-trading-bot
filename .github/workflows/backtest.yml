@@ -12,7 +12,7 @@ on:
       - "tools/**"
       - "requirements.txt"
   schedule:
-    - cron: "15 4 * * 1-5"   # Mon–Fri ~09:45 IST (UTC 04:15)
+    - cron: "15 4 * * 1-5"
 
 jobs:
   run-backtest:
@@ -20,15 +20,13 @@ jobs:
     timeout-minutes: 60
 
     env:
-      # Secrets
       ZERODHA_API_KEY:       ${{ secrets.ZERODHA_API_KEY }}
       ZERODHA_API_SECRET:    ${{ secrets.ZERODHA_API_SECRET }}
       ZERODHA_ACCESS_TOKEN:  ${{ secrets.ZERODHA_ACCESS_TOKEN }}
       TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
-      # Defaults for run
       UNDERLYING: NIFTY
-      INTERVAL: "5m"
+      INTERVAL: "1m"     # <<< CHANGED from 5m to 1m
 
     steps:
       - name: Checkout repo
@@ -68,6 +66,7 @@ jobs:
             --order_qty 1 \
             --outdir ./reports
 
+      # (rest of your Telegram summary/charts/report steps same as before)
       - name: Upload artifacts (reports + logs)
         uses: actions/upload-artifact@v4
         with:
@@ -78,7 +77,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # -------- Telegram summary (plain JSON; logs response) --------
       - name: Notify Telegram (Summary)
         if: ${{ success() }}
         env:
@@ -87,13 +85,11 @@ jobs:
         run: |
           python - <<'PY'
           import json, os, pathlib
-          # read metrics
           m = json.load(open("reports/metrics.json","r",encoding="utf-8"))
           und   = os.environ.get("UNDERLYING","NIFTY")
-          itv   = os.environ.get("INTERVAL","5m")
+          itv   = os.environ.get("INTERVAL","1m")
           start = os.environ.get("START","")
           end   = os.environ.get("END","")
-          # compose plain text
           lines = [
             "Backtest Summary (SUCCESS)",
             f"Underlying: {und}   Interval: {itv}",
@@ -108,13 +104,10 @@ jobs:
           pathlib.Path("payload.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
           PY
 
-          echo "Sending summary to Telegram…"
           curl -s -X POST -H "Content-Type: application/json" \
                -d @payload.json \
-               "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" | tee telegram_response.json
-          echo "Telegram response logged above ↑"
+               "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" > /dev/null
 
-      # -------- Telegram charts (if present) --------
       - name: Notify Telegram (Charts)
         if: ${{ success() }}
         run: |
@@ -129,7 +122,6 @@ jobs:
                  "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" > /dev/null
           fi
 
-      # -------- Telegram report.md (full summary table as document) --------
       - name: Notify Telegram (Report file)
         if: ${{ success() && hashFiles('reports/report.md') != '' }}
         run: |
