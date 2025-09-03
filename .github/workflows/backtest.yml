@@ -1,6 +1,17 @@
 name: Backtest
 
 on:
+  # Manual trigger (recommended while developing)
+  workflow_dispatch:
+    inputs:
+      profiles:
+        description: "Profiles to run (comma-separated: loose,medium,strict)"
+        required: false
+        default: "loose,medium,strict"
+  # Nightly / trading days (optional)
+  schedule:
+    - cron: "15 4 * * 1-5"   # Mon–Fri ~09:45 IST
+  # Push trigger (kept, but safe)
   push:
     branches: [ main ]
     paths:
@@ -8,19 +19,25 @@ on:
       - "bot/**"
       - "tools/**"
       - "strategies/**"
-      - "requirements.txt"
       - "config.yaml"
-  workflow_dispatch: {}
+      - "requirements.txt"
+
+# ✅ Only one run per branch; older in-progress runs are cancelled (not 'failed')
+concurrency:
+  group: backtest-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   run-backtest:
+    # Skip auto run on pushes that explicitly opt out
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.event.head_commit.message, '[skip bt]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
     strategy:
       fail-fast: false
       matrix:
-        profile: [ loose, medium, strict ]
+        profile: ${{ fromJson('["loose","medium","strict"]') }}
 
     env:
       ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
@@ -31,23 +48,27 @@ jobs:
       INTERVAL: "1m"
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Compute date range (last 365 days)
+      - name: Compute date range
         id: dates
         run: |
+          # 365 days for manual runs; for schedule keep same
           END=$(date -u +%F)
           START=$(date -u -d "$END -365 days" +%F)
           echo "start=$START" >> "$GITHUB_OUTPUT"
-          echo "end=$END" >> "$GITHUB_OUTPUT"
+          echo "end=$END"   >> "$GITHUB_OUTPUT"
 
       - name: Run backtest (${{ matrix.profile }})
         run: |
@@ -62,14 +83,14 @@ jobs:
             --profile "${{ matrix.profile }}" \
             --outdir "./reports_${{ matrix.profile }}"
 
-      - name: Upload artifacts
+      - name: Upload artifacts (${{ matrix.profile }})
         uses: actions/upload-artifact@v4
         with:
           name: backtest-artifacts-${{ matrix.profile }}
           path: reports_${{ matrix.profile }}/**
 
       - name: Telegram summary (${{ matrix.profile }})
-        if: ${{ success() }}
+        if: ${{ success() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
         env:
           START: ${{ steps.dates.outputs.start }}
           END:   ${{ steps.dates.outputs.end }}
@@ -89,8 +110,6 @@ jobs:
             f"ROI: {m.get('roi_pct',0)}%   PF: {m.get('profit_factor',0)}",
             f"R:R: {m.get('rr',0)}   Sharpe: {m.get('sharpe_ratio',0)}",
             f"Max DD: {m.get('max_dd_pct',0)}%   Time DD: {m.get('time_dd_bars',0)} bars",
-            f"Bars: {m.get('n_trades',0) if False else 0}   ATR-bars: 0",  # placeholder to keep your existing format
-            f"Setups: long=0 short=0  Trades taken: {m.get('n_trades',0)}",
           ]
           payload = {"chat_id": os.environ["TELEGRAM_CHAT_ID"], "text": "\n".join(lines)}
           pathlib.Path("payload.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -98,11 +117,9 @@ jobs:
           curl -s -X POST -H "Content-Type: application/json" \
                -d @payload.json \
                "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" >/dev/null
-
           for img in equity_curve.png drawdown.png; do
             if [ -f "reports_${PROFILE}/$img" ]; then
-              curl -s -F chat_id="${TELEGRAM_CHAT_ID}" \
-                      -F photo="@reports_${PROFILE}/$img" \
+              curl -s -F chat_id="${TELEGRAM_CHAT_ID}" -F photo="@reports_${PROFILE}/$img" \
                 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" >/dev/null
             fi
           done
