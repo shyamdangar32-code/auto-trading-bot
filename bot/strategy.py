@@ -2,6 +2,7 @@
 from __future__ import annotations
 import numpy as np
 import pandas as pd
+from datetime import time as dtime  # <-- for session window comparisons
 
 # positions
 LONG, SHORT, FLAT = 1, -1, 0
@@ -64,17 +65,18 @@ def _adx(df: pd.DataFrame, length: int = 14) -> pd.Series:
     atr = tr.ewm(alpha=1/length, adjust=False).mean()
     plus_di = 100 * (plus_dm.ewm(alpha=1/length, adjust=False).mean() / atr.replace(0, np.nan))
     minus_di = 100 * (minus_dm.ewm(alpha=1/length, adjust=False).mean() / atr.replace(0, np.nan))
-    dx = ( (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan) ) * 100.0
+    dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100.0
     adx = dx.ewm(alpha=1/length, adjust=False).mean().fillna(0.0)
     return adx
 
 def _within_session(ts: pd.Timestamp, start: str, end: str) -> bool:
-    """expect naive IST timestamps (from runner)."""
-    t = ts.time()
+    """
+    Compare only on clock-time using datetime.time (no year/month/day needed).
+    """
+    t = (ts if isinstance(ts, pd.Timestamp) else pd.Timestamp(ts)).time()
     s_h, s_m = map(int, start.split(":"))
     e_h, e_m = map(int, end.split(":"))
-    return (t >= pd.Timestamp(hour=s_h, minute=s_m).time()
-            and t <= pd.Timestamp(hour=e_h, minute=e_m).time())
+    return dtime(s_h, s_m) <= t <= dtime(e_h, e_m)
 
 # ----------------- PUBLIC API ------------------
 def prepare_signals(prices: pd.DataFrame, cfg: dict, use_block: str = "backtest") -> pd.DataFrame:
@@ -125,7 +127,6 @@ def prepare_signals(prices: pd.DataFrame, cfg: dict, use_block: str = "backtest"
 
     # HTF EMA (confirm trend on higher timeframe)
     if use_htf:
-        # resample on-the-fly
         htf_close = d["Close"].resample(htf_rule).last().ffill()
         htf_ema   = _ema(htf_close, htf_ema_len)
         d["ema_htf"] = htf_ema.reindex(d.index, method="ffill")
