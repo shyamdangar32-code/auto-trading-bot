@@ -121,13 +121,21 @@ jobs:
           if [ -f reports/equity_curve.png ]; then
             curl -s -F chat_id="${TELEGRAM_CHAT_ID}" \
                     -F photo="@reports/equity_curve.png" \
-                 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto"
+                 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" > /dev/null
           fi
           if [ -f reports/drawdown.png ]; then
             curl -s -F chat_id="${TELEGRAM_CHAT_ID}" \
                     -F photo="@reports/drawdown.png" \
-                 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto"
+                 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendPhoto" > /dev/null
           fi
+
+      # -------- Telegram report.md (full summary table as document) --------
+      - name: Notify Telegram (Report file)
+        if: ${{ success() && hashFiles('reports/report.md') != '' }}
+        run: |
+          curl -s -F chat_id="${TELEGRAM_CHAT_ID}" \
+                  -F document="@reports/report.md" \
+               "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" > /dev/null
 
       - name: Notify Telegram (Failure)
         if: ${{ failure() }}
@@ -135,4 +143,4 @@ jobs:
           MSG="❌ Backtest FAILED\nRepo: $GITHUB_REPOSITORY\nRun: $GITHUB_RUN_NUMBER\nCommit: $GITHUB_SHA"
           curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
-            -d text="$MSG"
+            -d text="$MSG" > /dev/null
