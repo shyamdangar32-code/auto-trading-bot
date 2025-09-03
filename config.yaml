@@ -1,6 +1,8 @@
+# ===== Runtime / IO =====
 tz: "Asia/Kolkata"
 out_dir: "reports"
 
+# ===== Secrets (fill via GitHub Secrets ideally) =====
 zerodha_enabled: true
 ZERODHA_API_KEY: ""
 ZERODHA_API_SECRET: ""
@@ -8,34 +10,37 @@ ZERODHA_ACCESS_TOKEN: ""
 TELEGRAM_BOT_TOKEN: ""
 TELEGRAM_CHAT_ID: ""
 
+# ===== Capital & Sizing =====
 capital_rs: 100000
 order_qty: 1
 
-# ---- Global params (prepare_signals પણ વાંચે છે) ----
+# ===== Global signal params =====
 ema_fast: 21
 ema_slow: 50
 rsi_len: 14
 rsi_buy: 52
 rsi_sell: 48
 atr_len: 14
-ema_poke_pct: 0.0001
+ema_poke_pct: 0.0002   # 0.02% — entries a bit easier than 0.01%
 
-# exits (global mirrors)
+# ===== Exits (global mirrors) =====
 stop_atr_mult: 1.0
 take_atr_mult: 1.3
 trailing_enabled: true
 trail_start_atr: 0.5
 trail_atr_mult: 1.0
 
-# Re-entries (used by backtest guardrails as well)
+# ===== Re-entries (global; backtest.guardrails heed કરે) =====
 reentry_max: 12
 reentry_cooldown: 0
 
+# ===== Intraday options (index-level sourcing) =====
+# Workflow NIFTY પર ચાલે છે — token match રાખ્યું છે.
 intraday_options:
-  underlying: "BANKNIFTY"
-  index_token: 260105
-  timeframe: "5minute"
-  strike_step: 100
+  underlying: "NIFTY"      # NIFTY or BANKNIFTY
+  index_token: 256265       # <-- NIFTY token
+  timeframe: "1minute"
+  strike_step: 50
   ma_len: 20
   atr_len: 14
   sl_atr_mult: 1.0
@@ -45,15 +50,18 @@ intraday_options:
   reentry_max: 12
   reentry_cooldown: 0
 
+# ===== Modes (safety) =====
 send_only_signals: true
 paper_trading: true
 live_trading: false
 
-# ---- Backtest block (engine primary) ----
+# ===== Backtest block (engine primary) =====
 backtest:
+  # Trading session (IST)
   session_start: "09:20"
   session_end:   "15:20"
 
+  # Execution frictions
   slippage_bps: 2.0
   brokerage_flat: 20.0
   brokerage_pct: 0.0003
@@ -65,28 +73,31 @@ backtest:
   rsi_buy: 52
   rsi_sell: 48
   atr_len: 14
-  ema_poke_pct: 0.0001
+  ema_poke_pct: 0.0002
 
-  # NEW quality filters
+  # Quality / participation filters (1m tuned)
   filters:
     adx_len: 14
-    adx_min: 15           # trend-strength
+    adx_min: 16            # 15–18 sweet-spot; 16 keeps quality
     use_htf: true
-    htf_rule: "15min"     # higher timeframe for confirmation
+    htf_rule: "15min"
     htf_ema_len: 20
-    min_atr_pct: 0.0003   # avoid dead periods
-    session_start: "09:25"
-    session_end:   "15:15"
+    min_atr_pct: 0.0005    # 0.05%+ range on 1m to avoid dead periods
+    session_start: "09:25" # skip first 10m
+    session_end:   "15:15" # skip last 5m
 
+  # Re-entries (intra-day)
   reentry:
-    max_per_day: 20
+    max_per_day: 30
     cooldown_bars: 0
 
+  # Guardrails (risk/day)
   guardrails:
-    max_trades_per_day: 30
+    max_trades_per_day: 60
     max_daily_loss_rs: 2500
     stop_after_target_rs: 4000
 
+  # Exits
   exits:
     stop_atr_mult: 1.0
     take_atr_mult: 1.3
