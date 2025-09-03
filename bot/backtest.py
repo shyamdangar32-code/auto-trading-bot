@@ -24,56 +24,31 @@ class Trade:
     pnl: float = 0.0
 
 
-def _day_key(ts):
-    """
-    Make day key from a timestamp that may be pd.Timestamp, int (epoch),
-    float, str, or numpy datetime64. Zerodha historical API ક્યારેક epoch/int
-    પણ આપી શકે છે; તેને safely datetimeમાં ફેરવો.
-    """
-    # Normalize to pandas.Timestamp
-    if isinstance(ts, (int, float)):
-        # assume seconds since epoch
-        ts = pd.to_datetime(ts, unit="s", errors="coerce")
-    elif isinstance(ts, str):
-        ts = pd.to_datetime(ts, errors="coerce")
-    elif not isinstance(ts, pd.Timestamp):
-        ts = pd.to_datetime(ts, errors="coerce")
-
-    if ts is None or pd.isna(ts):
-        raise ValueError(f"Unsupported/NaT timestamp for _day_key: {ts!r}")
-
-    # Drop timezone if present, then return date
-    if getattr(ts, "tzinfo", None):
-        ts = ts.tz_localize(None)
-    return ts.date()
+def _day_key(ts: pd.Timestamp) -> pd.Timestamp.date:
+    # Accept both tz-aware & naive
+    return (ts.tz_localize(None) if getattr(ts, "tzinfo", None) else ts).date()
 
 
 def run_backtest(prices: pd.DataFrame, cfg: dict, use_block: str = "backtest"):
     """
-    Walk-forward backtest:
-      - ORB + VWAP entries
-      - ATR stop/target
-      - Trailing stop
-      - Re-entry with cooldown
-      - Day guardrails: max trades/day, max daily loss, optional daily target stop
-    Returns: (summary_dict, trades_df, equity_series)
+    Walk-forward backtest with ORB/VWAP/ATR style exits (same as before).
+    Returns: (summary_dict, trades_df, equity_series, debug_dict)
     """
-    block = (cfg.get(use_block) or cfg.get("intraday_options") or {})
-    entry_cfg     = block.get("entry", {})
-    exits_cfg     = block.get("exits", {})
-    reentry_cfg   = block.get("reentry", {})
-    guards_cfg    = block.get("guardrails", {})
+    block       = (cfg.get(use_block) or cfg.get("intraday_options") or {})
+    exits_cfg   = block.get("exits", {})
+    reentry_cfg = block.get("reentry", {})
+    guards_cfg  = block.get("guardrails", {})
 
     d = prepare_signals(prices, cfg, use_block=use_block).copy()
 
     qty        = int(cfg.get("order_qty", 1))
     capital    = float(cfg.get("capital_rs", 100000.0))
-    re_max     = int(reentry_cfg.get("max_per_day", 0))
-    cooldown   = int(reentry_cfg.get("cooldown_bars", 0))
+    re_max     = int(reentry_cfg.get("max_per_day", cfg.get("reentry_max", 0)))
+    cooldown   = int(reentry_cfg.get("cooldown_bars", cfg.get("reentry_cooldown", 0)))
 
-    max_trades_day   = int(guards_cfg.get("max_trades_per_day", 9999))
-    max_daily_loss   = float(guards_cfg.get("max_daily_loss_rs", 1e18))
-    stop_after_target= float(guards_cfg.get("stop_after_target_rs", 1e18))
+    max_trades_day     = int(guards_cfg.get("max_trades_per_day", cfg.get("max_trades_per_day", 9999)))
+    max_daily_loss     = float(guards_cfg.get("max_daily_loss_rs", 1e18))
+    stop_after_target  = float(guards_cfg.get("stop_after_target_rs", 1e18))
 
     position = FLAT
     entry_px = stop = target = np.nan
@@ -83,6 +58,17 @@ def run_backtest(prices: pd.DataFrame, cfg: dict, use_block: str = "backtest"):
 
     equity_val = capital
     eq_curve: list[float] = []
+
+    # ---- DEBUG counters ----
+    dbg = {
+        "bars_total": int(d.shape[0]),
+        "bars_with_atr": int(d["atr"].notna().sum()) if "atr" in d else 0,
+        "long_setups": int(d.get("long_entry", pd.Series(dtype=bool)).sum()) if "long_entry" in d else 0,
+        "short_setups": int(d.get("short_entry", pd.Series(dtype=bool)).sum()) if "short_entry" in d else 0,
+        "trades_taken": 0,
+        "avg_atr": float(d["atr"].dropna().mean()) if "atr" in d else 0.0,
+        "note": "Counts are pre-trade filters; trades may be fewer due to cooldown/limits/guardrails."
+    }
 
     # day state
     day_trade_count = 0
@@ -101,7 +87,6 @@ def run_backtest(prices: pd.DataFrame, cfg: dict, use_block: str = "backtest"):
         if prev_day is None:
             prev_day = this_day
         if this_day != prev_day:
-            # reset per-day counters
             day_trade_count = 0
             day_pnl_accum   = 0.0
             re_count        = 0
@@ -140,7 +125,6 @@ def run_backtest(prices: pd.DataFrame, cfg: dict, use_block: str = "backtest"):
 
         if did_exit:
             last_exit_idx = i
-            # guardrails after exit
             if day_pnl_accum <= -abs(max_daily_loss):
                 block_new_entries_today = True
             if day_pnl_accum >= abs(stop_after_target):
@@ -157,6 +141,7 @@ def run_backtest(prices: pd.DataFrame, cfg: dict, use_block: str = "backtest"):
                     entry_px = px
                     stop, target = initial_stop_target(LONG, entry_px, atr_val, exits_cfg)
                     trades.append(Trade(LONG, ts, entry_px))
+                    dbg["trades_taken"] += 1
                     re_count += 1 if last_exit_idx > -10**8 else 0
                     day_trade_count += 1
 
@@ -165,10 +150,10 @@ def run_backtest(prices: pd.DataFrame, cfg: dict, use_block: str = "backtest"):
                     entry_px = px
                     stop, target = initial_stop_target(SHORT, entry_px, atr_val, exits_cfg)
                     trades.append(Trade(SHORT, ts, entry_px))
+                    dbg["trades_taken"] += 1
                     re_count += 1 if last_exit_idx > -10**8 else 0
                     day_trade_count += 1
 
-            # if cap hit, freeze further entries for the day
             if day_trade_count >= max_trades_day:
                 block_new_entries_today = True
 
@@ -182,12 +167,16 @@ def run_backtest(prices: pd.DataFrame, cfg: dict, use_block: str = "backtest"):
 
     # metrics
     summary = compute_metrics(trades_df, equity_ser, capital)
-    return summary, trades_df, equity_ser
+    # include quick debug snapshot too
+    summary = dict(summary or {})
+    summary["_debug"] = dbg
+
+    return summary, trades_df, equity_ser, dbg
 
 
-def save_reports(out_dir: str, summary: dict, trades: pd.DataFrame, equity: pd.Series):
+def save_reports(out_dir: str, summary: dict, trades: pd.DataFrame, equity: pd.Series, debug: dict | None = None):
     """
-    Writes standard artifacts + quick report & charts.
+    Writes standard artifacts + quick report & charts + debug files.
     """
     out_dir = out_dir.rstrip("/")
 
@@ -203,3 +192,23 @@ def save_reports(out_dir: str, summary: dict, trades: pd.DataFrame, equity: pd.S
     if equity is not None and not equity.empty:
         plot_equity_and_drawdown(equity, out_dir)
     write_quick_report(summary or {}, trades, out_dir)
+
+    # --- debug extras ---
+    if debug is None and isinstance(summary, dict) and "_debug" in summary:
+        debug = summary["_debug"]
+    if debug:
+        with open(f"{out_dir}/debug.json", "w", encoding="utf-8") as f:
+            json.dump(debug, f, indent=2)
+        # small human file
+        lines = [
+            "# Debug summary",
+            f"- Bars total: {debug.get('bars_total', 0)}",
+            f"- Bars with ATR: {debug.get('bars_with_atr', 0)}",
+            f"- Long setups: {debug.get('long_setups', 0)}",
+            f"- Short setups: {debug.get('short_setups', 0)}",
+            f"- Trades taken: {debug.get('trades_taken', 0)}",
+            f"- Avg ATR: {round(debug.get('avg_atr', 0.0), 4)}",
+            f"- Note: {debug.get('note','')}",
+        ]
+        with open(f"{out_dir}/debug.md", "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
