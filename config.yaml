@@ -11,21 +11,23 @@ TELEGRAM_CHAT_ID: ""
 capital_rs: 100000
 order_qty: 1
 
-# --- GLOBAL (prepare_signals reads these too) ---
+# ---- Global params (prepare_signals પણ વાંચે છે) ----
 ema_fast: 21
 ema_slow: 50
 rsi_len: 14
-rsi_buy: 50
-rsi_sell: 50
-ema_poke_pct: 0.0001   # 0.01%
+rsi_buy: 52
+rsi_sell: 48
 atr_len: 14
+ema_poke_pct: 0.0001
 
+# exits (global mirrors)
 stop_atr_mult: 1.0
-take_atr_mult: 1.2
+take_atr_mult: 1.3
 trailing_enabled: true
 trail_start_atr: 0.5
 trail_atr_mult: 1.0
 
+# Re-entries (used by backtest guardrails as well)
 reentry_max: 12
 reentry_cooldown: 0
 
@@ -37,7 +39,7 @@ intraday_options:
   ma_len: 20
   atr_len: 14
   sl_atr_mult: 1.0
-  tgt_rr: 1.2
+  tgt_rr: 1.3
   trail_start_atr: 0.5
   trail_atr_mult: 1.0
   reentry_max: 12
@@ -47,7 +49,7 @@ send_only_signals: true
 paper_trading: true
 live_trading: false
 
-# --- BACKTEST block mirrors (so either path works) ---
+# ---- Backtest block (engine primary) ----
 backtest:
   session_start: "09:20"
   session_end:   "15:20"
@@ -56,13 +58,25 @@ backtest:
   brokerage_flat: 20.0
   brokerage_pct: 0.0003
 
+  # Strategy mirrors
   ema_fast: 21
   ema_slow: 50
   rsi_len: 14
-  rsi_buy: 50
-  rsi_sell: 50
+  rsi_buy: 52
+  rsi_sell: 48
   atr_len: 14
   ema_poke_pct: 0.0001
+
+  # NEW quality filters
+  filters:
+    adx_len: 14
+    adx_min: 15           # trend-strength
+    use_htf: true
+    htf_rule: "15min"     # higher timeframe for confirmation
+    htf_ema_len: 20
+    min_atr_pct: 0.0003   # avoid dead periods
+    session_start: "09:25"
+    session_end:   "15:15"
 
   reentry:
     max_per_day: 20
@@ -75,7 +89,7 @@ backtest:
 
   exits:
     stop_atr_mult: 1.0
-    take_atr_mult: 1.2
+    take_atr_mult: 1.3
     trail:
       type: "atr"
       atr_mult: 1.0
