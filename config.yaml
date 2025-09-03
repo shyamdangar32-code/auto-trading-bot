@@ -39,16 +39,16 @@ ema_poke_pct: 0.0005   # 0.05%
 adx_min_bal: 10
 adx_min_strict: 18
 
-# Risk/targets
+# Risk/targets (legacy/global)
 stop_atr_mult: 1.2
 take_atr_mult: 1.6
 
-# Trailing
+# Trailing (legacy/global)
 trailing_enabled: true
 trail_start_atr: 0.6
 trail_atr_mult: 1.0
 
-# Re-entries
+# Re-entries (legacy/global)
 reentry_max: 3
 reentry_cooldown: 2
 
@@ -75,21 +75,40 @@ paper_trading: true
 live_trading: false
 
 # =========================
-# Backtest runner settings (read by run_backtest.py)
+# Backtest runner settings (read by run_backtest.py / bot.backtest)
 # =========================
 backtest:
   # Trading session (IST)
   session_start: "09:20"
   session_end:   "15:20"
 
-  # Execution frictions
-  max_trades_per_day: 6
+  # Execution frictions (used by your evaluation layer if applicable)
+  max_trades_per_day: 6   # kept for backward-compat (engine may read this)
   slippage_bps: 2.0           # 2 bps each side
   brokerage_flat: 20.0        # INR per leg (min)
   brokerage_pct: 0.0003       # 3 bps per leg
 
-  # Strategy parameters for index-level backtest
+  # Strategy parameters (kept at backtest.* for your prepare_signals)
   ema_fast: 20
   ema_slow: 50
   rsi_len: 14
   rsi_buy: 55
+  # You can add rsi_sell etc here if your prepare_signals reads them.
+
+  # >>> New structured knobs used by bot/backtest.py <<<
+  reentry:
+    max_per_day: 6
+    cooldown_bars: 1
+
+  guardrails:
+    max_trades_per_day: 15
+    max_daily_loss_rs: 1800
+    stop_after_target_rs: 2500
+
+  exits:
+    stop_atr_mult: 1.0
+    take_atr_mult: 1.8
+    trail:
+      type: "atr"
+      atr_mult: 1.0
+      step_bars: 3
