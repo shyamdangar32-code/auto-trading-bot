@@ -1,13 +1,44 @@
 # bot/strategy.py
 from __future__ import annotations
+from datetime import time as _dtime
+import re
 import pandas as pd
 import numpy as np
 
-# indicators from 'ta' (already in requirements)
+# ========== Session helpers (robust; fixes pandas Timestamp(year) error) ==========
+def _parse_hhmm(x) -> _dtime:
+    if x is None:
+        raise ValueError("session time is None")
+    if isinstance(x, str):
+        s = x.strip()
+        m = re.match(r"^(\d{1,2}):(\d{2})$", s)
+        if m:
+            return _dtime(int(m.group(1)), int(m.group(2)))
+        if s.isdigit() and (3 <= len(s) <= 4):
+            hh, mm = int(s[:-2]), int(s[-2:])
+            return _dtime(hh, mm)
+        raise ValueError(f"Unrecognized time string: {x}")
+    if isinstance(x, (int, float)):
+        v = int(x)
+        return _dtime(v // 100, v % 100)
+    if isinstance(x, (tuple, list)) and len(x) >= 2:
+        return _dtime(int(x[0]), int(x[1]))
+    raise ValueError(f"Unsupported time format: {x!r}")
+
+def _within_session(ts: pd.Timestamp, session_start, session_end) -> bool:
+    s = _parse_hhmm(session_start)
+    e = _parse_hhmm(session_end)
+    if isinstance(ts, pd.Timestamp):
+        t = ts.tz_convert("Asia/Kolkata").time() if ts.tzinfo else ts.time()
+    else:
+        t = pd.to_datetime(ts).time()
+    return s <= t <= e
+# ================================================================================
+
+# indicators from 'ta'
 from ta.trend import EMAIndicator, ADXIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
-
 
 def _ema(series: pd.Series, n: int) -> pd.Series:
     return EMAIndicator(close=series, window=n).ema_indicator()
@@ -21,37 +52,28 @@ def _adx(high: pd.Series, low: pd.Series, close: pd.Series, n: int) -> pd.Series
 def _atr(high: pd.Series, low: pd.Series, close: pd.Series, n: int) -> pd.Series:
     return AverageTrueRange(high=high, low=low, close=close, window=n).average_true_range()
 
-
 def _resample_htf(df: pd.DataFrame, rule: str, ema_len: int) -> pd.Series:
-    """
-    Higher-timeframe confirmation: price above HTF EMA.
-    Returns a Series aligned to df.index with boolean confirmation.
-    """
-    ohlc = df[['Open','High','Low','Close']].resample(rule, label="right", closed="right").agg({
-        'Open':'first','High':'max','Low':'min','Close':'last'
-    }).dropna()
+    """Higher-TF confirmation: price above HTF EMA."""
+    ohlc = (
+        df[['Open','High','Low','Close']]
+        .resample(rule, label="right", closed="right")
+        .agg({'Open':'first','High':'max','Low':'min','Close':'last'})
+        .dropna()
+    )
     htf_ema = _ema(ohlc['Close'], ema_len)
     htf_ok = (ohlc['Close'] > htf_ema).reindex(df.index, method="ffill").fillna(False)
     return htf_ok.astype(bool)
 
-
 def _slope(x: pd.Series, lookback: int = 5) -> pd.Series:
-    """simple slope of EMA — positive means trending up"""
     return x.diff(lookback)
 
-
 def profile_presets(profile: str) -> dict:
-    """
-    Thresholds per profile. 'loose' = more trades, 'strict' = fewer & cleaner.
-    """
     p = (profile or "loose").lower()
     if p == "strict":
         return dict(adx_min=20, rsi_buy=55, rsi_sell=45, ema_slope_lb=5, min_atr_pct=0.0004, htf_rule="15min")
     if p == "medium":
         return dict(adx_min=16, rsi_buy=53, rsi_sell=47, ema_slope_lb=4, min_atr_pct=0.00035, htf_rule="15min")
-    # loose
     return dict(adx_min=12, rsi_buy=52, rsi_sell=48, ema_slope_lb=3, min_atr_pct=0.00030, htf_rule="15min")
-
 
 def prepare_signals(prices: pd.DataFrame, cfg: dict, profile: str = "loose") -> pd.DataFrame:
     """
@@ -61,7 +83,7 @@ def prepare_signals(prices: pd.DataFrame, cfg: dict, profile: str = "loose") -> 
     df = prices.copy().sort_index()
     presets = profile_presets(profile)
 
-    # base params (mirrors config)
+    # base params (mirror config)
     ema_fast = int((cfg.get("backtest") or {}).get("ema_fast", cfg.get("ema_fast", 21)))
     ema_slow = int((cfg.get("backtest") or {}).get("ema_slow", cfg.get("ema_slow", 50)))
     rsi_len  = int((cfg.get("backtest") or {}).get("rsi_len", 14))
@@ -76,17 +98,13 @@ def prepare_signals(prices: pd.DataFrame, cfg: dict, profile: str = "loose") -> 
     df["adx"]      = _adx(df["High"], df["Low"], df["Close"], adx_len)
     df["atr"]      = _atr(df["High"], df["Low"], df["Close"], atr_len)
     df["atr_pct"]  = (df["atr"] / df["Close"]).fillna(0.0)
-
     df["ema_fast_slope"] = _slope(df["ema_fast"], presets["ema_slope_lb"]).fillna(0.0)
 
     # HTF confirmation
-    use_htf = bool(((cfg.get("backtest") or {}).get("filters") or {}).get("use_htf", True))
-    htf_rule = ((cfg.get("backtest") or {}).get("filters") or {}).get("htf_rule", presets["htf_rule"])
+    use_htf     = bool(((cfg.get("backtest") or {}).get("filters") or {}).get("use_htf", True))
+    htf_rule    = ((cfg.get("backtest") or {}).get("filters") or {}).get("htf_rule", presets["htf_rule"])
     htf_ema_len = int(((cfg.get("backtest") or {}).get("filters") or {}).get("htf_ema_len", 20))
-    if use_htf:
-        df["htf_ok"] = _resample_htf(df, htf_rule, htf_ema_len)
-    else:
-        df["htf_ok"] = True
+    df["htf_ok"] = _resample_htf(df, htf_rule, htf_ema_len) if use_htf else True
 
     # quality filters
     df["quality_ok"] = (
@@ -96,8 +114,8 @@ def prepare_signals(prices: pd.DataFrame, cfg: dict, profile: str = "loose") -> 
         & (df["htf_ok"])
     )
 
-    # entry logic (LONG)
-    rsi_buy = max(presets["rsi_buy"], int((cfg.get("backtest") or {}).get("rsi_buy", cfg.get("rsi_buy", presets["rsi_buy"]))))
+    # LONG entries/exits
+    rsi_buy  = max(presets["rsi_buy"],  int((cfg.get("backtest") or {}).get("rsi_buy",  cfg.get("rsi_buy",  presets["rsi_buy"])) ))
     rsi_sell = min(presets["rsi_sell"], int((cfg.get("backtest") or {}).get("rsi_sell", cfg.get("rsi_sell", presets["rsi_sell"]))))
 
     df["enter_long"] = (
@@ -106,11 +124,9 @@ def prepare_signals(prices: pd.DataFrame, cfg: dict, profile: str = "loose") -> 
         & (df["rsi"] >= rsi_buy)
         & (df["quality_ok"])
     )
-
-    # simple long exit hint (unused by engine when using SL/TP)
     df["exit_long_hint"] = (df["rsi"] <= rsi_sell) | (df["Close"] < df["ema_fast"])
 
-    # SHORT hooks for future
+    # SHORT hooks (future)
     df["enter_short"] = False
     df["exit_short_hint"] = False
 
