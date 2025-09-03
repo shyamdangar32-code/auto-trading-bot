@@ -1,10 +1,6 @@
-# =========================
-# Global / Common
-# =========================
 tz: "Asia/Kolkata"
 out_dir: "reports"
 
-# Zerodha / Telegram (placeholders)
 zerodha_enabled: true
 ZERODHA_API_KEY: ""
 ZERODHA_API_SECRET: ""
@@ -12,84 +8,64 @@ ZERODHA_ACCESS_TOKEN: ""
 TELEGRAM_BOT_TOKEN: ""
 TELEGRAM_CHAT_ID: ""
 
-# ---- Capital & sizing ----
 capital_rs: 100000
 order_qty: 1
 
-# =========================
-# Intraday Options Algo — GLOBAL knobs (prepare_signals likely reads these)
-# =========================
-signal_mode: "balanced"
-
-# Entries — loosened to increase frequency
+# --- GLOBAL (prepare_signals reads these too) ---
 ema_fast: 21
 ema_slow: 50
 rsi_len: 14
-rsi_buy: 50          # buy when RSI > 50
-rsi_sell: 50         # sell/short when RSI < 50
-ema_poke_pct: 0.0001 # 0.01% tolerance (was 0.05%)
+rsi_buy: 50
+rsi_sell: 50
+ema_poke_pct: 0.0001   # 0.01%
+atr_len: 14
 
-# ADX
-adx_len: 14
-adx_min_bal: 8
-adx_min_strict: 15
-
-# Risk/targets (global mirrors for safety)
 stop_atr_mult: 1.0
-take_atr_mult: 1.2   # R:R ≈ 1:1.2
-
-# Trailing (global)
+take_atr_mult: 1.2
 trailing_enabled: true
 trail_start_atr: 0.5
 trail_atr_mult: 1.0
 
-# Re-entries (global) — loosened
-reentry_max: 10
+reentry_max: 12
 reentry_cooldown: 0
 
-# ---- Intraday Options block (index-level sourcing) ----
 intraday_options:
   underlying: "BANKNIFTY"
   index_token: 260105
   timeframe: "5minute"
   strike_step: 100
-
-  # legacy mirrors
   ma_len: 20
   atr_len: 14
   sl_atr_mult: 1.0
   tgt_rr: 1.2
   trail_start_atr: 0.5
   trail_atr_mult: 1.0
-  reentry_max: 10
+  reentry_max: 12
   reentry_cooldown: 0
 
-# ---- Modes ----
 send_only_signals: true
 paper_trading: true
 live_trading: false
 
-# =========================
-# Backtest block — engine reads from here; mirrored values
-# =========================
+# --- BACKTEST block mirrors (so either path works) ---
 backtest:
   session_start: "09:20"
   session_end:   "15:20"
 
-  # Frictions
   slippage_bps: 2.0
   brokerage_flat: 20.0
   brokerage_pct: 0.0003
 
-  # Strategy params (mirror)
   ema_fast: 21
   ema_slow: 50
   rsi_len: 14
   rsi_buy: 50
   rsi_sell: 50
+  atr_len: 14
+  ema_poke_pct: 0.0001
 
   reentry:
-    max_per_day: 12
+    max_per_day: 20
     cooldown_bars: 0
 
   guardrails:
