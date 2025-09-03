@@ -11,6 +11,7 @@ TELEGRAM_CHAT_ID: ""
 capital_rs: 100000
 order_qty: 1
 
+# ---- Global params ----
 ema_fast: 21
 ema_slow: 50
 rsi_len: 14
@@ -46,6 +47,7 @@ send_only_signals: true
 paper_trading: true
 live_trading: false
 
+# ---- Backtest block ----
 backtest:
   session_start: "09:20"
   session_end:   "15:20"
@@ -63,7 +65,7 @@ backtest:
   atr_len: 14
   ema_poke_pct: 0.0001
 
-  # Quality filters (HTF confirm)
+  # quality filters (default; profile presets may tighten/loosen)
   filters:
     adx_len: 14
     adx_min: 15
@@ -74,9 +76,14 @@ backtest:
     session_start: "09:25"
     session_end:   "15:15"
 
-  # Risk & exits
-  risk_pct: 0.005        # NEW: 0.5% per trade
-  min_stop_pct: 0.002     # NEW: floor on stop distance
+  reentry:
+    max_per_day: 30
+    cooldown_bars: 0
+
+  guardrails:
+    max_trades_per_day: 30
+    max_daily_loss_rs: 2500
+    stop_after_target_rs: 4000
 
   exits:
     stop_atr_mult: 1.0
