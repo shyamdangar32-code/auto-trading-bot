@@ -4,7 +4,7 @@
 tz: "Asia/Kolkata"
 out_dir: "reports"
 
-# Zerodha / Telegram (unchanged placeholders)
+# Zerodha / Telegram (placeholders)
 zerodha_enabled: true
 ZERODHA_API_KEY: ""
 ZERODHA_API_SECRET: ""
@@ -21,31 +21,31 @@ order_qty: 1
 # =========================
 signal_mode: "balanced"
 
-# Entries (loosen a bit)
+# Entries — loosened to increase frequency
 ema_fast: 21
 ema_slow: 50
 rsi_len: 14
-rsi_buy: 53          # (old 55 / 52 → a bit easier)
-rsi_sell: 47
-ema_poke_pct: 0.0005
+rsi_buy: 50          # buy when RSI > 50
+rsi_sell: 50         # sell/short when RSI < 50
+ema_poke_pct: 0.0001 # 0.01% tolerance (was 0.05%)
 
 # ADX
 adx_len: 14
-adx_min_bal: 10
-adx_min_strict: 18
+adx_min_bal: 8
+adx_min_strict: 15
 
-# Risk/targets (global)
-stop_atr_mult: 1.0   # (old 1.2)
-take_atr_mult: 1.8
+# Risk/targets (global mirrors for safety)
+stop_atr_mult: 1.0
+take_atr_mult: 1.2   # R:R ≈ 1:1.2
 
 # Trailing (global)
 trailing_enabled: true
-trail_start_atr: 0.6
+trail_start_atr: 0.5
 trail_atr_mult: 1.0
 
-# Re-entries (global) — **loosened**
-reentry_max: 6       # (old 3)
-reentry_cooldown: 1  # (old 2)
+# Re-entries (global) — loosened
+reentry_max: 10
+reentry_cooldown: 0
 
 # ---- Intraday Options block (index-level sourcing) ----
 intraday_options:
@@ -54,15 +54,15 @@ intraday_options:
   timeframe: "5minute"
   strike_step: 100
 
-  # legacy mirror (safe)
+  # legacy mirrors
   ma_len: 20
   atr_len: 14
   sl_atr_mult: 1.0
-  tgt_rr: 1.8
-  trail_start_atr: 0.6
+  tgt_rr: 1.2
+  trail_start_atr: 0.5
   trail_atr_mult: 1.0
-  reentry_max: 6
-  reentry_cooldown: 1
+  reentry_max: 10
+  reentry_cooldown: 0
 
 # ---- Modes ----
 send_only_signals: true
@@ -70,13 +70,13 @@ paper_trading: true
 live_trading: false
 
 # =========================
-# Backtest block (engine may read from here) — mirror values
+# Backtest block — engine reads from here; mirrored values
 # =========================
 backtest:
   session_start: "09:20"
   session_end:   "15:20"
 
-  # Execution frictions
+  # Frictions
   slippage_bps: 2.0
   brokerage_flat: 20.0
   brokerage_pct: 0.0003
@@ -85,21 +85,21 @@ backtest:
   ema_fast: 21
   ema_slow: 50
   rsi_len: 14
-  rsi_buy: 53
-  rsi_sell: 47
+  rsi_buy: 50
+  rsi_sell: 50
 
   reentry:
-    max_per_day: 6
-    cooldown_bars: 1
+    max_per_day: 12
+    cooldown_bars: 0
 
   guardrails:
-    max_trades_per_day: 20   # (old 6) allow higher frequency
-    max_daily_loss_rs: 1800
-    stop_after_target_rs: 2500
+    max_trades_per_day: 30
+    max_daily_loss_rs: 2500
+    stop_after_target_rs: 4000
 
   exits:
     stop_atr_mult: 1.0
-    take_atr_mult: 1.8
+    take_atr_mult: 1.2
     trail:
       type: "atr"
       atr_mult: 1.0
