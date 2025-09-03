@@ -4,104 +4,96 @@
 tz: "Asia/Kolkata"
 out_dir: "reports"
 
-# ---- Zerodha (optional for backtest) ----
+# Zerodha / Telegram (unchanged placeholders)
 zerodha_enabled: true
 ZERODHA_API_KEY: ""
 ZERODHA_API_SECRET: ""
 ZERODHA_ACCESS_TOKEN: ""
-
-# ---- Telegram (optional) ----
 TELEGRAM_BOT_TOKEN: ""
 TELEGRAM_CHAT_ID: ""
 
-# ---- Capital & sizing (common) ----
+# ---- Capital & sizing ----
 capital_rs: 100000
 order_qty: 1
 
 # =========================
-# Intraday Options Algo — Tunables (as-is)
+# Intraday Options Algo — GLOBAL knobs (prepare_signals likely reads these)
 # =========================
-# Global signal knobs (used by intraday runner)
 signal_mode: "balanced"
 
+# Entries (loosen a bit)
 ema_fast: 21
 ema_slow: 50
 rsi_len: 14
+rsi_buy: 53          # (old 55 / 52 → a bit easier)
+rsi_sell: 47
+ema_poke_pct: 0.0005
+
+# ADX
 adx_len: 14
-atr_len: 14
-
-# Momentum thresholds
-rsi_buy: 52
-rsi_sell: 48
-ema_poke_pct: 0.0005   # 0.05%
-
-# ADX thresholds
 adx_min_bal: 10
 adx_min_strict: 18
 
-# Risk/targets (legacy/global)
-stop_atr_mult: 1.2
-take_atr_mult: 1.6
+# Risk/targets (global)
+stop_atr_mult: 1.0   # (old 1.2)
+take_atr_mult: 1.8
 
-# Trailing (legacy/global)
+# Trailing (global)
 trailing_enabled: true
 trail_start_atr: 0.6
 trail_atr_mult: 1.0
 
-# Re-entries (legacy/global)
-reentry_max: 3
-reentry_cooldown: 2
+# Re-entries (global) — **loosened**
+reentry_max: 6       # (old 3)
+reentry_cooldown: 1  # (old 2)
 
 # ---- Intraday Options block (index-level sourcing) ----
 intraday_options:
-  underlying: "BANKNIFTY"     # NIFTY or BANKNIFTY
+  underlying: "BANKNIFTY"
   index_token: 260105
   timeframe: "5minute"
   strike_step: 100
 
-  # legacy keys (kept for tools compatibility)
+  # legacy mirror (safe)
   ma_len: 20
   atr_len: 14
-  sl_atr_mult: 1.2
-  tgt_rr: 1.6
+  sl_atr_mult: 1.0
+  tgt_rr: 1.8
   trail_start_atr: 0.6
   trail_atr_mult: 1.0
-  reentry_max: 3
-  reentry_cooldown: 2
+  reentry_max: 6
+  reentry_cooldown: 1
 
-# ---- Modes (safety) ----
+# ---- Modes ----
 send_only_signals: true
 paper_trading: true
 live_trading: false
 
 # =========================
-# Backtest runner settings (read by run_backtest.py / bot.backtest)
+# Backtest block (engine may read from here) — mirror values
 # =========================
 backtest:
-  # Trading session (IST)
   session_start: "09:20"
   session_end:   "15:20"
 
-  # Execution frictions (used by your evaluation layer if applicable)
-  max_trades_per_day: 6   # kept for backward-compat (engine may read this)
-  slippage_bps: 2.0           # 2 bps each side
-  brokerage_flat: 20.0        # INR per leg (min)
-  brokerage_pct: 0.0003       # 3 bps per leg
+  # Execution frictions
+  slippage_bps: 2.0
+  brokerage_flat: 20.0
+  brokerage_pct: 0.0003
 
-  # Strategy parameters (kept at backtest.* for your prepare_signals)
-  ema_fast: 20
+  # Strategy params (mirror)
+  ema_fast: 21
   ema_slow: 50
   rsi_len: 14
-  rsi_buy: 55
-  # You can add rsi_sell etc here if your prepare_signals reads them.
+  rsi_buy: 53
+  rsi_sell: 47
 
-  # >>> New structured knobs used by bot/backtest.py <<<
   reentry:
     max_per_day: 6
     cooldown_bars: 1
 
   guardrails:
-    max_trades_per_day: 15
+    max_trades_per_day: 20   # (old 6) allow higher frequency
     max_daily_loss_rs: 1800
     stop_after_target_rs: 2500
 
