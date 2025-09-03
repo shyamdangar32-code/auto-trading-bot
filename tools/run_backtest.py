@@ -163,10 +163,11 @@ def main():
     print("⚙️  Trade config:", {
         "order_qty": cfg.get("order_qty"),
         "capital_rs": cfg.get("capital_rs"),
-        "reentry_max": cfg.get("reentry_max", 0),
-        "reentry_cooldown": cfg.get("reentry_cooldown", 0),
-        "stop_atr_mult": cfg.get("stop_atr_mult", 1.2),
-        "take_atr_mult": cfg.get("take_atr_mult", 1.6),
+        "reentry_max": (cfg.get("backtest", {}).get("reentry", {}) or {}).get("max_per_day"),
+        "cooldown_bars": (cfg.get("backtest", {}).get("reentry", {}) or {}).get("cooldown_bars"),
+        "stop_atr_mult": (cfg.get("backtest", {}).get("exits", {}) or {}).get("stop_atr_mult"),
+        "take_atr_mult": (cfg.get("backtest", {}).get("exits", {}) or {}).get("take_atr_mult"),
+        "max_trades_per_day": (cfg.get("backtest", {}).get("guardrails", {}) or {}).get("max_trades_per_day"),
     })
 
     # Run backtest (your strategy/indicators are wired inside bot.strategy / bot.backtest)
