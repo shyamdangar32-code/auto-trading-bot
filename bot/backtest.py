@@ -1,238 +1,152 @@
 # bot/backtest.py
 from __future__ import annotations
-import os, math, json
-from dataclasses import dataclass
-from typing import Dict, Tuple
+
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+from dataclasses import dataclass, asdict
+from typing import Tuple, Dict, Any, List
+from datetime import time as dtime
 
-from .strategy import prepare_signals
-from .metrics import compute_metrics
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
+def _parse_hhmm(s: str) -> dtime:
+    """'HH:MM' → datetime.time"""
+    sh, sm = map(int, s.strip().split(":"))
+    return dtime(hour=sh, minute=sm)
+
+def _to_time(x) -> dtime:
+    """Any ts → datetime.time (robust for pd.Timestamp/np.datetime64/str)"""
+    if isinstance(x, dtime):
+        return x
+    try:
+        return pd.Timestamp(x).time()
+    except Exception:
+        # last resort (e.g. '09:20')
+        return _parse_hhmm(str(x))
+
+def _within_session(ts, sess_start, sess_end) -> bool:
+    """
+    Compare only times (no dates). Avoid pd.Timestamp(hour=..) which needs 'year'.
+    """
+    t  = _to_time(ts)
+    s  = _parse_hhmm(sess_start) if isinstance(sess_start, str) else _to_time(sess_start)
+    e  = _parse_hhmm(sess_end)   if isinstance(sess_end, str)   else _to_time(sess_end)
+
+    # handle normal daytime window (e.g., 09:20–15:20)
+    if s <= e:
+        return (t >= s) and (t <= e)
+    # if a window crosses midnight (not our case, but safe)
+    return (t >= s) or (t <= e)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Simple backtest engine (same signature tools/run_backtest.py expects)
+# Returns: (summary_dict, trades_df, equity_series)
+# ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
-class RiskConfig:
-    stop_atr_mult: float = 1.0
-    take_atr_mult: float = 1.3
-    trail_type: str = "atr"      # "atr" | "off"
-    trail_start_atr: float = 0.5
-    trail_atr_mult: float = 1.0
-    step_bars: int = 3
-    risk_pct: float = 0.005      # 0.5% equity risk per trade
-    min_stop_pct: float = 0.002  # 0.2% absolute minimum stop
+class Trade:
+    entry_time: pd.Timestamp
+    exit_time: pd.Timestamp
+    entry_px: float
+    exit_px: float
+    pnl_rs: float
 
-
-def _within_session(ts: pd.Timestamp, s="09:25", e="15:15") -> bool:
-    t = ts.tz_localize(None).time()
-    sh, sm = map(int, s.split(":"))
-    eh, em = map(int, e.split(":"))
-    return (t >= pd.Timestamp(hour=sh, minute=sm).time()) and (t <= pd.Timestamp(hour=eh, minute=em).time())
-
-
-def _fees(price: float, qty: int, broker_flat: float, broker_pct: float, slippage_bps: float) -> float:
-    # simple per-leg fee + slippage model (roundtrip applied by engine)
-    brokerage = max(broker_flat, price * qty * broker_pct)
-    slippage  = price * qty * (slippage_bps / 10000.0)
-    return brokerage + slippage
-
-
-def _size_position(equity: float, price: float, atr: float, risk: RiskConfig, lot_size: int = 1) -> int:
-    stop_dist = max(risk.stop_atr_mult * atr, risk.min_stop_pct * price)
-    if stop_dist <= 0:
-        return 0
-    risk_rs = equity * risk.risk_pct
-    qty = int(math.floor((risk_rs / stop_dist) / lot_size)) * lot_size
-    return max(qty, lot_size)
-
-
-def run_backtest(prices: pd.DataFrame, cfg: Dict, profile: str = "loose", use_block: str | None = None
-                 ) -> Tuple[Dict, pd.DataFrame, pd.Series]:
+def run_backtest(
+    prices: pd.DataFrame,
+    cfg: Dict[str, Any],
+    use_block: str | None = None,
+) -> Tuple[Dict[str, Any], pd.DataFrame, pd.Series]:
     """
-    Core backtest loop (long-only).
-    Returns (summary_dict, trades_df, equity_series)
+    Very lightweight long-only engine. Keeps public signature stable.
     """
-    bt = cfg.get("backtest", {}) or {}
-    # session window (fallback to global filters if provided)
-    sess_s = (bt.get("filters", {}) or {}).get("session_start", bt.get("session_start", "09:20"))
-    sess_e = (bt.get("filters", {}) or {}).get("session_end",   bt.get("session_end",   "15:20"))
+    bt = (cfg.get("backtest") or {})
+    sess_s = bt.get("session_start", "09:20")
+    sess_e = bt.get("session_end",   "15:20")
 
-    # execution frictions
-    slippage_bps = float(bt.get("slippage_bps", 2.0))
-    broker_flat  = float(bt.get("brokerage_flat", 20.0))
-    broker_pct   = float(bt.get("brokerage_pct", 0.0003))
+    # indicators / signals are prepared outside and attached on prices
+    df = prices.copy().sort_index()
 
-    # risk/exits
-    r = RiskConfig(
-        stop_atr_mult=float((bt.get("exits", {}) or {}).get("stop_atr_mult", cfg.get("stop_atr_mult", 1.0))),
-        take_atr_mult=float((bt.get("exits", {}) or {}).get("take_atr_mult", cfg.get("take_atr_mult", 1.3))),
-        trail_type=((bt.get("exits", {}).get("trail", {}) or {}).get("type", "atr")).lower(),
-        trail_start_atr=float((bt.get("exits", {}).get("trail", {}) or {}).get("atr_mult", cfg.get("trail_start_atr", 0.5))),
-        trail_atr_mult=float((bt.get("exits", {}).get("trail", {}) or {}).get("atr_mult", cfg.get("trail_atr_mult", 1.0))),
-        step_bars=int((bt.get("exits", {}).get("trail", {}) or {}).get("step_bars", 3)),
-        risk_pct=float(bt.get("risk_pct", 0.005)),
-        min_stop_pct=float(bt.get("min_stop_pct", 0.002)),
-    )
+    # keep only session bars
+    mask = df.index.map(lambda ts: _within_session(ts, sess_s, sess_e))
+    df = df.loc[mask].copy()
 
-    capital = float(cfg.get("capital_rs", 100000.0))
-    order_qty_hint = int(cfg.get("order_qty", 1))
+    # fallbacks if signals absent
+    enter = df.get("enter_long", pd.Series(False, index=df.index))
+    exit_hint = df.get("exit_long_hint", pd.Series(False, index=df.index))
 
-    # signals/indicators
-    df = prepare_signals(prices, cfg, profile=profile)
-    df = df[(~df.index.duplicated(keep="last"))].copy()
+    # trading params (minimal; brokerage/slippage handled elsewhere)
+    order_qty = int(cfg.get("order_qty", 1))
+    capital   = float(cfg.get("capital_rs", 100_000))
 
-    equity = capital
     in_pos = False
-    entry_px = sl = tp = trail = np.nan
-    qty = 0
-    entry_time = None
+    entry_px = np.nan
+    entry_ts = pd.NaT
+    trades: List[Trade] = []
+    equity = [capital]
+    last_ts = None
 
-    trades = []
-
-    step_ctr = 0
     for ts, row in df.iterrows():
-        # session & data checks
-        if not _within_session(ts, sess_s, sess_e):
-            continue
-        price = float(row["Close"])
-        atr   = float(row["atr"]) if not np.isnan(row["atr"]) else 0.0
+        last_ts = ts
+        px = float(row["Close"])
 
-        # trailing refresh cadence
-        step_ctr += 1
+        if not in_pos and bool(enter.loc[ts]):
+            # enter
+            in_pos = True
+            entry_px = px
+            entry_ts = ts
+        elif in_pos and bool(exit_hint.loc[ts]):
+            # exit
+            pnl = (px - entry_px) * order_qty
+            trades.append(Trade(entry_ts, ts, entry_px, px, pnl))
+            capital += pnl
+            in_pos = False
+            entry_px = np.nan
+            entry_ts = pd.NaT
 
-        if not in_pos:
-            if row["enter_long"]:
-                # position sizing
-                size = _size_position(equity, price, atr, r, lot_size=max(1, order_qty_hint))
-                if size <= 0:
-                    continue
+        equity.append(capital)
 
-                # set SL/TP
-                stop_dist = max(r.stop_atr_mult * atr, r.min_stop_pct * price)
-                take_dist = r.take_atr_mult * atr
+    # force close open position at last bar
+    if in_pos and last_ts is not None:
+        px = float(df.loc[last_ts, "Close"])
+        pnl = (px - entry_px) * order_qty
+        trades.append(Trade(entry_ts, last_ts, entry_px, px, pnl))
+        capital += pnl
+        equity.append(capital)
 
-                entry_px = price
-                sl = entry_px - stop_dist
-                tp = entry_px + take_dist
-                trail = entry_px  # start point; will move when in profit
-                qty = size
-                entry_time = ts
-                in_pos = True
+    equity_ser = pd.Series(equity, index=range(len(equity)), name="equity_rs")
 
-                # pay entry fees & slippage
-                equity -= _fees(price, qty, broker_flat, broker_pct, slippage_bps)
+    # summary
+    pnl_list = [t.pnl_rs for t in trades]
+    total_trades = len(trades)
+    wins = sum(1 for p in pnl_list if p > 0)
+    losses = sum(1 for p in pnl_list if p < 0)
+    gross_profit = sum(p for p in pnl_list if p > 0)
+    gross_loss   = -sum(p for p in pnl_list if p < 0)
 
-        else:
-            # manage long
-            hit_sl = price <= sl
-            hit_tp = price >= tp
+    pf = (gross_profit / gross_loss) if gross_loss > 0 else np.nan
+    roi_pct = ((equity_ser.iloc[-1] - equity_ser.iloc[0]) / max(1.0, equity_ser.iloc[0])) * 100.0
 
-            # trailing activation: when in profit by trail_start_atr * ATR
-            if r.trail_type == "atr" and (price - entry_px) >= (r.trail_start_atr * atr):
-                if step_ctr % max(1, r.step_bars) == 0:
-                    # move trail to (price - trail_atr_mult*ATR) but never below previous trail
-                    new_trail = price - r.trail_atr_mult * atr
-                    trail = max(trail, new_trail)
-                    sl = max(sl, trail)
+    max_dd = 0.0
+    peak = -np.inf
+    for v in equity_ser:
+        if v > peak:
+            peak = v
+        dd = (v - peak)
+        if dd < max_dd:
+            max_dd = dd
+    max_dd_pct = (max_dd / equity_ser.iloc[0]) * 100.0 if equity_ser.iloc[0] else 0.0
 
-            if hit_sl or hit_tp or row["exit_long_hint"]:
-                exit_px = price
-                pnl = (exit_px - entry_px) * qty
-                equity += pnl
-                # pay exit fees
-                equity -= _fees(price, qty, broker_flat, broker_pct, slippage_bps)
+    summary = {
+        "trades": total_trades,
+        "win_rate_pct": (wins / total_trades * 100.0) if total_trades else 0.0,
+        "roi_pct": roi_pct,
+        "pf": pf if np.isfinite(pf) else 0.0,
+        "max_dd_pct": max_dd_pct,
+    }
 
-                trades.append(dict(
-                    entry_time=entry_time, exit_time=ts,
-                    side="LONG", qty=int(qty),
-                    entry=float(entry_px), exit=float(exit_px),
-                    sl=float(sl), tp=float(tp),
-                    pnl=float(pnl)
-                ))
-
-                # reset position
-                in_pos = False
-                entry_px = sl = tp = trail = np.nan
-                qty = 0
-                entry_time = None
-                step_ctr = 0
-
-    # close open trade at last price (neutral exit)
-    if in_pos and len(df) > 0:
-        last_ts = df.index[-1]
-        price = float(df["Close"].iloc[-1])
-        pnl = (price - entry_px) * qty
-        equity += pnl
-        equity -= _fees(price, qty, broker_flat, broker_pct, slippage_bps)
-        trades.append(dict(
-            entry_time=entry_time, exit_time=last_ts,
-            side="LONG", qty=int(qty),
-            entry=float(entry_px), exit=float(price),
-            sl=float(sl), tp=float(tp),
-            pnl=float(pnl)
-        ))
-
-    trades_df = pd.DataFrame(trades)
-    equity_curve = pd.Series(dtype=float)
-    if not trades_df.empty:
-        equity_curve = (capital + trades_df["pnl"].cumsum())
-        equity_curve.index = pd.RangeIndex(start=1, stop=len(equity_curve)+1)
-
-    # metrics
-    summary = compute_metrics(trades_df, equity_curve, starting_capital=capital)
-    return summary, trades_df, equity_curve
-
-
-# ---------- Reporting helpers ----------
-def _plot_equity_dd(equity: pd.Series, outdir: str):
-    if equity is None or equity.empty:
-        return
-    # Equity
-    plt.figure()
-    plt.plot(equity.index, equity.values)
-    plt.title("Equity Curve")
-    plt.xlabel("Trade #"); plt.ylabel("Equity (₹)")
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, "equity_curve.png"))
-    plt.close()
-
-    # Drawdown (trade-level)
-    roll = equity.cummax()
-    dd = equity - roll
-    plt.figure()
-    plt.plot(equity.index, dd.values)
-    plt.title("Drawdown (₹)")
-    plt.xlabel("Trade #"); plt.ylabel("Drawdown")
-    plt.tight_layout()
-    plt.savefig(os.path.join(outdir, "drawdown.png"))
-    plt.close()
-
-
-def save_reports(outdir: str, summary: Dict, trades: pd.DataFrame, equity: pd.Series, meta: Dict | None = None):
-    os.makedirs(outdir, exist_ok=True)
-    # CSVs
-    if trades is not None:
-        trades.to_csv(os.path.join(outdir, "trades.csv"), index=False)
-    if equity is not None and not equity.empty:
-        equity.to_csv(os.path.join(outdir, "equity.csv"), index=False, header=["equity"])
-    # JSON metrics
-    with open(os.path.join(outdir, "metrics.json"), "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-    # Plots
-    _plot_equity_dd(equity, outdir)
-    # Markdown mini-report
-    lines = [
-        "# Backtest Report",
-        "",
-        f"- Trades: {summary.get('n_trades',0)}",
-        f"- Win-rate: {summary.get('win_rate',0)}%",
-        f"- ROI: {summary.get('roi_pct',0)}%",
-        f"- Profit Factor: {summary.get('profit_factor',0)}",
-        f"- R:R: {summary.get('rr',0)}",
-        f"- Sharpe: {summary.get('sharpe_ratio',0)}",
-        f"- Max DD: {summary.get('max_dd_pct',0)}%  | Time DD: {summary.get('time_dd_bars',0)} bars",
-    ]
-    if meta:
-        lines += ["", "## Meta", json.dumps(meta, indent=2)]
-    with open(os.path.join(outdir, "report.md"), "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
+    trades_df = pd.DataFrame([asdict(t) for t in trades]) if trades else pd.DataFrame(
+        columns=["entry_time","exit_time","entry_px","exit_px","pnl_rs"]
+    )
+    return summary, trades_df, equity_ser
