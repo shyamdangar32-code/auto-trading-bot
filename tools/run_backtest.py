@@ -1,147 +1,202 @@
-#!/usr/bin/env python3
 # tools/run_backtest.py
-
 from __future__ import annotations
-import argparse
-import json
+
 import os
-from datetime import datetime
+import json
+import argparse
 from pathlib import Path
+from datetime import datetime
+from typing import Dict
 
 import pandas as pd
-import matplotlib.pyplot as plt
 
-# repo local imports
-from bot.pricefeed import get_zerodha_ohlc  # your existing helper
-from bot.backtest import run_backtest       # NOTE: save_reports is now local here
+# engine hooks (unchanged)
+from bot.backtest import run_backtest, save_reports  # noqa: F401
 
 
-# ------------------------
-# Local helper: save all artifacts (no import from bot.backtest)
-# ------------------------
-def save_reports(out_dir: str,
-                 profile: str,
-                 summary: dict,
-                 trades_df: pd.DataFrame,
-                 equity_ser: pd.Series) -> None:
+# -------- Zerodha OHLC fetch (inline, no extra file) --------
+def get_zerodha_ohlc(
+    instrument_token: int,
+    interval: str,
+    start: str,
+    end: str,
+) -> pd.DataFrame:
     """
-    Write: report.md, metrics.json, equity.csv, drawdown/equity charts.
+    Fetch OHLC using KiteConnect directly.
+    Expects ZERODHA_API_KEY & ZERODHA_ACCESS_TOKEN in env.
     """
-    out = Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+    from kiteconnect import KiteConnect  # imported here to keep global deps light
 
-    # ---- metrics.json
-    metrics_path = out / "metrics.json"
-    with open(metrics_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
+    api_key = os.environ.get("ZERODHA_API_KEY", "").strip()
+    access_token = os.environ.get("ZERODHA_ACCESS_TOKEN", "").strip()
 
-    # ---- equity.csv
-    if not isinstance(equity_ser, pd.Series):
-        equity_ser = pd.Series(dtype=float)
-    equity_path = out / "equity.csv"
-    equity_ser.to_csv(equity_path, header=["equity"], index_label="ts")
+    if not api_key or not access_token:
+        raise RuntimeError(
+            "Missing Zerodha creds: set ZERODHA_API_KEY and ZERODHA_ACCESS_TOKEN in Actions secrets."
+        )
 
-    # ---- charts
-    # Equity
-    plt.figure()
-    equity_ser.reset_index(drop=True).plot()
-    plt.title("Equity Curve")
-    plt.xlabel("Trade #")
-    plt.ylabel("Equity (₹)")
-    plt.tight_layout()
-    plt.savefig(out / "equity_curve.png")
-    plt.close()
+    kite = KiteConnect(api_key=api_key)
+    kite.set_access_token(access_token)
 
-    # Drawdown (simple peak-to-valley from equity)
-    if len(equity_ser) > 0:
-        roll_max = equity_ser.cummax()
-        dd = equity_ser - roll_max
-    else:
-        dd = pd.Series(dtype=float)
+    # Kite intervals: "minute","3minute","5minute","15minute","60minute","day"
+    data = kite.historical_data(
+        instrument_token=instrument_token,
+        from_date=start,
+        to_date=end,
+        interval=interval,
+        continuous=False,
+        oi=True,
+    )
 
-    plt.figure()
-    dd.reset_index(drop=True).plot()
-    plt.title("Drawdown (₹)")
-    plt.xlabel("Trade #")
-    plt.ylabel("Drawdown")
-    plt.tight_layout()
-    plt.savefig(out / "drawdown.png")
-    plt.close()
+    if not data:
+        raise RuntimeError("Empty OHLC returned from Zerodha.")
 
-    # ---- report.md (short human summary)
-    report_md = out / "report.md"
-    lines = [
-        f"Backtest Summary (SUCCESS) — profile: {profile}",
-        f"Underlying: {summary.get('underlying','NIFTY')}   Interval: {summary.get('interval','1m')}",
-        f"Period: {summary.get('period_start','?')} -> {summary.get('period_end','?')}",
-        f"Trades: {summary.get('trades',0)}   Win-rate: {summary.get('win_rate_pct',0):.2f}%",
-        f"ROI: {summary.get('roi_pct',0):.2f}%   PF: {summary.get('pf',0):.2f}",
-        f"R:R: {summary.get('rr',0):.2f}   Sharpe: {summary.get('sharpe',0):.02f}",
-        f"Max DD: {summary.get('max_dd_pct',0):.02f}%   Time DD: {summary.get('time_dd_bars',0)} bars",
-        f"Bars: {summary.get('bars',0)}   ATR-bars: {summary.get('atr_bars',0)}",
-        f"Setups: long={summary.get('setups_long',0)} short={summary.get('setups_short',0)}   Trades taken: {summary.get('trades',0)}",
-        "",
-    ]
-    report_md.write_text("\n".join(lines), encoding="utf-8")
+    df = pd.DataFrame(data)
+    # 'date' field is ISO string; make TZ-naive index (our engine handles tz)
+    df["date"] = pd.to_datetime(df["date"], utc=True).dt.tz_convert(None)
+    df = df.rename(
+        columns={
+            "date": "Date",
+            "open": "Open",
+            "high": "High",
+            "low": "Low",
+            "close": "Close",
+            "volume": "Volume",
+        }
+    ).set_index("Date").sort_index()
+
+    # Ensure expected columns exist
+    for col in ["Open", "High", "Low", "Close"]:
+        if col not in df:
+            raise RuntimeError(f"Missing column '{col}' in Zerodha OHLC.")
+
+    return df
 
 
-# ------------------------
-# CLI
-# ------------------------
+# -------- Small helpers --------
+INDEX_TOKENS: Dict[str, int] = {
+    # Keep what you really use; BANKNIFTY was 260105 in your runs
+    "NIFTY": 256265,
+    "BANKNIFTY": 260105,
+    "FINNIFTY": 2707457,
+}
+
+INTERVAL_MAP = {
+    "1m": "minute",
+    "3m": "3minute",
+    "5m": "5minute",
+    "15m": "15minute",
+    "60m": "60minute",
+    "1d": "day",
+}
+
+
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--start", required=True)
-    p.add_argument("--end", required=True)
-    p.add_argument("--token", required=True, type=int, help="Zerodha instrument token")
-    p.add_argument("--interval", default="minute")
-    p.add_argument("--profile", default="loose", choices=["loose", "medium", "strict"])
-    p.add_argument("--use-block", default="", help="label for profile/block in logs")
-    p.add_argument("--cfg", default="config.yaml")
-    p.add_argument("--out", default="reports")  # directory to write artifacts
+    p = argparse.ArgumentParser("Run backtest")
+    p.add_argument("--underlying", default="NIFTY")
+    p.add_argument("--start", required=True, help="YYYY-MM-DD")
+    p.add_argument("--end", required=True, help="YYYY-MM-DD")
+    p.add_argument("--interval", default="1m")
+    p.add_argument("--capital_rs", type=float, default=100000)
+    p.add_argument("--order_qty", type=int, default=1)
+    p.add_argument("--outdir", default="reports")
+    p.add_argument("--use_block", default="backtest_loose")
     return p.parse_args()
 
 
-def load_config(path: str) -> dict:
-    import yaml
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
-
-
-def main():
+def main() -> None:
     args = parse_args()
-    cfg = load_config(args.cfg)
 
-    # Fetch prices (you already have this util in your project)
-    print(f"📅 Fetching Zerodha OHLC: token={args.token} interval={args.interval} {args.start} -> {args.end}")
-    prices = get_zerodha_ohlc(
-        token=args.token,
-        interval=args.interval,
-        start=args.start,
-        end=args.end,
+    und = args.underlying.upper().strip()
+    token = INDEX_TOKENS.get(und)
+    if not token:
+        raise SystemExit(f"Unsupported underlying '{und}'. Add its instrument token in INDEX_TOKENS.")
+
+    interval_kite = INTERVAL_MAP.get(args.interval, args.interval)
+
+    # Paths
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Minimal config passed to engine
+    cfg = {
+        "tz": "Asia/Kolkata",
+        "out_dir": str(outdir),
+        "capital_rs": float(args.capital_rs),
+        "order_qty": int(args.order_qty),
+        # backtest block mirrors (engine reads these)
+        "backtest": {
+            "session_start": "09:20",
+            "session_end": "15:20",
+            "slippage_bps": 2.0,
+            "brokerage_flat": 20.0,
+            "brokerage_pct": 0.0003,
+            "ema_fast": 21,
+            "ema_slow": 50,
+            "rsi_len": 14,
+            "rsi_buy": 52,
+            "rsi_sell": 48,
+            "atr_len": 14,
+            "ema_poke_pct": 0.0001,
+            "filters": {
+                "adx_len": 14,
+                "adx_min": 12,
+                "use_htf": True,
+                "htf_rule": "15min",
+                "htf_ema_len": 20,
+                "min_atr_pct": 0.0003,
+                "session_start": "09:25",
+                "session_end": "15:15",
+            },
+            "reentry": {
+                "max_per_day": 20,
+                "cooldown_bars": 0,
+            },
+            "guardrails": {
+                "max_trades_per_day": 30,
+                "max_daily_loss_rs": 2500,
+                "stop_after_target_rs": 4000,
+            },
+            "exits": {
+                "stop_atr_mult": 1.0,
+                "take_atr_mult": 1.3,
+                "trail": {"type": "atr", "atr_mult": 1.0, "step_bars": 3},
+            },
+        },
+    }
+
+    print(
+        f"🗓  Fetching Zerodha OHLC: token={token} interval={interval_kite} "
+        f"{args.start} -> {args.end}"
     )
+    prices = get_zerodha_ohlc(token, interval_kite, args.start, args.end)
 
-    # Run the backtest
-    print(f"🧩 Trade config: {{'order_qty': {cfg.get('order_qty',1)}, 'capital_rs': {cfg.get('capital_rs',100000.0)} }}")
-    if args.use_block:
-        print(f"🧱 Using profile/block: {args.use_block}")
+    print(
+        f"⚙️  Trade config: {{'order_qty': {cfg['order_qty']}, 'capital_rs': {cfg['capital_rs']}}}"
+    )
+    print(f"📦 Using profile/block: {args.use_block}")
 
-    summary, trades_df, equity_ser = run_backtest(prices, cfg, profile=args.profile, use_block=args.use_block)
+    # Run engine
+    summary, trades_df, equity_ser = run_backtest(prices, cfg, use_block=args.use_block)
 
     # Persist artifacts
-    out_dir = os.path.join(args.out, args.profile)
-    save_reports(out_dir, args.profile, summary, trades_df, equity_ser)
+    save_reports(
+        out_dir=outdir,
+        prices=prices,
+        equity=e
 
-    # Also print a tiny JSON line for comparison job (keep it super small)
-    comp_min = {
-        "profile": args.profile,
-        "trades": int(summary.get("trades", 0)),
-        "win%": round(float(summary.get("win_rate_pct", 0.0)), 2),
-        "PF": round(float(summary.get("pf", 0.0)), 2),
-        "R:R": round(float(summary.get("rr", 0.0)), 2),
-        "ROI%": round(float(summary.get("roi_pct", 0.0)), 2),
-        "DD%": round(float(summary.get("max_dd_pct", 0.0)), 2),
-    }
-    print("==BACKTEST_COMPACT==", json.dumps(comp_min))
+quity_ser,
+        trades=trades_df,
+        summary=summary,
+        meta={
+            "underlying": und,
+            "interval": args.interval,
+            "start": args.start,
+            "end": args.end,
+            "use_block": args.use_block,
+            "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        },
+    )
 
 
 if __name__ == "__main__":
