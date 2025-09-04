@@ -1,8 +1,15 @@
 name: Backtest
 
-# ✅ Manual only
 on:
   workflow_dispatch: {}
+
+# top-level env → compare job ને પણ મળે
+env:
+  ZERODHA_API_KEY:       ${{ secrets.ZERODHA_API_KEY }}
+  ZERODHA_API_SECRET:    ${{ secrets.ZERODHA_API_SECRET }}
+  ZERODHA_ACCESS_TOKEN:  ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+  TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
 
 jobs:
   run-backtest:
@@ -16,16 +23,8 @@ jobs:
         profile: [loose, medium, strict]
 
     env:
-      # --- Secrets (set in repo Settings → Secrets and variables → Actions) ---
-      ZERODHA_API_KEY:       ${{ secrets.ZERODHA_API_KEY }}
-      ZERODHA_API_SECRET:    ${{ secrets.ZERODHA_API_SECRET }}
-      ZERODHA_ACCESS_TOKEN:  ${{ secrets.ZERODHA_ACCESS_TOKEN }}
-      TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
-
-      # --- Default run params ---
       UNDERLYING: NIFTY
-      INTERVAL: "1m"
+      INTERVAL: "minute"   # (safe alias; તમારા script માં "1m" support હોય તો બદલી શકો)
 
     steps:
       - name: Checkout repo
@@ -46,7 +45,6 @@ jobs:
 
       - name: Compute date range (last 365 days)
         id: dates
-        shell: bash
         run: |
           END=$(date -u +%F)
           START=$(date -u -d "$END -365 days" +%F)
@@ -56,7 +54,7 @@ jobs:
       - name: Run backtest (${{ matrix.profile }})
         run: |
           mkdir -p reports logs
-          python -m tools.run_backtest \
+          python tools/run_backtest.py \
             --underlying "${UNDERLYING}" \
             --start "${{ steps.dates.outputs.start }}" \
             --end   "${{ steps.dates.outputs.end }}" \
@@ -87,13 +85,9 @@ jobs:
           import json, os, pathlib
           prof = os.environ.get("PROFILE","").strip()
           mpath = f"reports/{prof}/metrics.json"
-          try:
-              m = json.load(open(mpath,"r",encoding="utf-8"))
-          except Exception as e:
-              print("No metrics for Telegram:", e); raise
-
+          m = json.load(open(mpath,"r",encoding="utf-8"))
           und   = os.environ.get("UNDERLYING","NIFTY")
-          itv   = os.environ.get("INTERVAL","1m")
+          itv   = os.environ.get("INTERVAL","minute")
           start = os.environ.get("START","")
           end   = os.environ.get("END","")
           lines = [
@@ -115,7 +109,6 @@ jobs:
           pathlib.Path("payload.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
           PY
 
-          # chart images if present
           CURL="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
           curl -s -X POST -H "Content-Type: application/json" \
                -d @payload.json "$CURL/sendMessage" | tee telegram_response_${{ matrix.profile }}.json
@@ -144,10 +137,9 @@ jobs:
       - name: Compose comparison text
         run: |
           python - <<'PY'
-          import json, glob, os, pathlib
+          import json, glob, pathlib
           rows=[]
-          order=['loose','medium','strict']
-          for prof in order:
+          for prof in ['loose','medium','strict']:
               p = glob.glob(f"artifacts/backtest-artifacts-{prof}/**/metrics.json", recursive=True)
               if not p: continue
               m = json.load(open(p[0],'r',encoding='utf-8'))
@@ -167,6 +159,6 @@ jobs:
         if: ${{ env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
         run: |
           TXT=$(cat comparison.txt)
-          curl -s "https://api.telegram.org/bot${{ env.TELEGRAM_BOT_TOKEN }}/sendMessage" \
-            -d chat_id="${{ env.TELEGRAM_CHAT_ID }}" \
+          curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
             --data-urlencode text="$TXT" >/dev/null
