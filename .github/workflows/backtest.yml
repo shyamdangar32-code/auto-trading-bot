@@ -1,40 +1,40 @@
 name: Backtest
 
+# ✅ Manual only
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - ".github/workflows/backtest.yml"
-      - "bot/**"
-      - "tools/**"
-      - "strategies/**"
-      - "core_backtest/**"
-      - "requirements.txt"
   workflow_dispatch: {}
-  schedule:
-    - cron: "15 4 * * 1-5"  # ~09:45 IST
 
 jobs:
   run-backtest:
-    strategy:
-      matrix:
-        profile: [loose, medium, strict]
+    name: Run backtest (${{ matrix.profile }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [loose, medium, strict]
+
     env:
+      # --- Secrets (set in repo Settings → Secrets and variables → Actions) ---
       ZERODHA_API_KEY:       ${{ secrets.ZERODHA_API_KEY }}
       ZERODHA_API_SECRET:    ${{ secrets.ZERODHA_API_SECRET }}
       ZERODHA_ACCESS_TOKEN:  ${{ secrets.ZERODHA_ACCESS_TOKEN }}
       TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      # --- Default run params ---
       UNDERLYING: NIFTY
       INTERVAL: "1m"
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
@@ -63,88 +63,110 @@ jobs:
             --interval "${INTERVAL}" \
             --capital_rs 100000 \
             --order_qty 1 \
-            --profile "${{ matrix.profile }}" \
-            --use_block "backtest_${{ matrix.profile }}" \
-            --outdir "./reports"
+            --outdir "./reports/${{ matrix.profile }}" \
+            --use_block "backtest_${{ matrix.profile }}"
 
       - name: Upload artifacts (${{ matrix.profile }})
         uses: actions/upload-artifact@v4
         with:
           name: backtest-artifacts-${{ matrix.profile }}
-          path: reports/**
+          path: |
+            reports/${{ matrix.profile }}/**
+            logs/**
           if-no-files-found: warn
           retention-days: 7
 
       - name: Telegram summary (${{ matrix.profile }})
-        if: ${{ success() }}
+        if: ${{ success() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
         env:
-          START:   ${{ steps.dates.outputs.start }}
-          END:     ${{ steps.dates.outputs.end }}
+          START: ${{ steps.dates.outputs.start }}
+          END:   ${{ steps.dates.outputs.end }}
           PROFILE: ${{ matrix.profile }}
-          UNDERLYING: ${{ env.UNDERLYING }}
-          INTERVAL:   ${{ env.INTERVAL }}
-          CHAT_ID:    ${{ env.TELEGRAM_CHAT_ID }}
-          BOT_TOKEN:  ${{ env.TELEGRAM_BOT_TOKEN }}
         run: |
           python - <<'PY'
-          import os, json, pathlib
-          m = json.load(open("reports/metrics.json","r",encoding="utf-8"))
+          import json, os, pathlib
+          prof = os.environ.get("PROFILE","").strip()
+          mpath = f"reports/{prof}/metrics.json"
+          try:
+              m = json.load(open(mpath,"r",encoding="utf-8"))
+          except Exception as e:
+              print("No metrics for Telegram:", e); raise
+
+          und   = os.environ.get("UNDERLYING","NIFTY")
+          itv   = os.environ.get("INTERVAL","1m")
+          start = os.environ.get("START","")
+          end   = os.environ.get("END","")
           lines = [
-            f"Backtest Summary (SUCCESS) — profile: {os.environ['PROFILE']}",
-            f"Underlying: {os.environ['UNDERLYING']}   Interval: {os.environ['INTERVAL']}",
-            f"Period: {os.environ['START']} -> {os.environ['END']}",
+            f"Backtest Summary (SUCCESS) — profile: {prof}",
+            f"Underlying: {und}   Interval: {itv}",
+            f"Period: {start} -> {end}",
             f"Trades: {m.get('n_trades',0)}   Win-rate: {m.get('win_rate',0)}%",
             f"ROI: {m.get('roi_pct',0)}%   PF: {m.get('profit_factor',0)}",
             f"R:R: {m.get('rr',0)}   Sharpe: {m.get('sharpe_ratio',0)}",
             f"Max DD: {m.get('max_dd_pct',0)}%   Time DD: {m.get('time_dd_bars',0)} bars",
             f"Bars: {m.get('n_bars',0)}   ATR-bars: {m.get('atr_bars',0)}",
-            f"Setups: long={m.get('setups_long',0)} short={m.get('setups_short',0)}   Trades taken: {m.get('n_trades',0)}",
+            f"Setups: long={m.get('setups_long',0)} short={m.get('setups_short',0)}  Trades taken: {m.get('n_trades',0)}",
           ]
-          msg = "\n".join(lines)
-          payload = {"chat_id": os.environ["CHAT_ID"], "text": msg, "disable_web_page_preview": True}
+          payload = {
+            "chat_id": os.environ["TELEGRAM_CHAT_ID"],
+            "text": "\n".join(lines),
+            "disable_web_page_preview": True
+          }
           pathlib.Path("payload.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
           PY
-          curl -s -X POST -H "Content-Type: application/json" \
-               -d @payload.json \
-               "https://api.telegram.org/bot${{ env.TELEGRAM_BOT_TOKEN }}/sendMessage" >/dev/null
 
-          # charts
-          if [ -f reports/equity_curve.png ]; then
-            curl -s -F chat_id="${{ env.TELEGRAM_CHAT_ID }}" -F photo="@reports/equity_curve.png" \
-              "https://api.telegram.org/bot${{ env.TELEGRAM_BOT_TOKEN }}/sendPhoto" >/dev/null
+          # chart images if present
+          CURL="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
+          curl -s -X POST -H "Content-Type: application/json" \
+               -d @payload.json "$CURL/sendMessage" | tee telegram_response_${{ matrix.profile }}.json
+          if [ -f reports/${{ matrix.profile }}/equity_curve.png ]; then
+            curl -s -F chat_id="${TELEGRAM_CHAT_ID}" \
+                    -F photo="@reports/${{ matrix.profile }}/equity_curve.png" \
+                 "$CURL/sendPhoto" >/dev/null
           fi
-          if [ -f reports/drawdown.png ]; then
-            curl -s -F chat_id="${{ env.TELEGRAM_CHAT_ID }}" -F photo="@reports/drawdown.png" \
-              "https://api.telegram.org/bot${{ env.TELEGRAM_BOT_TOKEN }}/sendPhoto" >/dev/null
+          if [ -f reports/${{ matrix.profile }}/drawdown.png ]; then
+            curl -s -F chat_id="${TELEGRAM_CHAT_ID}" \
+                    -F photo="@reports/${{ matrix.profile }}/drawdown.png" \
+                 "$CURL/sendPhoto" >/dev/null
           fi
 
   compare:
-    needs: run-backtest
+    name: Compare (loose vs medium vs strict)
     runs-on: ubuntu-latest
+    needs: run-backtest
     if: ${{ always() }}
     steps:
-      - uses: actions/download-artifact@v4
-        with: { path: out }
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
       - name: Compose comparison text
         run: |
-          set -e
           python - <<'PY'
-          import json, glob, os
-          def load(path):
-            try: return json.load(open(path,"r",encoding="utf-8"))
-            except: return {}
-          parts=[]
-          for prof in ["loose","medium","strict"]:
-            m=load(f"out/backtest-artifacts-{prof}/reports/metrics.json")
-            if not m: continue
-            parts.append(f"{prof}: {m.get('n_trades',0)} | win%={m.get('win_rate',0)} | PF={m.get('profit_factor',0)} | R:R={m.get('rr',0)} | ROI%={m.get('roi_pct',0)} | DD%={m.get('max_dd_pct',0)}")
-          open("compare.txt","w").write("Backtest Comparison (loose | medium | strict)\n"+"\n".join(parts))
+          import json, glob, os, pathlib
+          rows=[]
+          order=['loose','medium','strict']
+          for prof in order:
+              p = glob.glob(f"artifacts/backtest-artifacts-{prof}/**/metrics.json", recursive=True)
+              if not p: continue
+              m = json.load(open(p[0],'r',encoding='utf-8'))
+              rows.append(f"{prof}: {m.get('n_trades',0)} | win%={m.get('win_rate',0)} | PF={m.get('profit_factor',0)} | R:R={m.get('rr',0)} | ROI%={m.get('roi_pct',0)} | DD%={m.get('max_dd_pct',0)}")
+          txt="Backtest Comparison (loose | medium | strict)\n" + "\n".join(rows) if rows else "No metrics found."
+          pathlib.Path("comparison.txt").write_text(txt, encoding="utf-8")
           PY
-      - name: Send comparison to Telegram
-        env:
-          BOT:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      - name: Upload comparison
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-comparison
+          path: comparison.txt
+          if-no-files-found: warn
+
+      - name: Telegram comparison
+        if: ${{ env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
         run: |
-          TEXT=$(cat compare.txt)
-          curl -s "https://api.telegram.org/bot${BOT}/sendMessage" \
-            -d chat_id="${CHAT}" -d text="$TEXT" >/dev/null
+          TXT=$(cat comparison.txt)
+          curl -s "https://api.telegram.org/bot${{ env.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ env.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode text="$TXT" >/dev/null
