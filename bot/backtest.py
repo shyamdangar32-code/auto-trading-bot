@@ -1,152 +1,169 @@
 # bot/backtest.py
 from __future__ import annotations
+from dataclasses import dataclass
+from typing import Tuple, Dict
 
 import pandas as pd
 import numpy as np
-from dataclasses import dataclass, asdict
-from typing import Tuple, Dict, Any, List
-from datetime import time as dtime
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
+from bot.strategy import prepare_signals
 
-def _parse_hhmm(s: str) -> dtime:
-    """'HH:MM' → datetime.time"""
-    sh, sm = map(int, s.strip().split(":"))
-    return dtime(hour=sh, minute=sm)
 
-def _to_time(x) -> dtime:
-    """Any ts → datetime.time (robust for pd.Timestamp/np.datetime64/str)"""
-    if isinstance(x, dtime):
-        return x
-    try:
-        return pd.Timestamp(x).time()
-    except Exception:
-        # last resort (e.g. '09:20')
-        return _parse_hhmm(str(x))
+# ------------------------
+# Session helper (FIX for Pandas Timestamp 'year' error)
+# ------------------------
+def _parse_hhmm(hhmm: str) -> pd.Timestamp:
+    # robust: accepts "9:20", "09:20", "09:20:00"
+    hhmm = (hhmm or "").strip()
+    # stick an arbitrary date to make a full timestamp
+    return pd.to_datetime(f"2000-01-01 {hhmm}", format="%Y-%m-%d %H:%M", errors="coerce")
 
-def _within_session(ts, sess_start, sess_end) -> bool:
-    """
-    Compare only times (no dates). Avoid pd.Timestamp(hour=..) which needs 'year'.
-    """
-    t  = _to_time(ts)
-    s  = _parse_hhmm(sess_start) if isinstance(sess_start, str) else _to_time(sess_start)
-    e  = _parse_hhmm(sess_end)   if isinstance(sess_end, str)   else _to_time(sess_end)
+def _within_session(ts: pd.Timestamp, sess_s: str, sess_e: str) -> bool:
+    if pd.isna(ts):
+        return False
+    sh = _parse_hhmm(sess_s)
+    eh = _parse_hhmm(sess_e)
+    if pd.isna(sh) or pd.isna(eh):
+        return True  # if misconfigured, don't block
+    t = pd.to_datetime(f"2000-01-01 {ts.time()}")
+    return (t.time() >= sh.time()) and (t.time() <= eh.time())
 
-    # handle normal daytime window (e.g., 09:20–15:20)
-    if s <= e:
-        return (t >= s) and (t <= e)
-    # if a window crosses midnight (not our case, but safe)
-    return (t >= s) or (t <= e)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Simple backtest engine (same signature tools/run_backtest.py expects)
-# Returns: (summary_dict, trades_df, equity_series)
-# ──────────────────────────────────────────────────────────────────────────────
-
+# ------------------------
+# Very small trade engine (long-only)
+# ------------------------
 @dataclass
-class Trade:
-    entry_time: pd.Timestamp
-    exit_time: pd.Timestamp
-    entry_px: float
-    exit_px: float
-    pnl_rs: float
+class BTState:
+    in_pos: bool = False
+    entry_px: float = 0.0
 
-def run_backtest(
-    prices: pd.DataFrame,
-    cfg: Dict[str, Any],
-    use_block: str | None = None,
-) -> Tuple[Dict[str, Any], pd.DataFrame, pd.Series]:
+def _simulate(df: pd.DataFrame, cfg: dict, profile: str) -> Tuple[pd.DataFrame, pd.Series]:
     """
-    Very lightweight long-only engine. Keeps public signature stable.
+    Very small long-only backtest using prepared entry/exit hints.
+    Produces trades dataframe and equity curve (by closed trades).
     """
-    bt = (cfg.get("backtest") or {})
-    sess_s = bt.get("session_start", "09:20")
-    sess_e = bt.get("session_end",   "15:20")
+    st = BTState()
+    trades = []
+    equity = []
+    cash = float(cfg.get("capital_rs", 100000.0))
+    qty = int(cfg.get("order_qty", 1))
 
-    # indicators / signals are prepared outside and attached on prices
-    df = prices.copy().sort_index()
-
-    # keep only session bars
-    mask = df.index.map(lambda ts: _within_session(ts, sess_s, sess_e))
-    df = df.loc[mask].copy()
-
-    # fallbacks if signals absent
-    enter = df.get("enter_long", pd.Series(False, index=df.index))
-    exit_hint = df.get("exit_long_hint", pd.Series(False, index=df.index))
-
-    # trading params (minimal; brokerage/slippage handled elsewhere)
-    order_qty = int(cfg.get("order_qty", 1))
-    capital   = float(cfg.get("capital_rs", 100_000))
-
-    in_pos = False
-    entry_px = np.nan
-    entry_ts = pd.NaT
-    trades: List[Trade] = []
-    equity = [capital]
-    last_ts = None
+    sess_s = (cfg.get("backtest") or {}).get("session_start", "09:20")
+    sess_e = (cfg.get("backtest") or {}).get("session_end", "15:20")
 
     for ts, row in df.iterrows():
-        last_ts = ts
+        if not _within_session(ts, sess_s, sess_e):
+            continue
+
         px = float(row["Close"])
+        # enter
+        if (not st.in_pos) and bool(row.get("enter_long", False)):
+            st.in_pos = True
+            st.entry_px = px
 
-        if not in_pos and bool(enter.loc[ts]):
-            # enter
-            in_pos = True
-            entry_px = px
-            entry_ts = ts
-        elif in_pos and bool(exit_hint.loc[ts]):
-            # exit
-            pnl = (px - entry_px) * order_qty
-            trades.append(Trade(entry_ts, ts, entry_px, px, pnl))
-            capital += pnl
-            in_pos = False
-            entry_px = np.nan
-            entry_ts = pd.NaT
+        # exit
+        if st.in_pos and bool(row.get("exit_long_hint", False)):
+            pnl = (px - st.entry_px) * qty
+            trades.append({"ts": ts, "entry": st.entry_px, "exit": px, "pnl": pnl})
+            cash += pnl
+            equity.append(cash)
+            st = BTState()  # reset
 
-        equity.append(capital)
+    # if open trade at end, mark-to-close
+    if st.in_pos:
+        px = float(df["Close"].iloc[-1])
+        pnl = (px - st.entry_px) * qty
+        trades.append({"ts": df.index[-1], "entry": st.entry_px, "exit": px, "pnl": pnl})
+        cash += pnl
+        equity.append(cash)
+        st = BTState()
 
-    # force close open position at last bar
-    if in_pos and last_ts is not None:
-        px = float(df.loc[last_ts, "Close"])
-        pnl = (px - entry_px) * order_qty
-        trades.append(Trade(entry_ts, last_ts, entry_px, px, pnl))
-        capital += pnl
-        equity.append(capital)
+    trades_df = pd.DataFrame(trades)
+    equity_ser = pd.Series(equity, name="equity")
 
-    equity_ser = pd.Series(equity, index=range(len(equity)), name="equity_rs")
+    return trades_df, equity_ser
 
-    # summary
-    pnl_list = [t.pnl_rs for t in trades]
-    total_trades = len(trades)
-    wins = sum(1 for p in pnl_list if p > 0)
-    losses = sum(1 for p in pnl_list if p < 0)
-    gross_profit = sum(p for p in pnl_list if p > 0)
-    gross_loss   = -sum(p for p in pnl_list if p < 0)
 
-    pf = (gross_profit / gross_loss) if gross_loss > 0 else np.nan
-    roi_pct = ((equity_ser.iloc[-1] - equity_ser.iloc[0]) / max(1.0, equity_ser.iloc[0])) * 100.0
+def _summarize(df_prices: pd.DataFrame,
+               trades_df: pd.DataFrame,
+               equity_ser: pd.Series,
+               cfg: dict,
+               profile: str) -> Dict:
+    """
+    Build a summary dict (keys used by reports).
+    """
+    trades = len(trades_df)
+    wins = int((trades_df["pnl"] > 0).sum()) if trades else 0
+    win_rate = (wins / trades * 100.0) if trades else 0.0
+    roi = 0.0
+    pf = 0.0
+    rr = 0.0
+    sharpe = -0.00
+    max_dd_pct = 0.0
+    time_dd_bars = len(df_prices)
 
-    max_dd = 0.0
-    peak = -np.inf
-    for v in equity_ser:
-        if v > peak:
-            peak = v
-        dd = (v - peak)
-        if dd < max_dd:
-            max_dd = dd
-    max_dd_pct = (max_dd / equity_ser.iloc[0]) * 100.0 if equity_ser.iloc[0] else 0.0
+    if trades:
+        gross_p = trades_df.loc[trades_df["pnl"] > 0, "pnl"].sum()
+        gross_l = -trades_df.loc[trades_df["pnl"] < 0, "pnl"].sum()
+        pf = (gross_p / gross_l) if gross_l > 0 else 0.0
+        rr = (abs(trades_df["pnl"].mean()) / (trades_df["pnl"].abs().mean() + 1e-9)) if trades else 0.0
 
-    summary = {
-        "trades": total_trades,
-        "win_rate_pct": (wins / total_trades * 100.0) if total_trades else 0.0,
-        "roi_pct": roi_pct,
-        "pf": pf if np.isfinite(pf) else 0.0,
-        "max_dd_pct": max_dd_pct,
-    }
+        start_cap = float(cfg.get("capital_rs", 100000.0))
+        end_cap = equity_ser.iloc[-1] if len(equity_ser) else start_cap
+        roi = (end_cap - start_cap) / start_cap * 100.0
 
-    trades_df = pd.DataFrame([asdict(t) for t in trades]) if trades else pd.DataFrame(
-        columns=["entry_time","exit_time","entry_px","exit_px","pnl_rs"]
+        # rough drawdown from equity
+        if len(equity_ser):
+            roll_max = equity_ser.cummax()
+            dd = (equity_ser - roll_max)
+            max_dd_abs = dd.min() if len(dd) else 0.0
+            max_dd_pct = (max_dd_abs / start_cap) * 100.0
+
+    summary = dict(
+        underlying=cfg.get("underlying", "NIFTY"),
+        interval="1m",
+        period_start=str(df_prices.index.min())[:10] if len(df_prices) else "",
+        period_end=str(df_prices.index.max())[:10] if len(df_prices) else "",
+        trades=trades,
+        win_rate_pct=round(win_rate, 2),
+        roi_pct=round(roi, 2),
+        pf=round(pf, 2),
+        rr=round(rr, 2),
+        sharpe=round(sharpe, 2),
+        max_dd_pct=round(max_dd_pct, 2),
+        time_dd_bars=int(time_dd_bars),
+        bars=int(len(df_prices)),
+        atr_bars=0,
+        setups_long=int(df_prices.get("enter_long", pd.Series(dtype=bool)).sum() if len(df_prices) else 0),
+        setups_short=0,
+        profile=profile,
     )
+    return summary
+
+
+# ------------------------
+# Public API
+# ------------------------
+def run_backtest(prices: pd.DataFrame,
+                 cfg: dict,
+                 profile: str = "loose",
+                 use_block: str = "") -> tuple[dict, pd.DataFrame, pd.Series]:
+    """
+    Main entry used by tools/run_backtest.py
+    Returns: (summary_dict, trades_df, equity_series)
+    """
+    if prices is None or len(prices) == 0:
+        # empty inputs -> empty outputs
+        empty = pd.DataFrame(), pd.Series(dtype=float)
+        return _summarize(pd.DataFrame(), *empty, cfg, profile), *empty
+
+    # 1) build indicators & signals
+    df = prepare_signals(prices, cfg, profile=profile)
+
+    # 2) simulate
+    trades_df, equity_ser = _simulate(df, cfg, profile)
+
+    # 3) summarize
+    summary = _summarize(df, trades_df, equity_ser, cfg, profile)
+
     return summary, trades_df, equity_ser
