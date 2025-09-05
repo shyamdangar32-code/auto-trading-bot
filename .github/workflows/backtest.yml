@@ -1,15 +1,8 @@
 name: Backtest
 
+# ✅ Manual only
 on:
   workflow_dispatch: {}
-
-# top-level env → compare job ને પણ મળે
-env:
-  ZERODHA_API_KEY:       ${{ secrets.ZERODHA_API_KEY }}
-  ZERODHA_API_SECRET:    ${{ secrets.ZERODHA_API_SECRET }}
-  ZERODHA_ACCESS_TOKEN:  ${{ secrets.ZERODHA_ACCESS_TOKEN }}
-  TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
-  TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
 
 jobs:
   run-backtest:
@@ -23,8 +16,16 @@ jobs:
         profile: [loose, medium, strict]
 
     env:
+      # --- Secrets (repo → Settings → Secrets and variables → Actions) ---
+      ZERODHA_API_KEY:       ${{ secrets.ZERODHA_API_KEY }}
+      ZERODHA_API_SECRET:    ${{ secrets.ZERODHA_API_SECRET }}
+      ZERODHA_ACCESS_TOKEN:  ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+      TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      # --- Default run params ---
       UNDERLYING: NIFTY
-      INTERVAL: "minute"   # (safe alias; તમારા script માં "1m" support હોય તો બદલી શકો)
+      INTERVAL: "1m"
 
     steps:
       - name: Checkout repo
@@ -45,6 +46,7 @@ jobs:
 
       - name: Compute date range (last 365 days)
         id: dates
+        shell: bash
         run: |
           END=$(date -u +%F)
           START=$(date -u -d "$END -365 days" +%F)
@@ -54,7 +56,7 @@ jobs:
       - name: Run backtest (${{ matrix.profile }})
         run: |
           mkdir -p reports logs
-          python tools/run_backtest.py \
+          python -m tools.run_backtest \
             --underlying "${UNDERLYING}" \
             --start "${{ steps.dates.outputs.start }}" \
             --end   "${{ steps.dates.outputs.end }}" \
@@ -73,55 +75,6 @@ jobs:
             logs/**
           if-no-files-found: warn
           retention-days: 7
-
-      - name: Telegram summary (${{ matrix.profile }})
-        if: ${{ success() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
-        env:
-          START: ${{ steps.dates.outputs.start }}
-          END:   ${{ steps.dates.outputs.end }}
-          PROFILE: ${{ matrix.profile }}
-        run: |
-          python - <<'PY'
-          import json, os, pathlib
-          prof = os.environ.get("PROFILE","").strip()
-          mpath = f"reports/{prof}/metrics.json"
-          m = json.load(open(mpath,"r",encoding="utf-8"))
-          und   = os.environ.get("UNDERLYING","NIFTY")
-          itv   = os.environ.get("INTERVAL","minute")
-          start = os.environ.get("START","")
-          end   = os.environ.get("END","")
-          lines = [
-            f"Backtest Summary (SUCCESS) — profile: {prof}",
-            f"Underlying: {und}   Interval: {itv}",
-            f"Period: {start} -> {end}",
-            f"Trades: {m.get('n_trades',0)}   Win-rate: {m.get('win_rate',0)}%",
-            f"ROI: {m.get('roi_pct',0)}%   PF: {m.get('profit_factor',0)}",
-            f"R:R: {m.get('rr',0)}   Sharpe: {m.get('sharpe_ratio',0)}",
-            f"Max DD: {m.get('max_dd_pct',0)}%   Time DD: {m.get('time_dd_bars',0)} bars",
-            f"Bars: {m.get('n_bars',0)}   ATR-bars: {m.get('atr_bars',0)}",
-            f"Setups: long={m.get('setups_long',0)} short={m.get('setups_short',0)}  Trades taken: {m.get('n_trades',0)}",
-          ]
-          payload = {
-            "chat_id": os.environ["TELEGRAM_CHAT_ID"],
-            "text": "\n".join(lines),
-            "disable_web_page_preview": True
-          }
-          pathlib.Path("payload.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-          PY
-
-          CURL="https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}"
-          curl -s -X POST -H "Content-Type: application/json" \
-               -d @payload.json "$CURL/sendMessage" | tee telegram_response_${{ matrix.profile }}.json
-          if [ -f reports/${{ matrix.profile }}/equity_curve.png ]; then
-            curl -s -F chat_id="${TELEGRAM_CHAT_ID}" \
-                    -F photo="@reports/${{ matrix.profile }}/equity_curve.png" \
-                 "$CURL/sendPhoto" >/dev/null
-          fi
-          if [ -f reports/${{ matrix.profile }}/drawdown.png ]; then
-            curl -s -F chat_id="${TELEGRAM_CHAT_ID}" \
-                    -F photo="@reports/${{ matrix.profile }}/drawdown.png" \
-                 "$CURL/sendPhoto" >/dev/null
-          fi
 
   compare:
     name: Compare (loose vs medium vs strict)
@@ -154,11 +107,3 @@ jobs:
           name: backtest-comparison
           path: comparison.txt
           if-no-files-found: warn
-
-      - name: Telegram comparison
-        if: ${{ env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
-        run: |
-          TXT=$(cat comparison.txt)
-          curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TELEGRAM_CHAT_ID}" \
-            --data-urlencode text="$TXT" >/dev/null
