@@ -2,183 +2,122 @@
 from __future__ import annotations
 
 import os
-import time
-import math
-from typing import Dict, List, Tuple
-from datetime import datetime, timedelta, date
-
 import pandas as pd
 
-# Zerodha KiteConnect (requirements.txt માં હોવું જોઈએ)
-try:
-    from kiteconnect import KiteConnect
-except Exception:
-    KiteConnect = None  # GitHub Actions માં missing હોય તો clear error ઉઠાડી દઈએ
+# NOTE: kiteconnect is already in requirements for this repo. If not, add it there.
+from kiteconnect import KiteConnect
 
 
-# ---- Helpers -----------------------------------------------------------------
+# --- Helpers -----------------------------------------------------------------
 
-_INSTRUMENT_TOKEN_MAP: Dict[str, int] = {
-    # Common indices
+_INSTRUMENT_TOKENS = {
+    # Index tokens on Zerodha
     "NIFTY": 256265,       # NIFTY 50 index
-    "BANKNIFTY": 260105,   # BANKNIFTY index
-    # તમે માટે જરૂર હોય તો અહીં વધારાના symbols ઉમેરો
-}
-
-_INTERVAL_MAP: Dict[str, str] = {
-    "1m": "minute",
-    "1min": "minute",
-    "minute": "minute",
-    "3m": "3minute",
-    "5m": "5minute",
-    "10m": "10minute",
-    "15m": "15minute",
-    "30m": "30minute",
-    "60m": "60minute",
-    "day": "day",
-    "1d": "day",
-    "daily": "day",
+    "NIFTY 50": 256265,
+    "NSE:NIFTY 50": 256265,
+    "BANKNIFTY": 260105,   # NIFTY BANK index
+    "NIFTY BANK": 260105,
+    "NSE:NIFTY BANK": 260105,
 }
 
 
-def _parse_date(s: str) -> datetime:
-    """Accepts 'YYYY-MM-DD' or full ISO. Returns naive UTC datetime."""
-    if isinstance(s, datetime):
-        return s
-    if isinstance(s, date):
-        return datetime(s.year, s.month, s.day)
-    try:
-        return datetime.fromisoformat(s)
-    except Exception:
-        # last resort: YYYY-MM-DD
-        return datetime.strptime(s, "%Y-%m-%d")
+def _normalize_symbol(symbol: str) -> str:
+    if not symbol:
+        return "NIFTY"
+    s = symbol.upper().replace("_", " ").strip()
+    # common aliases
+    if s in ("NIFTY50", "NIFTY-50"):
+        return "NIFTY 50"
+    if s in ("BANKNIFTY", "NIFTYBANK", "NIFTY-BANK"):
+        return "NIFTY BANK"
+    return s
 
 
-def _init_kite() -> KiteConnect:
-    if KiteConnect is None:
-        raise RuntimeError("kiteconnect library not available. Add 'kiteconnect' to requirements.txt")
-
-    api_key = os.environ.get("ZERODHA_API_KEY", "").strip()
-    access_token = os.environ.get("ZERODHA_ACCESS_TOKEN", "").strip()
-    if not api_key or not access_token:
-        raise RuntimeError("Missing ZERODHA_API_KEY / ZERODHA_ACCESS_TOKEN in environment.")
-
-    kite = KiteConnect(api_key=api_key)
-    kite.set_access_token(access_token)
-    return kite
-
-
-def _chunk_ranges(start: datetime, end: datetime, days_per_chunk: int) -> List[Tuple[datetime, datetime]]:
+def _map_interval(interval: str) -> str:
     """
-    Zerodha rate-limits historical endpoint. Break the full range into chunks.
+    Map friendly intervals to Kite historical API values.
+    Accepts: '1m','3m','5m','10m','15m','30m','60m','day','week','month'
     """
-    out: List[Tuple[datetime, datetime]] = []
-    cur = start
-    delta = timedelta(days=days_per_chunk)
-    while cur < end:
-        nxt = min(cur + delta, end)
-        out.append((cur, nxt))
-        cur = nxt
-    return out
+    if not interval:
+        return "day"
+    itv = interval.lower().strip()
+    mapping = {
+        "1m": "minute",
+        "3m": "3minute",
+        "5m": "5minute",
+        "10m": "10minute",
+        "15m": "15minute",
+        "30m": "30minute",
+        "60m": "60minute",
+        "1h": "60minute",
+        "day": "day",
+        "d": "day",
+        "week": "week",
+        "w": "week",
+        "month": "month",
+        "mo": "month",
+        "m": "minute",   # fallback if someone passes just 'm'
+    }
+    return mapping.get(itv, itv)
 
 
-# ---- Public API ---------------------------------------------------------------
+# --- Public API ---------------------------------------------------------------
 
-def get_zerodha_ohlc(
-    symbol: str,
-    start: str | datetime,
-    end: str | datetime,
-    interval: str = "1m",
-    tz: str = "Asia/Kolkata",
-) -> pd.DataFrame:
+def get_zerodha_ohlc(symbol: str, start: str, end: str, interval: str = "day") -> pd.DataFrame:
     """
-    Fetch OHLC from Zerodha historical endpoint and return a pandas DataFrame
-    indexed by tz-aware timestamps with columns: Open, High, Low, Close, Volume.
+    Fetch OHLC from Zerodha historical API for index symbols (NIFTY/BANKNIFTY).
+    Credentials are read from environment:
+        ZERODHA_API_KEY
+        ZERODHA_ACCESS_TOKEN
+    (SECRET is not required for historical endpoint once access token is set)
 
-    Args:
-        symbol: e.g. "NIFTY", "BANKNIFTY" (mapped to instrument tokens here)
-        start, end: "YYYY-MM-DD" or datetime
-        interval: e.g. "1m", "5m", "15m", "day"
-        tz: timezone for index (default Asia/Kolkata)
+    Parameters
+    ----------
+    symbol : str      e.g. 'NIFTY', 'BANKNIFTY'
+    start  : 'YYYY-MM-DD'
+    end    : 'YYYY-MM-DD'
+    interval : str    e.g. '1m', '5m', '15m', 'day', ...
+
+    Returns
+    -------
+    pd.DataFrame indexed by datetime with columns:
+      Open, High, Low, Close, Volume
     """
-    itoken = _INSTRUMENT_TOKEN_MAP.get(symbol.upper())
-    if not itoken:
-        raise RuntimeError(f"Unknown symbol '{symbol}'. Please add instrument token in data_io._INSTRUMENT_TOKEN_MAP")
+    sym = _normalize_symbol(symbol)
+    token = _INSTRUMENT_TOKENS.get(sym)
+    if token is None:
+        raise ValueError(f"Unknown/unsupported symbol for Zerodha historicals: {symbol}")
 
-    intrv = _INTERVAL_MAP.get(interval, interval)
+    kite = KiteConnect(api_key=os.environ["ZERODHA_API_KEY"])
+    # Access token must be generated outside and provided via secrets
+    kite.set_access_token(os.environ["ZERODHA_ACCESS_TOKEN"])
 
-    sdt = _parse_date(start)
-    edt = _parse_date(end)
+    itv = _map_interval(interval)
 
-    kite = _init_kite()
+    # Convert dates to pandas Timestamps (Kite accepts naive datetimes)
+    st = pd.to_datetime(start)
+    en = pd.to_datetime(end)
 
-    # Kite historical limits:
-    #  - minute data typically limited per call (around 30–45 days). Use 30 to be safe.
-    #  - daily can be much larger; but keep a sane chunk too.
-    chunk_days = 30 if "minute" in intrv else 365
-    ranges = _chunk_ranges(sdt, edt, chunk_days)
+    data = kite.historical_data(
+        instrument_token=token,
+        from_date=st.to_pydatetime(),
+        to_date=en.to_pydatetime(),
+        interval=itv,
+        continuous=False,
+        oi=False,
+    )
 
-    frames: List[pd.DataFrame] = []
-    for i, (a, b) in enumerate(ranges, start=1):
-        # Kite expects inclusive ranges; keep slight +1min padding on end
-        try:
-            data = kite.historical_data(
-                instrument_token=itoken,
-                from_date=a,
-                to_date=b,
-                interval=intrv,
-                continuous=False,
-                oi=False,
-            )
-        except Exception as e:
-            # rate-limit/backoff: log & continue
-            print(f"⚠️  Skip {a.date()}→{b.date()}: {e}")
-            # tiny backoff to be gentle
-            time.sleep(0.6)
-            continue
+    if not data:
+        # Return empty well-formed frame to let the caller handle "No metrics found"
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
 
-        if not data:
-            continue
-
-        df = pd.DataFrame(data)
-        # standardize column names
-        rename = {
-            "date": "DateTime",
-            "open": "Open",
-            "high": "High",
-            "low": "Low",
-            "close": "Close",
-            "volume": "Volume",
-        }
-        df = df.rename(columns=rename)
-        # convert timezone
-        if "DateTime" in df.columns:
-            dt = pd.to_datetime(df["DateTime"], utc=True)
-            try:
-                # convert to given timezone while keeping unique index
-                dt = dt.dt.tz_convert(tz)
-            except Exception:
-                # if naive → localize then convert
-                dt = dt.dt.tz_localize("UTC").dt.tz_convert(tz)
-            df.index = dt
-            df = df.drop(columns=["DateTime"])
-
-        # ensure core columns exist
-        for c in ["Open", "High", "Low", "Close", "Volume"]:
-            if c not in df.columns:
-                df[c] = pd.NA
-
-        frames.append(df[["Open", "High", "Low", "Close", "Volume"]])
-
-        # small sleep to reduce "Too many requests"
-        time.sleep(0.25)
-
-    if not frames:
-        raise RuntimeError(f"No OHLC data returned for {symbol} {sdt.date()}→{edt.date()} ({intrv}).")
-
-    out = pd.concat(frames).sort_index()
-
-    # Deduplicate if API sent overlapping bars
-    out = out[~out.index.duplicated(keep="last")]
-
-    return out
+    df = pd.DataFrame(data)
+    # Zerodha returns keys: date, open, high, low, close, volume
+    df.rename(
+        columns={"date": "Date", "open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"},
+        inplace=True,
+    )
+    df["Date"] = pd.to_datetime(df["Date"])
+    df.set_index("Date", inplace=True)
+    df = df[["Open", "High", "Low", "Close", "Volume"]].sort_index()
+    return df
