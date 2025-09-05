@@ -1,169 +1,225 @@
 # bot/backtest.py
 from __future__ import annotations
+
+import json
+import math
 from dataclasses import dataclass
-from typing import Tuple, Dict
+from datetime import time as dtime
+from typing import Dict, Tuple
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-from bot.strategy import prepare_signals
-
-
-# ------------------------
-# Session helper (FIX for Pandas Timestamp 'year' error)
-# ------------------------
-def _parse_hhmm(hhmm: str) -> pd.Timestamp:
-    # robust: accepts "9:20", "09:20", "09:20:00"
-    hhmm = (hhmm or "").strip()
-    # stick an arbitrary date to make a full timestamp
-    return pd.to_datetime(f"2000-01-01 {hhmm}", format="%Y-%m-%d %H:%M", errors="coerce")
-
-def _within_session(ts: pd.Timestamp, sess_s: str, sess_e: str) -> bool:
-    if pd.isna(ts):
-        return False
-    sh = _parse_hhmm(sess_s)
-    eh = _parse_hhmm(sess_e)
-    if pd.isna(sh) or pd.isna(eh):
-        return True  # if misconfigured, don't block
-    t = pd.to_datetime(f"2000-01-01 {ts.time()}")
-    return (t.time() >= sh.time()) and (t.time() <= eh.time())
+import matplotlib
+matplotlib.use("Agg")  # headless
+import matplotlib.pyplot as plt
 
 
-# ------------------------
-# Very small trade engine (long-only)
-# ------------------------
+# -------------------------
+# Helpers
+# -------------------------
+
+def _parse_hhmm(s: str) -> dtime:
+    h, m = s.split(":")
+    return dtime(int(h), int(m))
+
+def _within_session(ts: pd.Timestamp, sess_start: str, sess_end: str) -> bool:
+    """
+    Pandas 2.x પર pd.Timestamp(hour=9,minute=15) થી error આવતો હતો,
+    એટલા માટે datetime.time થી compare કરીએ છીએ.
+    """
+    tt = ts.tz_convert(None).time() if ts.tzinfo else ts.time()
+    s = _parse_hhmm(sess_start)
+    e = _parse_hhmm(sess_end)
+    return (tt >= s) and (tt <= e)
+
+
 @dataclass
-class BTState:
-    in_pos: bool = False
+class Position:
+    side: str = ""         # "long" only for now
     entry_px: float = 0.0
+    sl_px: float = 0.0
+    tp_px: float = 0.0
+    qty: int = 0
+    entry_ts: pd.Timestamp | None = None
 
-def _simulate(df: pd.DataFrame, cfg: dict, profile: str) -> Tuple[pd.DataFrame, pd.Series]:
+
+# -------------------------
+# Engine
+# -------------------------
+
+def run_backtest(df: pd.DataFrame, cfg: dict, use_block: str = "backtest_loose"):
     """
-    Very small long-only backtest using prepared entry/exit hints.
-    Produces trades dataframe and equity curve (by closed trades).
+    Very simple long-only engine using SL/TP in ATR multiples. Exits at SL/TP or end-of-day.
+    Returns: (summary: dict, trades_df: DataFrame, equity_ser: Series)
+    df must already include columns from prepare_signals(): enter_long, atr, etc.
     """
-    st = BTState()
+    df = df.copy()
+
+    # parameters
+    bcfg = (cfg.get("backtest") or {})
+    sess_s = (bcfg.get("filters", {}) or {}).get("session_start", bcfg.get("session_start", "09:20"))
+    sess_e = (bcfg.get("filters", {}) or {}).get("session_end",   bcfg.get("session_end",   "15:20"))
+    stop_mult = float(((bcfg.get("exits") or {}).get("stop_atr_mult", cfg.get("stop_atr_mult", 1.0))))
+    take_mult = float(((bcfg.get("exits") or {}).get("take_atr_mult", cfg.get("take_atr_mult", 1.3))))
+
+    capital = float(cfg.get("capital_rs", 100000.0))
+    qty     = int(cfg.get("order_qty", 1))
+
+    # local state
+    pos = None
+    cash = capital
+    eq_curve = []
     trades = []
-    equity = []
-    cash = float(cfg.get("capital_rs", 100000.0))
-    qty = int(cfg.get("order_qty", 1))
-
-    sess_s = (cfg.get("backtest") or {}).get("session_start", "09:20")
-    sess_e = (cfg.get("backtest") or {}).get("session_end", "15:20")
 
     for ts, row in df.iterrows():
+        # session filter
         if not _within_session(ts, sess_s, sess_e):
+            # square-off at session end
+            if pos is not None:
+                pnl = (row["Close"] - pos.entry_px) * pos.qty
+                cash += pnl
+                trades.append(dict(
+                    entry_ts=pos.entry_ts, exit_ts=ts, side="long",
+                    entry=pos.entry_px, exit=row["Close"], qty=pos.qty, pnl=pnl
+                ))
+                pos = None
+            eq_curve.append((ts, cash))
             continue
 
-        px = float(row["Close"])
-        # enter
-        if (not st.in_pos) and bool(row.get("enter_long", False)):
-            st.in_pos = True
-            st.entry_px = px
+        # entry
+        if pos is None and bool(row.get("enter_long", False)):
+            entry = float(row["Close"])
+            atr   = float(row.get("atr", 0.0))
+            sl    = entry - stop_mult * atr
+            tp    = entry + take_mult * atr
+            pos = Position(side="long", entry_px=entry, sl_px=sl, tp_px=tp, qty=qty, entry_ts=ts)
 
-        # exit
-        if st.in_pos and bool(row.get("exit_long_hint", False)):
-            pnl = (px - st.entry_px) * qty
-            trades.append({"ts": ts, "entry": st.entry_px, "exit": px, "pnl": pnl})
-            cash += pnl
-            equity.append(cash)
-            st = BTState()  # reset
+        # manage open
+        if pos is not None:
+            low = float(row.get("Low", row["Close"]))
+            high = float(row.get("High", row["Close"]))
+            exit_px = None
+            reason = None
+            if low <= pos.sl_px:
+                exit_px = pos.sl_px; reason = "SL"
+            elif high >= pos.tp_px:
+                exit_px = pos.tp_px; reason = "TP"
 
-    # if open trade at end, mark-to-close
-    if st.in_pos:
-        px = float(df["Close"].iloc[-1])
-        pnl = (px - st.entry_px) * qty
-        trades.append({"ts": df.index[-1], "entry": st.entry_px, "exit": px, "pnl": pnl})
+            if exit_px is not None:
+                pnl = (exit_px - pos.entry_px) * pos.qty
+                cash += pnl
+                trades.append(dict(
+                    entry_ts=pos.entry_ts, exit_ts=ts, side="long",
+                    entry=pos.entry_px, exit=exit_px, qty=pos.qty, pnl=pnl, reason=reason
+                ))
+                pos = None
+
+        eq_curve.append((ts, cash))
+
+    # finalize: square-off if still open at last bar
+    if pos is not None:
+        last_ts = df.index[-1]
+        last_px = float(df.iloc[-1]["Close"])
+        pnl = (last_px - pos.entry_px) * pos.qty
         cash += pnl
-        equity.append(cash)
-        st = BTState()
+        trades.append(dict(
+            entry_ts=pos.entry_ts, exit_ts=last_ts, side="long",
+            entry=pos.entry_px, exit=last_px, qty=pos.qty, pnl=pnl, reason="EOD"
+        ))
+        pos = None
+        eq_curve[-1] = (last_ts, cash)
+
+    equity_ser = pd.Series({ts: val for ts, val in eq_curve}).sort_index()
+    base = capital
+    ret = (equity_ser.iloc[-1] - base) / base if len(equity_ser) else 0.0
 
     trades_df = pd.DataFrame(trades)
-    equity_ser = pd.Series(equity, name="equity")
+    win = float((trades_df["pnl"] > 0).mean()*100) if not trades_df.empty else 0.0
+    rr  = (trades_df.loc[trades_df["pnl"]>0,"pnl"].mean() / abs(trades_df.loc[trades_df["pnl"]<0,"pnl"].mean())) if ((trades_df["pnl"]>0).any() and (trades_df["pnl"]<0).any()) else 0.0
+    pf  = (trades_df.loc[trades_df["pnl"]>0,"pnl"].sum() / abs(trades_df.loc[trades_df["pnl"]<0,"pnl"].sum())) if ((trades_df["pnl"]>0).any() and (trades_df["pnl"]<0).any()) else 0.0
 
-    return trades_df, equity_ser
-
-
-def _summarize(df_prices: pd.DataFrame,
-               trades_df: pd.DataFrame,
-               equity_ser: pd.Series,
-               cfg: dict,
-               profile: str) -> Dict:
-    """
-    Build a summary dict (keys used by reports).
-    """
-    trades = len(trades_df)
-    wins = int((trades_df["pnl"] > 0).sum()) if trades else 0
-    win_rate = (wins / trades * 100.0) if trades else 0.0
-    roi = 0.0
-    pf = 0.0
-    rr = 0.0
-    sharpe = -0.00
-    max_dd_pct = 0.0
-    time_dd_bars = len(df_prices)
-
-    if trades:
-        gross_p = trades_df.loc[trades_df["pnl"] > 0, "pnl"].sum()
-        gross_l = -trades_df.loc[trades_df["pnl"] < 0, "pnl"].sum()
-        pf = (gross_p / gross_l) if gross_l > 0 else 0.0
-        rr = (abs(trades_df["pnl"].mean()) / (trades_df["pnl"].abs().mean() + 1e-9)) if trades else 0.0
-
-        start_cap = float(cfg.get("capital_rs", 100000.0))
-        end_cap = equity_ser.iloc[-1] if len(equity_ser) else start_cap
-        roi = (end_cap - start_cap) / start_cap * 100.0
-
-        # rough drawdown from equity
-        if len(equity_ser):
-            roll_max = equity_ser.cummax()
-            dd = (equity_ser - roll_max)
-            max_dd_abs = dd.min() if len(dd) else 0.0
-            max_dd_pct = (max_dd_abs / start_cap) * 100.0
+    # drawdown
+    roll_max = equity_ser.cummax()
+    dd = equity_ser - roll_max
+    max_dd = float((dd.min() / base) * 100) if len(dd) else 0.0
 
     summary = dict(
-        underlying=cfg.get("underlying", "NIFTY"),
-        interval="1m",
-        period_start=str(df_prices.index.min())[:10] if len(df_prices) else "",
-        period_end=str(df_prices.index.max())[:10] if len(df_prices) else "",
-        trades=trades,
-        win_rate_pct=round(win_rate, 2),
-        roi_pct=round(roi, 2),
-        pf=round(pf, 2),
+        n_trades=int(len(trades_df)),
+        win_rate=round(win, 2),
+        roi_pct=round(ret*100, 2),
+        profit_factor=round(pf, 2),
         rr=round(rr, 2),
-        sharpe=round(sharpe, 2),
-        max_dd_pct=round(max_dd_pct, 2),
-        time_dd_bars=int(time_dd_bars),
-        bars=int(len(df_prices)),
-        atr_bars=0,
-        setups_long=int(df_prices.get("enter_long", pd.Series(dtype=bool)).sum() if len(df_prices) else 0),
+        sharpe_ratio=round(0.0, 2),        # placeholder
+        max_dd_pct=round(max_dd, 2),
+        time_dd_bars=int((dd == dd.min()).sum()) if len(dd) else 0,
+        n_bars=int(len(df)),
+        atr_bars=int((df.get("atr", pd.Series([])) > 0).sum()),
+        setups_long=int(df.get("enter_long", pd.Series([])).sum()),
         setups_short=0,
-        profile=profile,
     )
-    return summary
-
-
-# ------------------------
-# Public API
-# ------------------------
-def run_backtest(prices: pd.DataFrame,
-                 cfg: dict,
-                 profile: str = "loose",
-                 use_block: str = "") -> tuple[dict, pd.DataFrame, pd.Series]:
-    """
-    Main entry used by tools/run_backtest.py
-    Returns: (summary_dict, trades_df, equity_series)
-    """
-    if prices is None or len(prices) == 0:
-        # empty inputs -> empty outputs
-        empty = pd.DataFrame(), pd.Series(dtype=float)
-        return _summarize(pd.DataFrame(), *empty, cfg, profile), *empty
-
-    # 1) build indicators & signals
-    df = prepare_signals(prices, cfg, profile=profile)
-
-    # 2) simulate
-    trades_df, equity_ser = _simulate(df, cfg, profile)
-
-    # 3) summarize
-    summary = _summarize(df, trades_df, equity_ser, cfg, profile)
 
     return summary, trades_df, equity_ser
+
+
+# -------------------------
+# Reporting
+# -------------------------
+
+def _plot_equity(equity: pd.Series, out: str):
+    if equity.empty:
+        return
+    plt.figure()
+    equity.plot()
+    plt.title("Equity Curve")
+    plt.xlabel("Trade #")
+    plt.ylabel("Equity (₹)")
+    plt.tight_layout()
+    plt.savefig(out)
+    plt.close()
+
+def _plot_drawdown(equity: pd.Series, out: str):
+    if equity.empty:
+        return
+    roll_max = equity.cummax()
+    dd = equity - roll_max
+    plt.figure()
+    dd.plot()
+    plt.title("Drawdown (₹)")
+    plt.xlabel("Trade #")
+    plt.ylabel("Drawdown")
+    plt.tight_layout()
+    plt.savefig(out)
+    plt.close()
+
+def save_reports(outdir, summary: Dict, trades_df: pd.DataFrame, equity_ser: pd.Series):
+    outdir = pd.Path(outdir) if isinstance(outdir, str) else outdir
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # files
+    (outdir / "metrics.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+
+    if not equity_ser.empty:
+        equity_ser.to_csv(outdir / "equity.csv", header=["equity"], index_label="ts")
+
+    if not trades_df.empty:
+        trades_df.to_csv(outdir / "trades.csv", index=False)
+
+    # charts
+    _plot_equity(equity_ser, outdir / "equity_curve.png")
+    _plot_drawdown(equity_ser, outdir / "drawdown.png")
+
+    # simple markdown
+    lines = [
+        "# Backtest Report",
+        "",
+        f"**Trades:** {summary.get('n_trades',0)}",
+        f"**Win-rate:** {summary.get('win_rate',0)}%",
+        f"**ROI:** {summary.get('roi_pct',0)}%",
+        f"**PF:** {summary.get('profit_factor',0)}",
+        f"**R:R:** {summary.get('rr',0)}",
+        f"**Max DD:** {summary.get('max_dd_pct',0)}%",
+        "",
+        "Charts: `equity_curve.png`, `drawdown.png`",
+    ]
+    (outdir / "report.md").write_text("\n".join(lines), encoding="utf-8")
