@@ -76,6 +76,13 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      - name: Telegram summary (${{ matrix.profile }})
+        if: ${{ success() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
+        run: |
+          python tools/telegram_notify.py \
+            --dir "./reports/${{ matrix.profile }}" \
+            --title "Backtest ${{ matrix.profile }} • ${UNDERLYING} • ${INTERVAL}"
+
   compare:
     name: Compare (loose vs medium vs strict)
     runs-on: ubuntu-latest
