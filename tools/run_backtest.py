@@ -7,6 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from bot.data_io import get_zerodha_ohlc
+from bot.strategy import prepare_signals          # <-- ADD THIS
 from bot.backtest import run_backtest, save_reports
 
 
@@ -50,12 +51,23 @@ def main() -> None:
         "order_qty": int(args.order_qty),
         "paper_trading": True,
         "live_trading": False,
+        "backtest": {},  # optional tuning goes here
     }
 
-    print(f"⚙️  Trade config: {{'order_qty': {cfg['order_qty']}, 'capital_rs': {cfg['capital_rs']}}}")
-    print(f"🧱 Using profile/block: {args.use_block}")
+    # ---- Map block → profile ----
+    profile = "loose"
+    if args.use_block.endswith("medium"):
+        profile = "medium"
+    elif args.use_block.endswith("strict"):
+        profile = "strict"
 
-    summary, trades_df, equity_ser = run_backtest(prices, cfg, use_block=args.use_block)
+    # ---- Prepare signals ----
+    df = prepare_signals(prices, cfg, profile=profile)
+
+    print(f"⚙️  Trade config: {{'order_qty': {cfg['order_qty']}, 'capital_rs': {cfg['capital_rs']}}}")
+    print(f"🧱 Using profile/block: {args.use_block} (signals profile='{profile}')")
+
+    summary, trades_df, equity_ser = run_backtest(df, cfg, use_block=args.use_block)
 
     save_reports(outdir=outdir, summary=summary, trades_df=trades_df, equity_ser=equity_ser)
 
