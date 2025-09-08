@@ -1,8 +1,8 @@
 # Core data/TA
 pandas>=2.2.2
-numpy>=2.0
+numpy>=1.24,<2.0        # NumPy 2.x એવોઇડ for TA stacks
 ta==0.11.0
-pandas-ta>=0.3.14b # extra indicators (optional but handy)
+pandas-ta==0.3.14b0     # correct beta tag; wheels exist
 
 # Broker & auth (Zerodha)
 kiteconnect==5.0.1
@@ -13,14 +13,8 @@ PyYAML>=6.0.1
 # Time & calendars (intraday trading windows)
 python-dateutil>=2.8.2
 pytz>=2020.1
-tzdata>=2022.1
-pandas-market-calendars>=4.4.1   # NSE/NFO trading sessions
 
-# Options math (pricing & Greeks)
-scipy>=1.11.0           # Black–Scholes, Greeks
-numpy-financial>=1.0.0  # IRR/NPV helpers (optional for risk)
-
-# Logging/ops
+# Logging & cache
 loguru>=0.7.2
 cachetools>=5.3.3
 
@@ -33,5 +27,5 @@ pytest>=7.4.4
 # Tables (needed for Pandas .to_markdown)
 tabulate>=0.9.0
 
-# ---- Optional (leave if you still want Yahoo anywhere) ----
+# ---- Optional (leave commented if unused) ----
 # yfinance==0.2.43
