@@ -56,16 +56,38 @@ backtest:
   brokerage_flat: 20.0
   brokerage_pct: 0.0003
 
-  # Strategy mirrors
+  # === STRATEGY SWITCH (NEW) ===
+  strategy: intraday_rsi        # or: ema_rsi_adx
+
+  # --- RSI params (NEW for intraday_rsi) ---
+  rsi_len: 14
+  rsi_overbought: 70
+  rsi_oversold: 30
+
+  # --- EMA (for HTF filter) ---
   ema_fast: 21
   ema_slow: 50
-  rsi_len: 14
-  rsi_buy: 52
-  rsi_sell: 48
-  atr_len: 14
-  ema_poke_pct: 0.0001
 
-  # quality filters (default; profile presets may tighten/loosen)
+  # --- ATR / SL-TP (UPDATED keys) ---
+  atr_len: 14
+  atr_mult_sl: 1.8              # NEW (instead of stop_atr_mult)
+  atr_mult_tp: 2.5              # NEW (instead of take_atr_mult)
+
+  # --- Risk & Capital (NEW) ---
+  risk_perc: 0.002              # 0.2% per trade
+  order_qty: 1
+  capital_rs: 100000
+
+  # --- Behaviour controls (NEW) ---
+  allow_shorts: false           # long-only
+  trend_filter: true            # enable HTF EMA filter
+  htf_minutes: 5                # higher timeframe minutes
+
+  min_hold_bars: 5              # force hold >= 5 bars
+  cooldown_bars: 3              # block immediate re-entries
+  trail_after_hold: true        # allow trailing only after min_hold
+
+  # --- Quality filters (existing) ---
   filters:
     adx_len: 14
     adx_min: 15
@@ -86,9 +108,23 @@ backtest:
     stop_after_target_rs: 4000
 
   exits:
-    stop_atr_mult: 1.0
+    stop_atr_mult: 1.0          # legacy, safe to keep
     take_atr_mult: 1.3
     trail:
       type: "atr"
       atr_mult: 1.0
       step_bars: 3
+
+# ---- Profile overrides (optional) ----
+backtest_loose:
+  atr_mult_sl: 1.8
+  atr_mult_tp: 2.6
+
+backtest_medium:
+  atr_mult_sl: 1.9
+  atr_mult_tp: 2.4
+
+backtest_strict:
+  atr_mult_sl: 2.0
+  atr_mult_tp: 2.3
+  min_hold_bars: 6
