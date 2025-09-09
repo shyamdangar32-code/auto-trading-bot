@@ -1,4 +1,4 @@
-# bot/strategy.py
+# bot/strategy.py (PATCHED: unified strategies in one file)
 from __future__ import annotations
 
 import math
@@ -8,134 +8,186 @@ from typing import Dict, Literal, Optional
 import numpy as np
 import pandas as pd
 
-# ---- try using repo's indicators helpers; fall back to local impls ----
 try:
-    # your repo already has these
     from .indicators import ema, rsi, atr, adx  # type: ignore
 except Exception:
-    # lightweight fallbacks (if import path differs)
-    def ema(series: pd.Series, length: int) -> pd.Series:
-        return series.ewm(span=length, adjust=False).mean()
-
-    def rsi(series: pd.Series, length: int = 14) -> pd.Series:
-        delta = series.diff()
-        up = delta.clip(lower=0).rolling(length).mean()
-        down = -delta.clip(upper=0).rolling(length).mean()
-        rs = up / (down.replace(0, np.nan))
-        out = 100 - (100 / (1 + rs))
-        return out.fillna(50)
-
-    def atr(h: pd.Series, l: pd.Series, c: pd.Series, length: int = 14) -> pd.Series:
-        hl = (h - l).abs()
-        hc = (h - c.shift()).abs()
-        lc = (l - c.shift()).abs()
-        tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    def ema(s: pd.Series, length: int) -> pd.Series:
+        return s.ewm(span=length, adjust=False).mean()
+    def rsi(close: pd.Series, length: int = 14) -> pd.Series:
+        delta = close.diff()
+        gain = delta.where(delta > 0, 0.0).rolling(length).mean()
+        loss = -delta.where(delta < 0, 0.0).rolling(length).mean().replace(0, np.nan)
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
+    def atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
+        prev_close = close.shift(1)
+        tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
         return tr.rolling(length).mean()
-
-    def adx(h: pd.Series, l: pd.Series, c: pd.Series, length: int = 14) -> pd.Series:
-        # very compact ADX approximation
-        up = h.diff()
-        down = -l.diff()
-        plus_dm = np.where((up > down) & (up > 0), up, 0.0)
-        minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-        tr = atr(h, l, c, 1)
-        plus_di = 100 * pd.Series(plus_dm, index=h.index).ewm(span=length, adjust=False).mean() / tr.replace(0, np.nan)
-        minus_di = 100 * pd.Series(minus_dm, index=h.index).ewm(span=length, adjust=False).mean() / tr.replace(0, np.nan)
+    def adx(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
+        up = high.diff()
+        dn = -low.diff()
+        plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
+        minus_dm = np.where((dn > up) & (dn > 0), dn, 0.0)
+        trur = atr(high, low, close, length)
+        plus_di = 100 * pd.Series(plus_dm, index=high.index).rolling(length).mean() / trur
+        minus_di = 100 * pd.Series(minus_dm, index=high.index).rolling(length).mean() / trur
         dx = (abs(plus_di - minus_di) / (plus_di + minus_di)).replace([np.inf, -np.inf], np.nan) * 100
-        return dx.ewm(span=length, adjust=False).mean().fillna(20.0)
+        return dx.rolling(length).mean()
 
-
-Profile = Literal["loose", "medium", "strict"]
-
+LONG, SHORT, FLAT = +1, -1, 0
 
 @dataclass
-class RiskPlan:
-    risk_perc: float     # capital risk per trade (e.g. 0.005 = 0.5%)
-    sl_atr_mult: float
-    tp_atr_mult: float
-    ema_fast: int
-    ema_slow: int
-    rsi_len: int
-    adx_min: float       # min ADX to allow momentum entries
-    cooldown: int        # bars to cool-down after exit
+class Plan:
+    ema_fast: int = 21
+    ema_slow: int = 50
+    rsi_len: int = 14
+    rsi_buy: float = 52.0
+    rsi_sell: float = 48.0
+    adx_len: int = 14
+    atr_len: int = 14
+    atr_mult_sl: float = 1.8
+    atr_mult_tp: float = 2.5
+    risk_perc: float = 0.002
+    allow_shorts: bool = False
+    trend_filter: bool = True
+    htf_minutes: int = 5
+    order_qty: int = 1
+    capital_rs: float = 100000.0
+    strategy: str = "ema_rsi_adx"
 
+def _position_size(entry_px: float, stop_px: float, risk_rs: float, fallback_qty: int) -> int:
+    dist = abs(entry_px - stop_px)
+    if not np.isfinite(dist) or dist <= 0:
+        return fallback_qty
+    return max(int(round(risk_rs / dist)), 1)
 
-PROFILES: Dict[Profile, RiskPlan] = {
-    "loose":  RiskPlan(0.01, 1.2, 2.4, 9, 21, 10, 12.0, 3),
-    "medium": RiskPlan(0.0075, 1.0, 2.0, 10, 30, 14, 14.0, 5),
-    "strict": RiskPlan(0.005, 0.9, 1.8, 12, 40, 14, 16.0, 7),
-}
+def initial_stop_target(side: int, entry_px: float, atr_val: float, plan: Dict) -> tuple[float, float]:
+    sl_mult = float(plan.get("atr_mult_sl", 1.8))
+    tp_mult = float(plan.get("atr_mult_tp", 2.5))
+    if side == LONG:
+        sl = entry_px - sl_mult * atr_val
+        tp = entry_px + tp_mult * atr_val
+    else:
+        sl = entry_px + sl_mult * atr_val
+        tp = entry_px - tp_mult * atr_val
+    return sl, tp
 
+def trail_stop(side: int, px: float, atr_val: float, cur_stop: float, entry_px: float, plan: Dict) -> float:
+    trail_mult = float(plan.get("trail_mult", 1.0))
+    if side == LONG:
+        return max(cur_stop, px - trail_mult * atr_val)
+    else:
+        return min(cur_stop, px + trail_mult * atr_val)
 
-def _position_size(entry_px: float, sl_px: float, capital: float, min_qty: int) -> int:
-    """Risk-based position sizing; falls back to min_qty when computation invalid."""
-    risk_per_share = abs(entry_px - sl_px)
-    if not np.isfinite(risk_per_share) or risk_per_share <= 0:
-        return max(1, min_qty)
-    risk_budget = max(0.0, capital)
-    # qty so that max loss ~= risk_perc * capital
-    qty = int(math.floor((0.01 * risk_budget) / risk_per_share))  # 1% *capital per signal if caller didn’t override
-    return max(min_qty, qty)
+def _intraday_rsi_signals(df: pd.DataFrame, plan: Dict) -> pd.DataFrame:
+    out = df.copy()
+    for c in ("Open","High","Low","Close"):
+        if c in out.columns:
+            out[c.lower()] = out[c]
+    close = out["close"]; high = out["high"]; low = out["low"]
 
+    rlen = int(plan.get("rsi_len", 14))
+    ob   = float(plan.get("rsi_overbought", 70))
+    os   = float(plan.get("rsi_oversold", 30))
+    out["rsi"] = rsi(close, rlen)
 
-def prepare_signals(
-    prices: pd.DataFrame,
-    cfg: Dict,
-    profile: Profile = "medium",
-) -> pd.DataFrame:
-    """
-    Build rule-based signals + SL/TP/pos_size columns.
-    Expected price columns: ['open','high','low','close'] (case-insensitive ok).
-    """
-    df = prices.copy()
+    sig = np.where(out["rsi"] < os, LONG, np.where(out["rsi"] > ob, SHORT, FLAT))
 
-    # normalize column names
-    rename_map = {c: c.lower() for c in df.columns}
-    df.rename(columns=rename_map, inplace=True)
+    if plan.get("trend_filter", True):
+        m = int(plan.get("htf_minutes", 5))
+        htf = out.resample(f"{m}T").last()
+        htf["ema_f"] = ema(htf["close"], int(plan.get("ema_fast", 21)))
+        htf["ema_s"] = ema(htf["close"], int(plan.get("ema_slow", 50)))
+        htf["up"] = htf["ema_f"] > htf["ema_s"]
+        htf["dn"] = htf["ema_f"] < htf["ema_s"]
+        out[["up","dn"]] = htf[["up","dn"]].reindex(out.index).ffill()
+        sig = np.where((sig == LONG) & (out["up"] == True), LONG,
+              np.where((sig == SHORT) & (out["dn"] == True), SHORT, FLAT))
 
-    # indicators
-    plan = PROFILES.get(profile, PROFILES["medium"])
-    df["ema_f"] = ema(df["close"], plan.ema_fast)
-    df["ema_s"] = ema(df["close"], plan.ema_slow)
-    df["rsi"] = rsi(df["close"], plan.rsi_len)
-    df["atr"] = atr(df["high"], df["low"], df["close"], 14)
-    df["adx"] = adx(df["high"], df["low"], df["close"], 14)
+    if not plan.get("allow_shorts", False):
+        sig = np.where(sig == SHORT, FLAT, sig)
 
-    # momentum/mean-reversion blended logic
-    long_cond = (df["ema_f"] > df["ema_s"]) & (df["rsi"].between(45, 75)) & (df["adx"] >= plan.adx_min)
-    short_cond = (df["ema_f"] < df["ema_s"]) & (df["rsi"].between(25, 55)) & (df["adx"] >= plan.adx_min)
+    out["signal"] = sig
 
-    # signal (+1/-1/0) with basic de-whipsaw filter (no flip inside same bar range)
-    df["signal"] = 0
-    df.loc[long_cond, "signal"] = 1
-    df.loc[short_cond, "signal"] = -1
+    atr_len = int(plan.get("atr_len", 14))
+    out["atr"] = atr(high, low, close, atr_len)
 
-    # build SL/TP from ATR
-    sl_long = df["close"] - plan.sl_atr_mult * df["atr"]
-    tp_long = df["close"] + plan.tp_atr_mult * df["atr"]
-    sl_short = df["close"] + plan.sl_atr_mult * df["atr"]
-    tp_short = df["close"] - plan.tp_atr_mult * df["atr"]
+    sl_mult = float(plan.get("atr_mult_sl", 1.8))
+    tp_mult = float(plan.get("atr_mult_tp", 2.5))
+    entry_ref = close
 
-    df["sl_px"] = np.where(df["signal"] > 0, sl_long, np.where(df["signal"] < 0, sl_short, np.nan))
-    df["tp_px"] = np.where(df["signal"] > 0, tp_long, np.where(df["signal"] < 0, tp_short, np.nan))
+    long_sl  = entry_ref - sl_mult*out["atr"]
+    long_tp  = entry_ref + tp_mult*out["atr"]
+    short_sl = entry_ref + sl_mult*out["atr"]
+    short_tp = entry_ref - tp_mult*out["atr"]
 
-    # optional cool-down after an exit to avoid overtrading; we only stamp the field here
-    df["cooldown_bars"] = plan.cooldown
+    out["sl_px"] = np.where(out["signal"]==LONG, long_sl,
+                     np.where(out["signal"]==SHORT, short_sl, np.nan))
+    out["tp_px"] = np.where(out["signal"]==LONG, long_tp,
+                     np.where(out["signal"]==SHORT, short_tp, np.nan))
 
-    # risk-based pos_size (engine will use it if provided)
-    capital = float(cfg.get("capital_rs", 100000.0))
-    fallback_qty = int(cfg.get("order_qty", 1))
-    # compute a size per row; realistic engines pick only when the trade triggers
-    entry_price = df["close"]
-    est_sl = df["sl_px"]
-    df["pos_size"] = [
-        _position_size(ep, sp, capital * plan.risk_perc, fallback_qty)
-        if np.isfinite(ep) and np.isfinite(sp) else fallback_qty
-        for ep, sp in zip(entry_price, est_sl)
-    ]
+    fallback_qty = int(plan.get("order_qty", 1))
+    risk_rs = float(plan.get("capital_rs", 100000)) * float(plan.get("risk_perc", 0.002))
+    dist = (entry_ref - out["sl_px"]).abs()
+    out["pos_size"] = np.where((dist>0) & np.isfinite(dist), np.maximum((risk_rs/dist).round(), 1), fallback_qty)
 
-    # clean NaNs at the start
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df.dropna(subset=["ema_f", "ema_s", "rsi", "atr"], inplace=True)
+    out.replace([np.inf,-np.inf], np.nan, inplace=True)
+    out.dropna(subset=["signal","sl_px","tp_px","atr"], inplace=True)
+    return out
 
-    return df
+def _ema_rsi_adx_signals(df: pd.DataFrame, plan: Dict) -> pd.DataFrame:
+    out = df.copy()
+    for c in ("Open","High","Low","Close"):
+        if c in out.columns:
+            out[c.lower()] = out[c]
+    close = out["close"]; high = out["high"]; low = out["low"]
+
+    ef = int(plan.get("ema_fast", 21))
+    es = int(plan.get("ema_slow", 50))
+    rl = int(plan.get("rsi_len", 14))
+    al = int(plan.get("adx_len", 14))
+    atr_len = int(plan.get("atr_len", 14))
+
+    out["ema_f"] = ema(close, ef)
+    out["ema_s"] = ema(close, es)
+    out["rsi"]   = rsi(close, rl)
+    out["atr"]   = atr(high, low, close, atr_len)
+    out["adx"]   = adx(high, low, close, al)
+
+    sig_long  = (out["ema_f"] > out["ema_s"]) & (out["rsi"] > float(plan.get("rsi_buy", 52.0)))
+    sig_short = (out["ema_f"] < out["ema_s"]) & (out["rsi"] < float(plan.get("rsi_sell", 48.0)))
+    sig = np.where(sig_long, LONG, np.where(sig_short, SHORT, FLAT))
+
+    if not plan.get("allow_shorts", False):
+        sig = np.where(sig == SHORT, FLAT, sig)
+
+    out["signal"] = sig
+
+    sl_mult = float(plan.get("atr_mult_sl", 1.8))
+    tp_mult = float(plan.get("atr_mult_tp", 2.5))
+    entry_ref = close
+
+    long_sl  = entry_ref - sl_mult*out["atr"]
+    long_tp  = entry_ref + tp_mult*out["atr"]
+    short_sl = entry_ref + sl_mult*out["atr"]
+    short_tp = entry_ref - tp_mult*out["atr"]
+
+    out["sl_px"] = np.where(out["signal"]==LONG, long_sl,
+                     np.where(out["signal"]==SHORT, short_sl, np.nan))
+    out["tp_px"] = np.where(out["signal"]==LONG, long_tp,
+                     np.where(out["signal"]==SHORT, short_tp, np.nan))
+
+    fallback_qty = int(plan.get("order_qty", 1))
+    risk_rs = float(plan.get("capital_rs", 100000)) * float(plan.get("risk_perc", 0.002))
+    dist = (entry_ref - out["sl_px"]).abs()
+    out["pos_size"] = np.where((dist>0) & np.isfinite(dist), np.maximum((risk_rs/dist).round(), 1), fallback_qty)
+
+    out.replace([np.inf,-np.inf], np.nan, inplace=True)
+    out.dropna(subset=["signal","sl_px","tp_px","atr"], inplace=True)
+    return out
+
+def prepare_signals(prices: pd.DataFrame, plan: Dict) -> pd.DataFrame:
+    name = str(plan.get("strategy", "ema_rsi_adx")).lower()
+    if name in ("intraday_rsi", "rsi_simple"):
+        return _intraday_rsi_signals(prices, plan)
+    return _ema_rsi_adx_signals(prices, plan)
