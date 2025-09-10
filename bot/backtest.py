@@ -44,10 +44,10 @@ def _to_market_tz(ts: pd.Timestamp, market_tz: str) -> pd.Timestamp:
 
 def _compute_eod_mask(index: pd.DatetimeIndex, session_end: str, market_tz: str) -> pd.Series:
     """
-    True at the exact session_end bar for each date (or the last bar of that date
-    if session_end bar not present). Uses TZ-safe comparison and avoids non-boolean indices.
+    Boolean Series with True at the exact session_end bar for each date
+    (or the last bar of that date if session_end bar not present).
     """
-    # Convert for date grouping only (safe even if naive)
+    # convert for date-grouping (safe if naive)
     try:
         idx_mkt = index.tz_convert(market_tz) if index.tz is not None else index
     except Exception:
@@ -59,12 +59,14 @@ def _compute_eod_mask(index: pd.DatetimeIndex, session_end: str, market_tz: str)
         end_time = pd.to_datetime("15:20").time()
 
     dates = pd.Series(idx_mkt.date, index=index)
-    mask = pd.Series(False, index=index)
+    mask = pd.Series(False, index=index, dtype=bool)
 
-    # group by date and mark the first bar at/after end_time (else last bar)
+    # group by calendar date and mark one bar per day
     for _d, locs in dates.groupby(dates.values).groups.items():
-        day_idx = index[locs]  # retain original tz-awareness for alignment
+        # bars for this day (keep original tz)
+        day_idx = index[locs]
 
+        # extract array of python datetime.time for comparison
         if day_idx.tz is not None:
             times = day_idx.tz_convert(market_tz).to_series().dt.time.values
         else:
@@ -150,18 +152,18 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
                 trades[-1].exit_time = ts; trades[-1].exit = exit_px; trades[-1].pnl = pnl; trades[-1].reason = reason
                 position = FLAT; cool = cooldown_bars; hold = 0
                 entry_px = np.nan; qty = 0; stop = np.nan; target = np.nan
-                eq.iloc[i] = last
+                eq.iat[i] = last
                 continue
 
             # Exact EOD bar: exit at THIS bar OPEN (intraday square-off)
-            if bool(eod_mask.iloc[i]):
+            if eod_mask.iat[i]:  # scalar bool (fix)
                 exit_px, reason = float(row["open"]), "EOD"
                 pnl = (exit_px - entry_px) * qty if position == LONG else (entry_px - exit_px) * qty
                 last += pnl
                 trades[-1].exit_time = ts; trades[-1].exit = exit_px; trades[-1].pnl = pnl; trades[-1].reason = reason
                 position = FLAT; cool = cooldown_bars; hold = 0
                 entry_px = np.nan; qty = 0; stop = np.nan; target = np.nan
-                eq.iloc[i] = last
+                eq.iat[i] = last
                 continue
 
             # Normal SL/TP after min-hold
@@ -188,7 +190,7 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
                 position = FLAT; cool = cooldown_bars; hold = 0
                 entry_px = np.nan; qty = 0; stop = np.nan; target = np.nan
 
-        eq.iloc[i] = last
+        eq.iat[i] = last
 
     tdf = pd.DataFrame([t.__dict__ for t in trades]); tdf.index.name = "trade_id"
 
