@@ -11,7 +11,7 @@ TELEGRAM_CHAT_ID: ""
 capital_rs: 100000
 order_qty: 1
 
-# ---- Global params ----
+# ---- Global params (legacy; safe to keep) ----
 ema_fast: 21
 ema_slow: 50
 rsi_len: 14
@@ -47,7 +47,7 @@ send_only_signals: true
 paper_trading: true
 live_trading: false
 
-# ---- Backtest block ----
+# ---- Backtest defaults (used by all profiles) ----
 backtest:
   session_start: "09:20"
   session_end:   "15:20"
@@ -56,38 +56,40 @@ backtest:
   brokerage_flat: 20.0
   brokerage_pct: 0.0003
 
-  # === STRATEGY SWITCH (NEW) ===
-  strategy: intraday_rsi        # or: ema_rsi_adx
+  # Strategy switch
+  strategy: intraday_rsi
 
-  # --- RSI params (NEW for intraday_rsi) ---
+  # RSI (for intraday_rsi)
   rsi_len: 14
   rsi_overbought: 70
   rsi_oversold: 30
 
-  # --- EMA (for HTF filter) ---
+  # EMA (HTF filter)
   ema_fast: 21
   ema_slow: 50
+  trend_filter: true
+  htf_minutes: 5
 
-  # --- ATR / SL-TP (UPDATED keys) ---
+  # ATR / exits
   atr_len: 14
-  atr_mult_sl: 1.8              # NEW (instead of stop_atr_mult)
-  atr_mult_tp: 2.5              # NEW (instead of take_atr_mult)
+  atr_mult_sl: 1.8
+  atr_mult_tp: 2.5
 
-  # --- Risk & Capital (NEW) ---
-  risk_perc: 0.002              # 0.2% per trade
+  # Risk / position sizing
+  risk_perc: 0.002
   order_qty: 1
   capital_rs: 100000
+  allow_shorts: false
 
-  # --- Behaviour controls (NEW) ---
-  allow_shorts: false           # long-only
-  trend_filter: true            # enable HTF EMA filter
-  htf_minutes: 5                # higher timeframe minutes
+  # Behaviour
+  min_hold_bars: 5
+  cooldown_bars: 3
+  trail_after_hold: true
 
-  min_hold_bars: 5              # force hold >= 5 bars
-  cooldown_bars: 3              # block immediate re-entries
-  trail_after_hold: true        # allow trailing only after min_hold
+  # Time windows for entries (NEW)
+  entry_windows: ["09:20-10:00", "14:30-15:15"]
 
-  # --- Quality filters (existing) ---
+  # Legacy filter blocks (kept; engine ignores if unused)
   filters:
     adx_len: 14
     adx_min: 15
@@ -108,23 +110,28 @@ backtest:
     stop_after_target_rs: 4000
 
   exits:
-    stop_atr_mult: 1.0          # legacy, safe to keep
+    stop_atr_mult: 1.0
     take_atr_mult: 1.3
     trail:
       type: "atr"
       atr_mult: 1.0
       step_bars: 3
 
-# ---- Profile overrides (optional) ----
+# ---- Profile overrides ----
 backtest_loose:
   atr_mult_sl: 1.8
   atr_mult_tp: 2.6
+  entry_windows: ["09:20-10:15", "14:15-15:15"]
 
 backtest_medium:
   atr_mult_sl: 1.9
   atr_mult_tp: 2.4
 
 backtest_strict:
-  atr_mult_sl: 2.0
-  atr_mult_tp: 2.3
+  atr_mult_sl: 1.9
+  atr_mult_tp: 2.6
   min_hold_bars: 6
+  cooldown_bars: 5
+  rsi_overbought: 72
+  rsi_oversold: 28
+  entry_windows: ["09:20-10:00", "14:30-15:15"]
