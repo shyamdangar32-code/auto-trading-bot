@@ -69,8 +69,8 @@ backtest:
   atr_len: 14
 
   # Risk / exits
-  atr_mult_sl: 1.8
-  atr_mult_tp: 2.5
+  atr_mult_sl: 1.9
+  atr_mult_tp: 2.6
   risk_perc: 0.002
   order_qty: 1
   capital_rs: 100000
@@ -78,7 +78,7 @@ backtest:
 
   # Behaviour
   min_hold_bars: 5
-  cooldown_bars: 3
+  cooldown_bars: 4
   trail_after_hold: true
 
   # Entries only during these windows (HH:MM-HH:MM)
@@ -86,21 +86,22 @@ backtest:
 
 # ---- Profile overrides ----
 backtest_loose:
-  atr_mult_sl: 1.9
-  atr_mult_tp: 2.6
+  atr_mult_sl: 1.8
+  atr_mult_tp: 2.5
   entry_windows: ["09:20-10:15", "14:15-15:10"]
 
 backtest_medium:
   atr_mult_sl: 2.0
-  atr_mult_tp: 2.5
-  min_hold_bars: 6
-  cooldown_bars: 4
-
-backtest_strict:
-  atr_mult_sl: 2.0
-  atr_mult_tp: 2.7
+  atr_mult_tp: 2.6
   min_hold_bars: 6
   cooldown_bars: 5
+  entry_windows: ["09:20-10:00", "14:30-15:15"]
+
+backtest_strict:
+  atr_mult_sl: 2.1
+  atr_mult_tp: 2.7
+  min_hold_bars: 6
+  cooldown_bars: 6
   rsi_overbought: 72
   rsi_oversold: 28
   entry_windows: ["09:20-09:55", "14:35-15:10"]
