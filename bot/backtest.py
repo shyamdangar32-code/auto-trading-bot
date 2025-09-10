@@ -1,10 +1,9 @@
-# bot/backtest.py  (MIN-HOLD + COOLDOWN + EXACT EOD SQUARE-OFF, TZ-SAFE, BUGFIXED)
+# bot/backtest.py  (EOD SQUARE-OFF SAME-DAY • TZ-SAFE • MIN-HOLD • COOLDOWN • BUGFIXED)
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Tuple
-
 import json
 import numpy as np
 import pandas as pd
@@ -46,8 +45,8 @@ def _compute_eod_mask(index: pd.DatetimeIndex, session_end: str, market_tz: str)
     """
     Boolean Series with True at the exact session_end bar for each date
     (or the last bar of that date if session_end bar not present).
+    FIX: uses Series.dt.time.values -> proper python time objects; avoids IndexError.
     """
-    # convert for date-grouping (safe if naive)
     try:
         idx_mkt = index.tz_convert(market_tz) if index.tz is not None else index
     except Exception:
@@ -61,12 +60,10 @@ def _compute_eod_mask(index: pd.DatetimeIndex, session_end: str, market_tz: str)
     dates = pd.Series(idx_mkt.date, index=index)
     mask = pd.Series(False, index=index, dtype=bool)
 
-    # group by calendar date and mark one bar per day
     for _d, locs in dates.groupby(dates.values).groups.items():
-        # bars for this day (keep original tz)
         day_idx = index[locs]
 
-        # extract array of python datetime.time for comparison
+        # ✅ robust extraction of python datetime.time array
         if day_idx.tz is not None:
             times = day_idx.tz_convert(market_tz).to_series().dt.time.values
         else:
@@ -106,7 +103,7 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
     sess_end_str = str(plan.get("session_end", "15:20"))
     market_tz = str(plan.get("market_tz", plan.get("tz", "Asia/Kolkata")))
 
-    # Pre-compute exact EOD bars (bugfixed)
+    # exact EOD bars (final bugfix inside)
     eod_mask = _compute_eod_mask(df.index, sess_end_str, market_tz)
 
     position = FLAT
@@ -143,7 +140,7 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
         else:
             hold += 1
 
-            # HARD guard: if date rolled, exit immediately at this bar OPEN (carry cleanup)
+            # overnight carry cleanup
             entry_mkt = _to_market_tz(trades[-1].entry_time, market_tz)
             if ts_mkt.date() > entry_mkt.date():
                 exit_px, reason = float(row["open"]), "EOD_CARRY"
@@ -155,8 +152,8 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
                 eq.iat[i] = last
                 continue
 
-            # Exact EOD bar: exit at THIS bar OPEN (intraday square-off)
-            if eod_mask.iat[i]:  # scalar bool (fix)
+            # exact same-day EOD square-off → THIS bar OPEN
+            if eod_mask.iat[i]:   # scalar bool (no IndexError)
                 exit_px, reason = float(row["open"]), "EOD"
                 pnl = (exit_px - entry_px) * qty if position == LONG else (entry_px - exit_px) * qty
                 last += pnl
@@ -166,7 +163,7 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
                 eq.iat[i] = last
                 continue
 
-            # Normal SL/TP after min-hold
+            # normal SL/TP after min-hold
             exit_px = None; reason = None
             if hold >= min_hold:
                 if position == LONG:
@@ -174,7 +171,7 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
                 else:
                     exit_px, reason = _first_hit_short(row, stop, target)
 
-            # Trailing after min-hold (ATR-based 1.0x)
+            # trailing after min-hold (ATR 1.0x)
             if (exit_px is None) and allow_trail and (hold >= min_hold):
                 atr_val = row.get("atr", np.nan)
                 if np.isfinite(atr_val):
@@ -194,7 +191,7 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
 
     tdf = pd.DataFrame([t.__dict__ for t in trades]); tdf.index.name = "trade_id"
 
-    # --- metrics ---
+    # metrics
     gross_profit = tdf.loc[tdf["pnl"] > 0, "pnl"].sum() if not tdf.empty else 0.0
     gross_loss = -tdf.loc[tdf["pnl"] < 0, "pnl"].sum() if not tdf.empty else 0.0
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (np.inf if gross_profit > 0 else 0.0)
