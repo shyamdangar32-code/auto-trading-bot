@@ -1,28 +1,30 @@
-# bot/strategy.py (PATCHED: unified strategies in one file)
+# bot/strategy.py  (UNIFIED + ENTRY WINDOWS GATE)
 from __future__ import annotations
-
-import math
-from dataclasses import dataclass
-from typing import Dict, Literal, Optional
 
 import numpy as np
 import pandas as pd
+from dataclasses import dataclass
+from typing import Dict
 
+# --- indicators (fallbacks if local ones not available) ---
 try:
     from .indicators import ema, rsi, atr, adx  # type: ignore
 except Exception:
     def ema(s: pd.Series, length: int) -> pd.Series:
-        return s.ewm(span=length, adjust=False).mean()
+        return s.ewm(span=int(length), adjust=False).mean()
+
     def rsi(close: pd.Series, length: int = 14) -> pd.Series:
         delta = close.diff()
         gain = delta.where(delta > 0, 0.0).rolling(length).mean()
         loss = -delta.where(delta < 0, 0.0).rolling(length).mean().replace(0, np.nan)
         rs = gain / loss
         return 100 - (100 / (1 + rs))
+
     def atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
         prev_close = close.shift(1)
         tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
         return tr.rolling(length).mean()
+
     def adx(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
         up = high.diff()
         dn = -low.diff()
@@ -55,37 +57,15 @@ class Plan:
     capital_rs: float = 100000.0
     strategy: str = "ema_rsi_adx"
 
-def _position_size(entry_px: float, stop_px: float, risk_rs: float, fallback_qty: int) -> int:
-    dist = abs(entry_px - stop_px)
-    if not np.isfinite(dist) or dist <= 0:
-        return fallback_qty
-    return max(int(round(risk_rs / dist)), 1)
-
-def initial_stop_target(side: int, entry_px: float, atr_val: float, plan: Dict) -> tuple[float, float]:
-    sl_mult = float(plan.get("atr_mult_sl", 1.8))
-    tp_mult = float(plan.get("atr_mult_tp", 2.5))
-    if side == LONG:
-        sl = entry_px - sl_mult * atr_val
-        tp = entry_px + tp_mult * atr_val
-    else:
-        sl = entry_px + sl_mult * atr_val
-        tp = entry_px - tp_mult * atr_val
-    return sl, tp
-
-def trail_stop(side: int, px: float, atr_val: float, cur_stop: float, entry_px: float, plan: Dict) -> float:
-    trail_mult = float(plan.get("trail_mult", 1.0))
-    if side == LONG:
-        return max(cur_stop, px - trail_mult * atr_val)
-    else:
-        return min(cur_stop, px + trail_mult * atr_val)
-
 def _intraday_rsi_signals(df: pd.DataFrame, plan: Dict) -> pd.DataFrame:
     out = df.copy()
-    for c in ("Open","High","Low","Close"):
+    # normalize column case
+    for c in ("Open", "High", "Low", "Close"):
         if c in out.columns:
             out[c.lower()] = out[c]
     close = out["close"]; high = out["high"]; low = out["low"]
 
+    # core signals
     rlen = int(plan.get("rsi_len", 14))
     ob   = float(plan.get("rsi_overbought", 70))
     os   = float(plan.get("rsi_oversold", 30))
@@ -93,6 +73,7 @@ def _intraday_rsi_signals(df: pd.DataFrame, plan: Dict) -> pd.DataFrame:
 
     sig = np.where(out["rsi"] < os, LONG, np.where(out["rsi"] > ob, SHORT, FLAT))
 
+    # HTF trend filter (EMA on resampled bars)
     if plan.get("trend_filter", True):
         m = int(plan.get("htf_minutes", 5))
         htf = out.resample(f"{m}T").last()
@@ -100,7 +81,7 @@ def _intraday_rsi_signals(df: pd.DataFrame, plan: Dict) -> pd.DataFrame:
         htf["ema_s"] = ema(htf["close"], int(plan.get("ema_slow", 50)))
         htf["up"] = htf["ema_f"] > htf["ema_s"]
         htf["dn"] = htf["ema_f"] < htf["ema_s"]
-        out[["up","dn"]] = htf[["up","dn"]].reindex(out.index).ffill()
+        out[["up", "dn"]] = htf[["up", "dn"]].reindex(out.index).ffill()
         sig = np.where((sig == LONG) & (out["up"] == True), LONG,
               np.where((sig == SHORT) & (out["dn"] == True), SHORT, FLAT))
 
@@ -109,35 +90,50 @@ def _intraday_rsi_signals(df: pd.DataFrame, plan: Dict) -> pd.DataFrame:
 
     out["signal"] = sig
 
+    # --- Time-of-day entry windows gate (NEW) ---
+    # e.g. plan["entry_windows"] = ["09:20-10:00", "14:30-15:15"]
+    import datetime as _dt
+    wins_cfg = plan.get("entry_windows") or []
+    if wins_cfg:
+        def _win_to_times(s: str):
+            a, b = s.split("-", 1)
+            return _dt.time.fromisoformat(a), _dt.time.fromisoformat(b)
+        wins = [_win_to_times(w) for w in wins_cfg]
+        t = out.index.time
+        allow = np.zeros(len(out), dtype=bool)
+        for (st, en) in wins:
+            allow |= ((t >= st) & (t <= en))
+        out["signal"] = np.where(allow, out["signal"], 0)
+
+    # exits/size scaffolding
     atr_len = int(plan.get("atr_len", 14))
     out["atr"] = atr(high, low, close, atr_len)
-
     sl_mult = float(plan.get("atr_mult_sl", 1.8))
     tp_mult = float(plan.get("atr_mult_tp", 2.5))
     entry_ref = close
 
-    long_sl  = entry_ref - sl_mult*out["atr"]
-    long_tp  = entry_ref + tp_mult*out["atr"]
-    short_sl = entry_ref + sl_mult*out["atr"]
-    short_tp = entry_ref - tp_mult*out["atr"]
+    long_sl  = entry_ref - sl_mult * out["atr"]
+    long_tp  = entry_ref + tp_mult * out["atr"]
+    short_sl = entry_ref + sl_mult * out["atr"]
+    short_tp = entry_ref - tp_mult * out["atr"]
 
-    out["sl_px"] = np.where(out["signal"]==LONG, long_sl,
-                     np.where(out["signal"]==SHORT, short_sl, np.nan))
-    out["tp_px"] = np.where(out["signal"]==LONG, long_tp,
-                     np.where(out["signal"]==SHORT, short_tp, np.nan))
+    out["sl_px"] = np.where(out["signal"] == LONG, long_sl,
+                     np.where(out["signal"] == SHORT, short_sl, np.nan))
+    out["tp_px"] = np.where(out["signal"] == LONG, long_tp,
+                     np.where(out["signal"] == SHORT, short_tp, np.nan))
 
     fallback_qty = int(plan.get("order_qty", 1))
     risk_rs = float(plan.get("capital_rs", 100000)) * float(plan.get("risk_perc", 0.002))
     dist = (entry_ref - out["sl_px"]).abs()
-    out["pos_size"] = np.where((dist>0) & np.isfinite(dist), np.maximum((risk_rs/dist).round(), 1), fallback_qty)
+    out["pos_size"] = np.where((dist > 0) & np.isfinite(dist), np.maximum((risk_rs / dist).round(), 1), fallback_qty)
 
-    out.replace([np.inf,-np.inf], np.nan, inplace=True)
-    out.dropna(subset=["signal","sl_px","tp_px","atr"], inplace=True)
+    out.replace([np.inf, -np.inf], np.nan, inplace=True)
+    out.dropna(subset=["signal", "sl_px", "tp_px", "atr"], inplace=True)
     return out
 
 def _ema_rsi_adx_signals(df: pd.DataFrame, plan: Dict) -> pd.DataFrame:
     out = df.copy()
-    for c in ("Open","High","Low","Close"):
+    for c in ("Open", "High", "Low", "Close"):
         if c in out.columns:
             out[c.lower()] = out[c]
     close = out["close"]; high = out["high"]; low = out["low"]
@@ -163,30 +159,48 @@ def _ema_rsi_adx_signals(df: pd.DataFrame, plan: Dict) -> pd.DataFrame:
 
     out["signal"] = sig
 
+    # --- Time-of-day entry windows gate (NEW) ---
+    import datetime as _dt
+    wins_cfg = plan.get("entry_windows") or []
+    if wins_cfg:
+        def _win_to_times(s: str):
+            a, b = s.split("-", 1)
+            return _dt.time.fromisoformat(a), _dt.time.fromisoformat(b)
+        wins = [_win_to_times(w) for w in wins_cfg]
+        t = out.index.time
+        allow = np.zeros(len(out), dtype=bool)
+        for (st, en) in wins:
+            allow |= ((t >= st) & (t <= en))
+        out["signal"] = np.where(allow, out["signal"], 0)
+
     sl_mult = float(plan.get("atr_mult_sl", 1.8))
     tp_mult = float(plan.get("atr_mult_tp", 2.5))
     entry_ref = close
 
-    long_sl  = entry_ref - sl_mult*out["atr"]
-    long_tp  = entry_ref + tp_mult*out["atr"]
-    short_sl = entry_ref + sl_mult*out["atr"]
-    short_tp = entry_ref - tp_mult*out["atr"]
+    long_sl  = entry_ref - sl_mult * out["atr"]
+    long_tp  = entry_ref + tp_mult * out["atr"]
+    short_sl = entry_ref + sl_mult * out["atr"]
+    short_tp = entry_ref - tp_mult * out["atr"]
 
-    out["sl_px"] = np.where(out["signal"]==LONG, long_sl,
-                     np.where(out["signal"]==SHORT, short_sl, np.nan))
-    out["tp_px"] = np.where(out["signal"]==LONG, long_tp,
-                     np.where(out["signal"]==SHORT, short_tp, np.nan))
+    out["sl_px"] = np.where(out["signal"] == LONG, long_sl,
+                     np.where(out["signal"] == SHORT, short_sl, np.nan))
+    out["tp_px"] = np.where(out["signal"] == LONG, long_tp,
+                     np.where(out["signal"] == SHORT, short_tp, np.nan))
 
     fallback_qty = int(plan.get("order_qty", 1))
     risk_rs = float(plan.get("capital_rs", 100000)) * float(plan.get("risk_perc", 0.002))
     dist = (entry_ref - out["sl_px"]).abs()
-    out["pos_size"] = np.where((dist>0) & np.isfinite(dist), np.maximum((risk_rs/dist).round(), 1), fallback_qty)
+    out["pos_size"] = np.where((dist > 0) & np.isfinite(dist), np.maximum((risk_rs / dist).round(), 1), fallback_qty)
 
-    out.replace([np.inf,-np.inf], np.nan, inplace=True)
-    out.dropna(subset=["signal","sl_px","tp_px","atr"], inplace=True)
+    out.replace([np.inf, -np.inf], np.nan, inplace=True)
+    out.dropna(subset=["signal", "sl_px", "tp_px", "atr"], inplace=True)
     return out
 
 def prepare_signals(prices: pd.DataFrame, plan: Dict) -> pd.DataFrame:
+    """
+    prices: DataFrame with DateTimeIndex, columns include (open,high,low,close)
+    plan:   dict of parameters; key 'strategy' selects variant
+    """
     name = str(plan.get("strategy", "ema_rsi_adx")).lower()
     if name in ("intraday_rsi", "rsi_simple"):
         return _intraday_rsi_signals(prices, plan)
