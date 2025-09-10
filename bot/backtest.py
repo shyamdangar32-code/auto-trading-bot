@@ -1,4 +1,4 @@
-# bot/backtest.py (PATCHED: add min_hold_bars + cooldown_bars)
+# bot/backtest.py  (MIN-HOLD + COOLDOWN + EOD SQUARE-OFF)
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -38,9 +38,10 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
     for c in ("open", "high", "low", "close"):
         if c not in df.columns:
             df[c] = df[c.capitalize()] if c.capitalize() in df.columns else np.nan
-    df.dropna(subset=["open","high","low","close","signal"], inplace=True)
+    df.dropna(subset=["open", "high", "low", "close", "signal"], inplace=True)
 
-    plan = {}
+    # merge plan from config
+    plan: Dict = {}
     if "backtest" in cfg: plan.update(cfg["backtest"] or {})
     if use_block in cfg:  plan.update(cfg[use_block] or {})
 
@@ -56,14 +57,16 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
     trades = []; last = capital
 
     for i, (ts, row) in enumerate(df.iterrows()):
-        if i == 0: continue
+        if i == 0: 
+            continue
+
         if position == FLAT:
             if cool > 0:
                 cool -= 1
             else:
                 if int(row["signal"]) != 0:
                     position = LONG if int(row["signal"]) > 0 else SHORT
-                    entry_px = row["open"]
+                    entry_px = float(row["open"])
                     qty = int(row.get("pos_size", fallback_qty) or fallback_qty)
                     stop = float(row.get("sl_px", np.nan))
                     target = float(row.get("tp_px", np.nan))
@@ -71,12 +74,32 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
                     trades.append(Trade(side=position, entry_time=ts, entry=entry_px, qty=qty))
         else:
             hold += 1
+
+            # --- EOD square-off (NEW) ---
+            sess_end_str = str(plan.get("session_end", "15:20"))
+            try:
+                sess_end_ts = pd.Timestamp(ts.date().strftime("%Y-%m-%d") + f" {sess_end_str}", tz=ts.tz)
+            except Exception:
+                sess_end_ts = ts.normalize() + pd.Timedelta(hours=15, minutes=20)
+            if ts >= sess_end_ts:
+                exit_px, reason = float(row["close"]), "EOD"
+                pnl = (exit_px - entry_px) * qty if position == LONG else (entry_px - exit_px) * qty
+                last += pnl
+                trades[-1].exit_time = ts; trades[-1].exit = exit_px; trades[-1].pnl = pnl; trades[-1].reason = reason
+                position = FLAT; cool = cooldown_bars; hold = 0
+                entry_px = np.nan; qty = 0; stop = np.nan; target = np.nan
+                eq.iloc[i] = last
+                continue
+
+            # normal exits
             exit_px = None; reason = None
             if hold >= min_hold:
                 if position == LONG:
                     exit_px, reason = _first_hit_long(row, stop, target)
                 else:
                     exit_px, reason = _first_hit_short(row, stop, target)
+
+            # trailing stop post min-hold
             if (exit_px is None) and allow_trail and (hold >= min_hold):
                 atr_val = row.get("atr", np.nan)
                 if np.isfinite(atr_val):
@@ -84,6 +107,7 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
                         stop = max(stop, row["close"] - 1.0 * atr_val)
                     else:
                         stop = min(stop, row["close"] + 1.0 * atr_val)
+
             if exit_px is not None:
                 pnl = (exit_px - entry_px) * qty if position == LONG else (entry_px - exit_px) * qty
                 last += pnl
@@ -120,13 +144,13 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
     return summary, tdf, eq
 
 def _plot_equity(eq: pd.Series, outdir: Path):
-    fig, ax = plt.subplots(figsize=(10,4))
+    fig, ax = plt.subplots(figsize=(10, 4))
     eq.plot(ax=ax); ax.set_title("Equity Curve"); ax.grid(True, alpha=0.3)
     fig.tight_layout(); (outdir / "equity_curve.png").parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(outdir / "equity_curve.png", dpi=120); plt.close(fig)
 
     roll_max = eq.cummax(); dd = eq - roll_max
-    fig2, ax2 = plt.subplots(figsize=(10,2.5))
+    fig2, ax2 = plt.subplots(figsize=(10, 2.5))
     dd.plot(ax=ax2); ax2.set_title("Drawdown"); ax2.grid(True, alpha=0.3)
     fig2.tight_layout(); fig2.savefig(outdir / "drawdown.png", dpi=120); plt.close(fig2)
 
