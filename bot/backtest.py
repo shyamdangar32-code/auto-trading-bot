@@ -1,4 +1,4 @@
-# bot/backtest.py  (MIN-HOLD + COOLDOWN + EOD SQUARE-OFF SAME-DAY, TZ-SAFE)
+# bot/backtest.py  (MIN-HOLD + COOLDOWN + EXACT EOD SQUARE-OFF, TZ-SAFE)
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -42,16 +42,46 @@ def _to_market_tz(ts: pd.Timestamp, market_tz: str) -> pd.Timestamp:
     except Exception:
         return ts
 
+def _compute_eod_mask(index: pd.DatetimeIndex, session_end: str, market_tz: str) -> pd.Series:
+    """Return boolean mask True at the exact session_end bar for each date (or the last bar of that date if session_end not present)."""
+    # Convert to market TZ for comparison
+    try:
+        idx_mkt = index.tz_convert(market_tz) if index.tz is not None else index
+    except Exception:
+        idx_mkt = index
+    try:
+        end_time = pd.to_datetime(session_end).time()
+    except Exception:
+        end_time = pd.to_datetime("15:20").time()
+
+    dates = pd.Series(idx_mkt.date, index=index)
+    mask = pd.Series(False, index=index)
+
+    for d, locs in dates.groupby(dates.values).groups.items():
+        # all bars for this date
+        day_idx = index[locs]
+        day_times = pd.to_datetime(day_idx.tz_convert(market_tz).time if day_idx.tz is not None else day_idx.time)
+        # find first bar at/after session_end
+        sel = None
+        for k in range(len(day_idx)):
+            t = day_idx[k].tz_convert(market_tz).time if day_idx.tz is not None else day_idx[k].time()
+            if t >= end_time:
+                sel = day_idx[k]
+                break
+        if sel is None:
+            sel = day_idx[-1]
+        mask.loc[sel] = True
+
+    return mask
+
 def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loose") -> Tuple[Dict, pd.DataFrame, pd.Series]:
     df = df_in.copy()
-    # normalize expected columns
     for c in ("open", "high", "low", "close"):
         if c not in df.columns:
             cap = c.capitalize()
             df[c] = df[cap] if cap in df.columns else np.nan
     df.dropna(subset=["open","high","low","close","signal"], inplace=True)
 
-    # merge plan
     plan: Dict = {}
     if "backtest" in cfg: plan.update(cfg["backtest"] or {})
     if use_block in cfg:  plan.update(cfg[use_block] or {})
@@ -62,13 +92,11 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
     cooldown_bars = int(plan.get("cooldown_bars", 0))
     allow_trail = bool(plan.get("trail_after_hold", True))
 
-    # EOD settings
     sess_end_str = str(plan.get("session_end", "15:20"))
-    try:
-        sess_end_time = pd.to_datetime(sess_end_str).time()
-    except Exception:
-        sess_end_time = pd.to_datetime("15:20").time()
     market_tz = str(plan.get("market_tz", plan.get("tz", "Asia/Kolkata")))
+
+    # Pre-compute exact EOD bars
+    eod_mask = _compute_eod_mask(df.index, sess_end_str, market_tz)
 
     position = FLAT
     entry_px = np.nan
@@ -104,7 +132,7 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
         else:
             hold += 1
 
-            # --- HARD guard: if date rolled (overnight), exit at this bar OPEN (carry cleanup) ---
+            # If by any chance date rolled, exit immediately at this bar OPEN (carry cleanup)
             entry_mkt = _to_market_tz(trades[-1].entry_time, market_tz)
             if ts_mkt.date() > entry_mkt.date():
                 exit_px, reason = float(row["open"]), "EOD_CARRY"
@@ -116,8 +144,8 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
                 eq.iloc[i] = last
                 continue
 
-            # --- SAME-DAY EOD square-off: at/after session_end -> exit at THIS bar OPEN ---
-            if ts_mkt.time() >= sess_end_time:
+            # Exact EOD bar: exit at THIS bar OPEN
+            if bool(eod_mask.iloc[i]):
                 exit_px, reason = float(row["open"]), "EOD"
                 pnl = (exit_px - entry_px) * qty if position == LONG else (entry_px - exit_px) * qty
                 last += pnl
@@ -127,7 +155,7 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
                 eq.iloc[i] = last
                 continue
 
-            # --- normal exit logic after min-hold ---
+            # Normal SL/TP after min-hold
             exit_px = None; reason = None
             if hold >= min_hold:
                 if position == LONG:
@@ -135,7 +163,7 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
                 else:
                     exit_px, reason = _first_hit_short(row, stop, target)
 
-            # --- trailing after min-hold ---
+            # Trailing after min-hold
             if (exit_px is None) and allow_trail and (hold >= min_hold):
                 atr_val = row.get("atr", np.nan)
                 if np.isfinite(atr_val):
