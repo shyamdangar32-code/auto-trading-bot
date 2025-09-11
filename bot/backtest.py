@@ -1,4 +1,4 @@
-# bot/backtest.py  (EOD SQUARE-OFF SAME-DAY • TZ-SAFE • MIN-HOLD • COOLDOWN • BUGFIXED)
+# bot/backtest.py  (EOD SQUARE-OFF • TZ-SAFE • MIN-HOLD • COOLDOWN • FINAL INDEXERROR FIX)
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -45,8 +45,9 @@ def _compute_eod_mask(index: pd.DatetimeIndex, session_end: str, market_tz: str)
     """
     Boolean Series with True at the exact session_end bar for each date
     (or the last bar of that date if session_end bar not present).
-    FIX: uses Series.dt.time.values -> proper python time objects; avoids IndexError.
+    FINAL FIX: robust .dt.time.values + tz alignment + integer indexing.
     """
+    # convert for date grouping (safe even if naive)
     try:
         idx_mkt = index.tz_convert(market_tz) if index.tz is not None else index
     except Exception:
@@ -61,9 +62,9 @@ def _compute_eod_mask(index: pd.DatetimeIndex, session_end: str, market_tz: str)
     mask = pd.Series(False, index=index, dtype=bool)
 
     for _d, locs in dates.groupby(dates.values).groups.items():
-        day_idx = index[locs]
+        day_idx = index[locs]  # sub-index for this calendar day
 
-        # ✅ robust extraction of python datetime.time array
+        # robust extraction of python datetime.time for this day's bars
         if day_idx.tz is not None:
             times = day_idx.tz_convert(market_tz).to_series().dt.time.values
         else:
@@ -76,7 +77,16 @@ def _compute_eod_mask(index: pd.DatetimeIndex, session_end: str, market_tz: str)
                 break
         if sel is None:
             sel = day_idx[-1]
-        mask.loc[sel] = True
+
+        # tz-align the selected timestamp to the mask index tz
+        try:
+            sel_aligned = pd.Timestamp(sel).tz_convert(index.tz) if index.tz else pd.Timestamp(sel).tz_localize(None)
+        except Exception:
+            sel_aligned = pd.Timestamp(sel)
+
+        # ✅ use integer indexing on the *global* index
+        pos = index.get_loc(sel_aligned)
+        mask.iloc[pos] = True
 
     return mask
 
@@ -103,7 +113,7 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
     sess_end_str = str(plan.get("session_end", "15:20"))
     market_tz = str(plan.get("market_tz", plan.get("tz", "Asia/Kolkata")))
 
-    # exact EOD bars (final bugfix inside)
+    # exact EOD bars
     eod_mask = _compute_eod_mask(df.index, sess_end_str, market_tz)
 
     position = FLAT
@@ -140,7 +150,7 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
         else:
             hold += 1
 
-            # overnight carry cleanup
+            # overnight carry cleanup (date change)
             entry_mkt = _to_market_tz(trades[-1].entry_time, market_tz)
             if ts_mkt.date() > entry_mkt.date():
                 exit_px, reason = float(row["open"]), "EOD_CARRY"
@@ -152,8 +162,8 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
                 eq.iat[i] = last
                 continue
 
-            # exact same-day EOD square-off → THIS bar OPEN
-            if eod_mask.iat[i]:   # scalar bool (no IndexError)
+            # same-day exact EOD square-off → THIS bar OPEN
+            if eod_mask.iat[i]:
                 exit_px, reason = float(row["open"]), "EOD"
                 pnl = (exit_px - entry_px) * qty if position == LONG else (entry_px - exit_px) * qty
                 last += pnl
