@@ -1,30 +1,26 @@
-# bot/strategy.py  (UNIFIED + ENTRY WINDOWS GATE)
+# bot/strategy.py  (UNIFIED • ATR SL/TP • POS SIZE)
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
 from dataclasses import dataclass
 from typing import Dict
+import numpy as np
+import pandas as pd
 
-# --- indicators (fallbacks if local ones not available) ---
 try:
     from .indicators import ema, rsi, atr, adx  # type: ignore
 except Exception:
     def ema(s: pd.Series, length: int) -> pd.Series:
-        return s.ewm(span=int(length), adjust=False).mean()
-
+        return s.ewm(span=length, adjust=False).mean()
     def rsi(close: pd.Series, length: int = 14) -> pd.Series:
         delta = close.diff()
         gain = delta.where(delta > 0, 0.0).rolling(length).mean()
         loss = -delta.where(delta < 0, 0.0).rolling(length).mean().replace(0, np.nan)
         rs = gain / loss
         return 100 - (100 / (1 + rs))
-
     def atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
         prev_close = close.shift(1)
         tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
         return tr.rolling(length).mean()
-
     def adx(high: pd.Series, low: pd.Series, close: pd.Series, length: int = 14) -> pd.Series:
         up = high.diff()
         dn = -low.diff()
@@ -38,55 +34,20 @@ except Exception:
 
 LONG, SHORT, FLAT = +1, -1, 0
 
-@dataclass
-class Plan:
-    ema_fast: int = 21
-    ema_slow: int = 50
-    rsi_len: int = 14
-    rsi_buy: float = 52.0
-    rsi_sell: float = 48.0
-    adx_len: int = 14
-    atr_len: int = 14
-    atr_mult_sl: float = 1.8
-    atr_mult_tp: float = 2.5
-    risk_perc: float = 0.002
-    allow_shorts: bool = False
-    trend_filter: bool = True
-    htf_minutes: int = 5
-    order_qty: int = 1
-    capital_rs: float = 100000.0
-    strategy: str = "ema_rsi_adx"
-
-def _apply_entry_windows(out: pd.DataFrame, plan: Dict) -> None:
-    """Zero out entry signals outside allowed time windows."""
-    import datetime as _dt
-    wins_cfg = plan.get("entry_windows") or []
-    if not wins_cfg:
-        return
-    def _win_to_times(s: str):
-        a, b = s.split("-", 1)
-        return _dt.time.fromisoformat(a), _dt.time.fromisoformat(b)
-    wins = [_win_to_times(w) for w in wins_cfg]
-    t = out.index.time
-    allow = np.zeros(len(out), dtype=bool)
-    for (st, en) in wins:
-        allow |= ((t >= st) & (t <= en))
-    out["signal"] = np.where(allow, out["signal"], 0)
-
 def _intraday_rsi_signals(df: pd.DataFrame, plan: Dict) -> pd.DataFrame:
     out = df.copy()
-    for c in ("Open", "High", "Low", "Close"):
+    for c in ("Open","High","Low","Close"):
         if c in out.columns:
             out[c.lower()] = out[c]
     close = out["close"]; high = out["high"]; low = out["low"]
 
-    rlen = int(plan.get("rsi_len", 14))
-    ob   = float(plan.get("rsi_overbought", 70))
-    os   = float(plan.get("rsi_oversold", 30))
-    out["rsi"] = rsi(close, rlen)
-
+    rl  = int(plan.get("rsi_len", 14))
+    ob  = float(plan.get("rsi_overbought", 70))
+    os  = float(plan.get("rsi_oversold", 30))
+    out["rsi"] = rsi(close, rl)
     sig = np.where(out["rsi"] < os, LONG, np.where(out["rsi"] > ob, SHORT, FLAT))
 
+    # HTF EMA trend filter (optional)
     if plan.get("trend_filter", True):
         m = int(plan.get("htf_minutes", 5))
         htf = out.resample(f"{m}T").last()
@@ -95,17 +56,15 @@ def _intraday_rsi_signals(df: pd.DataFrame, plan: Dict) -> pd.DataFrame:
         htf["up"] = htf["ema_f"] > htf["ema_s"]
         htf["dn"] = htf["ema_f"] < htf["ema_s"]
         out[["up","dn"]] = htf[["up","dn"]].reindex(out.index).ffill()
-        sig = np.where((sig == LONG) & (out["up"]), LONG,
-              np.where((sig == SHORT) & (out["dn"]), SHORT, FLAT))
+        sig = np.where((sig == LONG) & (out["up"] == True), LONG,
+              np.where((sig == SHORT) & (out["dn"] == True), SHORT, FLAT))
 
     if not plan.get("allow_shorts", False):
         sig = np.where(sig == SHORT, FLAT, sig)
 
     out["signal"] = sig
-    _apply_entry_windows(out, plan)
+    out["atr"] = atr(high, low, close, int(plan.get("atr_len", 14)))
 
-    atr_len = int(plan.get("atr_len", 14))
-    out["atr"] = atr(high, low, close, atr_len)
     sl_mult = float(plan.get("atr_mult_sl", 1.8))
     tp_mult = float(plan.get("atr_mult_tp", 2.5))
     entry_ref = close
@@ -131,7 +90,7 @@ def _intraday_rsi_signals(df: pd.DataFrame, plan: Dict) -> pd.DataFrame:
 
 def _ema_rsi_adx_signals(df: pd.DataFrame, plan: Dict) -> pd.DataFrame:
     out = df.copy()
-    for c in ("Open", "High", "Low", "Close"):
+    for c in ("Open","High","Low","Close"):
         if c in out.columns:
             out[c.lower()] = out[c]
     close = out["close"]; high = out["high"]; low = out["low"]
@@ -156,7 +115,6 @@ def _ema_rsi_adx_signals(df: pd.DataFrame, plan: Dict) -> pd.DataFrame:
         sig = np.where(sig == SHORT, FLAT, sig)
 
     out["signal"] = sig
-    _apply_entry_windows(out, plan)
 
     sl_mult = float(plan.get("atr_mult_sl", 1.8))
     tp_mult = float(plan.get("atr_mult_tp", 2.5))
