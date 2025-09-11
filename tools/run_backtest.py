@@ -1,4 +1,4 @@
-# tools/run_backtest.py  (FINAL — base+profile deep-merge, CLI overrides, safe logs)
+# tools/run_backtest.py  (FINAL • df_in fix • deep-merge profiles • CLI overrides)
 from __future__ import annotations
 
 import argparse
@@ -77,8 +77,7 @@ def _build_plan_and_runtime(cfg: dict, args: argparse.Namespace) -> tuple[dict, 
     # 1) deep-merge base + profile  (profile only overrides provided keys)
     plan = _deep_merge(base, profile)
 
-    # 2) Inherit some important top-level defaults if missing
-    # (avoid accidental drops causing behaviour drift)
+    # 2) Inherit important top-level defaults if missing (avoid accidental drops)
     for k in ("strategy", "ema_fast", "ema_slow", "rsi_len", "rsi_buy", "rsi_sell",
               "atr_len", "atr_mult_sl", "atr_mult_tp", "risk_perc",
               "allow_shorts", "trend_filter", "htf_minutes",
@@ -86,17 +85,17 @@ def _build_plan_and_runtime(cfg: dict, args: argparse.Namespace) -> tuple[dict, 
         if k in cfg and k not in plan:
             plan[k] = cfg[k]
 
-    # Ensure TZ keys exist for backtest logic
+    # Ensure TZ keys
     plan.setdefault("tz", tz)
     plan.setdefault("market_tz", tz)
 
-    # 3) CLI overrides (highest priority, only if provided)
+    # 3) CLI overrides (highest priority)
     if args.capital_rs is not None:
         plan["capital_rs"] = float(args.capital_rs)
     if args.order_qty is not None:
         plan["order_qty"] = int(args.order_qty)
 
-    # runtime_cfg keeps original cfg + also reflect simple fallbacks
+    # runtime_cfg keeps original cfg + reflect simple fallbacks
     runtime_cfg = deepcopy(cfg)
     if args.capital_rs is not None:
         runtime_cfg["capital_rs"] = float(args.capital_rs)
@@ -137,10 +136,10 @@ def main() -> None:
     # Build signals from merged plan
     df = prepare_signals(prices, plan)
 
-    # Pass full cfg (so backtest can also read blocks) and explicitly specify profile used
+    # Run backtest (NOTE: df_in argument name!)
     runtime_cfg["__profile_used__"] = args.use_block
     summary, trades_df, equity_ser = run_backtest(
-        df=df,
+        df_in=df,                 # ← keyword FIX
         cfg=runtime_cfg,
         use_block=args.use_block,
     )
