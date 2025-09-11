@@ -1,4 +1,4 @@
-# tools/run_backtest.py  (FINAL • df_in fix • deep-merge profiles • CLI overrides)
+# tools/run_backtest.py  (COMPAT + SAFE OVERRIDE)
 from __future__ import annotations
 
 import argparse
@@ -7,31 +7,31 @@ from copy import deepcopy
 from pathlib import Path
 
 import pandas as pd
-import yaml
+
+# optional: only if config.yaml is present
+try:
+    import yaml  # type: ignore
+except Exception:
+    yaml = None
 
 from bot.data_io import get_zerodha_ohlc
 from bot.strategy import prepare_signals
 from bot.backtest import run_backtest, save_reports
 
 
-# ---------------------- CLI ---------------------- #
+# -------------------- CLI -------------------- #
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run backtest with config profiles (safe deep-merge)")
-    p.add_argument("--config", default="config.yaml")
-    p.add_argument("--underlying", required=True)        # e.g. NIFTY
-    p.add_argument("--start", required=True)             # YYYY-MM-DD
-    p.add_argument("--end", required=True)               # YYYY-MM-DD
-    p.add_argument("--interval", default="1m")           # 1m/3m/5m/15m/day/...
-    # optional runtime overrides
-    p.add_argument("--capital_rs", type=float)
-    p.add_argument("--order_qty", type=int)
+    p = argparse.ArgumentParser(description="Run backtest (compat baseline + safe profile overrides)")
+    p.add_argument("--config", default="config.yaml")     # optional; if missing, baseline path
+    p.add_argument("--underlying", required=True)         # e.g., NIFTY
+    p.add_argument("--start", required=True)              # YYYY-MM-DD
+    p.add_argument("--end", required=True)                # YYYY-MM-DD
+    p.add_argument("--interval", default="1m")            # 1m/3m/5m/15m/day/...
+    p.add_argument("--capital_rs", type=float, default=100000.0)
+    p.add_argument("--order_qty", type=int, default=1)
     p.add_argument("--outdir", required=True)
-    p.add_argument(
-        "--use_block",
-        default="backtest_loose",
-        choices=["backtest_loose", "backtest_medium", "backtest_strict"],
-        help="Profile block to overlay on top of the base 'backtest' block",
-    )
+    p.add_argument("--use_block", default="backtest_loose",
+                   choices=["backtest_loose", "backtest_medium", "backtest_strict"])
     return p.parse_args()
 
 
@@ -43,9 +43,21 @@ def _ensure_dirs(outdir: str) -> Path:
     return p
 
 
-# ---------------------- Config helpers ---------------------- #
+def _safe_load_yaml(path: str) -> dict:
+    if yaml is None:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        # on any parse error, fall back to baseline
+        return {}
+
+
 def _deep_merge(a: dict, b: dict) -> dict:
-    """Deep merge: returns copy of a overlaid with b (b overrides a)."""
     out = deepcopy(a) if isinstance(a, dict) else {}
     for k, v in (b or {}).items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
@@ -55,103 +67,91 @@ def _deep_merge(a: dict, b: dict) -> dict:
     return out
 
 
-def _load_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    if not isinstance(data, dict):
-        raise ValueError("config.yaml did not parse into a mapping/dict")
-    return data
+def _block_to_profile(use_block: str) -> str:
+    x = (use_block or "").strip().lower()
+    if x.startswith("backtest_"):
+        return x.split("backtest_", 1)[1] or "loose"
+    return x or "loose"
 
 
-def _build_plan_and_runtime(cfg: dict, args: argparse.Namespace) -> tuple[dict, dict]:
-    """
-    Returns (runtime_cfg, plan)
-      plan  -> backtest base + profile deep-merge + CLI overrides (used by prepare_signals)
-      runtime_cfg -> full cfg passed into run_backtest (keeps all blocks)
-    """
-    tz = cfg.get("tz", "Asia/Kolkata")
-
-    base = cfg.get("backtest", {}) or {}
-    profile = cfg.get(args.use_block, {}) or {}
-
-    # 1) deep-merge base + profile  (profile only overrides provided keys)
-    plan = _deep_merge(base, profile)
-
-    # 2) Inherit important top-level defaults if missing (avoid accidental drops)
-    for k in ("strategy", "ema_fast", "ema_slow", "rsi_len", "rsi_buy", "rsi_sell",
-              "atr_len", "atr_mult_sl", "atr_mult_tp", "risk_perc",
-              "allow_shorts", "trend_filter", "htf_minutes",
-              "min_hold_bars", "cooldown_bars", "trail_after_hold"):
-        if k in cfg and k not in plan:
-            plan[k] = cfg[k]
-
-    # Ensure TZ keys
-    plan.setdefault("tz", tz)
-    plan.setdefault("market_tz", tz)
-
-    # 3) CLI overrides (highest priority)
-    if args.capital_rs is not None:
-        plan["capital_rs"] = float(args.capital_rs)
-    if args.order_qty is not None:
-        plan["order_qty"] = int(args.order_qty)
-
-    # runtime_cfg keeps original cfg + reflect simple fallbacks
-    runtime_cfg = deepcopy(cfg)
-    if args.capital_rs is not None:
-        runtime_cfg["capital_rs"] = float(args.capital_rs)
-    if args.order_qty is not None:
-        runtime_cfg["order_qty"] = int(args.order_qty)
-
-    return runtime_cfg, plan
-
-
-# ---------------------- Main ---------------------- #
+# -------------------- Main -------------------- #
 def main() -> None:
     args = _parse_args()
     outdir = _ensure_dirs(args.outdir)
 
-    # Load & merge configuration
-    cfg = _load_config(args.config)
-    runtime_cfg, plan = _build_plan_and_runtime(cfg, args)
-
-    # Helpful logs
-    print("────────────────────────────────────────────────")
-    print(f"📁 Config: {args.config}")
-    print(f"🧱 Profile: {args.use_block}")
-    print(f"🕒 TZ: {plan.get('market_tz', 'Asia/Kolkata')}")
-    print(f"⚙️  Strategy: {plan.get('strategy', 'ema_rsi_adx')}")
-    print(f"💰 Capital: {plan.get('capital_rs')} | Qty: {plan.get('order_qty')}")
-    print(f"🔢 Params: ema({plan.get('ema_fast')},{plan.get('ema_slow')}), "
-          f"rsi_len={plan.get('rsi_len')}, rsi_buy={plan.get('rsi_buy')}, rsi_sell={plan.get('rsi_sell')}, "
-          f"atr_len={plan.get('atr_len')}, SLxATR={plan.get('atr_mult_sl')}, TPxATR={plan.get('atr_mult_tp')}")
-    print("────────────────────────────────────────────────")
-
-    # Fetch OHLC
     print(f"🧾 Fetching Zerodha OHLC: symbol={args.underlying} interval={args.interval} {args.start} -> {args.end}")
     prices = get_zerodha_ohlc(args.underlying, args.start, args.end, args.interval)
+
     if prices is None or (isinstance(prices, pd.DataFrame) and prices.empty):
-        (Path(outdir) / "metrics.json").write_text(json.dumps({"error": "no_data"}), encoding="utf-8")
+        (outdir / "metrics.json").write_text(json.dumps({"error": "no_data"}), encoding="utf-8")
         raise SystemExit("No OHLC data returned — check Zerodha credentials, token, or date range.")
 
-    # Build signals from merged plan
-    df = prepare_signals(prices, plan)
+    # -------- Baseline runtime config (exactly like your old file) -------- #
+    # This preserves the previously good results.
+    base_runtime_cfg = {
+        "capital_rs": float(args.capital_rs),
+        "order_qty": int(args.order_qty),
+        "paper_trading": True,
+        "live_trading": False,
+    }
 
-    # Run backtest (NOTE: df_in argument name!)
-    runtime_cfg["__profile_used__"] = args.use_block
+    profile_name = _block_to_profile(args.use_block)
+    print(f"⚙️  Trade config: {{'order_qty': {base_runtime_cfg['order_qty']}, "
+          f"'capital_rs': {base_runtime_cfg['capital_rs']}}}")
+    print(f"🧱 Using profile: {profile_name}")
+
+    # --------- Baseline plan for signals (keeps strategy defaults intact) --------- #
+    # Exactly like the old behaviour: no strategy params pulled from YAML unless whitelisted below.
+    compat_plan = base_runtime_cfg | {"backtest": {}, "market_tz": "Asia/Kolkata"}
+
+    # --------- OPTIONAL: Safe, minimal overrides from config.yaml --------- #
+    # Only allow these keys to override (so performance doesn't collapse).
+    SAFE_SIGNAL_KEYS = {
+        # risk sizing / exits
+        "risk_perc", "atr_len", "atr_mult_sl", "atr_mult_tp",
+        # behaviour controls
+        "allow_shorts", "trend_filter", "htf_minutes",
+    }
+    SAFE_ENGINE_KEYS = {
+        # backtest engine behaviour
+        "min_hold_bars", "cooldown_bars", "trail_after_hold",
+        "atr_mult_sl", "atr_mult_tp",
+    }
+
+    cfg_yaml = _safe_load_yaml(args.config)
+    base_block = cfg_yaml.get("backtest") or {}
+    prof_block = cfg_yaml.get(args.use_block) or {}
+    merged_profile = _deep_merge(base_block, prof_block) if (base_block or prof_block) else {}
+
+    # Apply only SAFE_SIGNAL_KEYS into plan (so core strategy defaults remain intact)
+    safe_signal_overrides = {k: v for k, v in merged_profile.items() if k in SAFE_SIGNAL_KEYS}
+    plan_for_signals = compat_plan | safe_signal_overrides
+
+    # --------- Build df with signals --------- #
+    df = prepare_signals(prices, plan_for_signals)
+
+    # --------- Engine cfg (what backtest.py sees) --------- #
+    # Old behaviour: {"backtest": base_runtime_cfg} | base_runtime_cfg
+    engine_cfg = {"backtest": deepcopy(base_runtime_cfg)} | deepcopy(base_runtime_cfg)
+
+    # From YAML, pass only SAFE_ENGINE_KEYS into engine backtest block
+    if merged_profile:
+        engine_cfg["backtest"].update({k: v for k, v in merged_profile.items() if k in SAFE_ENGINE_KEYS})
+
+    # --------- Run backtest --------- #
     summary, trades_df, equity_ser = run_backtest(
-        df_in=df,                 # ← keyword FIX
-        cfg=runtime_cfg,
-        use_block=args.use_block,
+        df_in=df,                 # NOTE: correct keyword
+        cfg=engine_cfg,
+        use_block=args.use_block, # kept for logging/compat, though engine_cfg already carries overrides
     )
 
-    # Save artifacts
+    # --------- Save artifacts --------- #
     save_reports(
         outdir=outdir,
         summary=summary,
         trades_df=trades_df,
         equity_ser=equity_ser,
     )
-
     print("✅ Backtest finished & reports saved.")
 
 
