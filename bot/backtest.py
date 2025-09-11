@@ -1,4 +1,4 @@
-# bot/backtest.py  (EOD SQUARE-OFF • TZ-SAFE • MIN-HOLD • COOLDOWN • FINAL INDEXERROR FIX)
+# bot/backtest.py  (FINAL • POS-INDEXED EOD MASK • TZ-SAFE • MIN-HOLD • COOLDOWN)
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -33,7 +33,7 @@ def _first_hit_short(row: pd.Series, stop: float, target: float):
     return None, None
 
 def _to_market_tz(ts: pd.Timestamp, market_tz: str) -> pd.Timestamp:
-    """If ts tz-aware -> convert; if naive -> return as-is (assume already market tz)."""
+    """If ts tz-aware -> convert; if naive -> as-is (assume market tz)."""
     try:
         if ts.tz is None:
             return ts
@@ -43,11 +43,14 @@ def _to_market_tz(ts: pd.Timestamp, market_tz: str) -> pd.Timestamp:
 
 def _compute_eod_mask(index: pd.DatetimeIndex, session_end: str, market_tz: str) -> pd.Series:
     """
-    Boolean Series with True at the exact session_end bar for each date
-    (or the last bar of that date if session_end bar not present).
-    FINAL FIX: robust .dt.time.values + tz alignment + integer indexing.
+    Build boolean Series where True is set at the exact session_end bar for each day
+    (or last bar of that day if session_end not present).
+
+    ROBUST: Uses pure **integer positional indexing** everywhere to avoid
+    'arrays used as indices must be of integer or boolean type' errors and
+    is TZ-safe.
     """
-    # convert for date grouping (safe even if naive)
+    # Market-TZ view for date grouping (safe even if index is naive)
     try:
         idx_mkt = index.tz_convert(market_tz) if index.tz is not None else index
     except Exception:
@@ -58,41 +61,40 @@ def _compute_eod_mask(index: pd.DatetimeIndex, session_end: str, market_tz: str)
     except Exception:
         end_time = pd.to_datetime("15:20").time()
 
-    dates = pd.Series(idx_mkt.date, index=index)
+    # Map each bar to its calendar date (market TZ), but keep **integer** positions
+    day_ser = pd.Series(idx_mkt.normalize().date, index=np.arange(len(index)))  # integer index
     mask = pd.Series(False, index=index, dtype=bool)
 
-    for _d, locs in dates.groupby(dates.values).groups.items():
-        day_idx = index[locs]  # sub-index for this calendar day
+    # Iterate unique days using integer positions only
+    for day in pd.unique(day_ser.values):
+        # integer positions for this calendar day
+        day_pos = np.flatnonzero(day_ser.values == day)
+        # sub-index (DatetimeIndex) for this day (for times); we still keep global positions in day_pos
+        day_idx = index.take(day_pos)
 
-        # robust extraction of python datetime.time for this day's bars
+        # extract python datetime.time for comparison (TZ-safe)
         if day_idx.tz is not None:
             times = day_idx.tz_convert(market_tz).to_series().dt.time.values
         else:
             times = day_idx.to_series().dt.time.values
 
-        sel = None
+        sel_pos_global = None
         for k, t in enumerate(times):
             if t >= end_time:
-                sel = day_idx[k]
+                sel_pos_global = int(day_pos[k])  # global integer position in `index`
                 break
-        if sel is None:
-            sel = day_idx[-1]
 
-        # tz-align the selected timestamp to the mask index tz
-        try:
-            sel_aligned = pd.Timestamp(sel).tz_convert(index.tz) if index.tz else pd.Timestamp(sel).tz_localize(None)
-        except Exception:
-            sel_aligned = pd.Timestamp(sel)
+        if sel_pos_global is None:
+            sel_pos_global = int(day_pos[-1])
 
-        # ✅ use integer indexing on the *global* index
-        pos = index.get_loc(sel_aligned)
-        mask.iloc[pos] = True
+        # Positional write eliminates dtype/label issues
+        mask.iat[sel_pos_global] = True
 
     return mask
 
 def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loose") -> Tuple[Dict, pd.DataFrame, pd.Series]:
     df = df_in.copy()
-    # normalize expected columns
+    # normalize OHLC columns
     for c in ("open", "high", "low", "close"):
         if c not in df.columns:
             cap = c.capitalize()
@@ -113,7 +115,7 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
     sess_end_str = str(plan.get("session_end", "15:20"))
     market_tz = str(plan.get("market_tz", plan.get("tz", "Asia/Kolkata")))
 
-    # exact EOD bars
+    # pre-compute exact EOD bars (positional)
     eod_mask = _compute_eod_mask(df.index, sess_end_str, market_tz)
 
     position = FLAT
@@ -150,7 +152,7 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
         else:
             hold += 1
 
-            # overnight carry cleanup (date change)
+            # Overnight carry guard: if date rolled, square-off at this bar OPEN
             entry_mkt = _to_market_tz(trades[-1].entry_time, market_tz)
             if ts_mkt.date() > entry_mkt.date():
                 exit_px, reason = float(row["open"]), "EOD_CARRY"
@@ -162,7 +164,7 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
                 eq.iat[i] = last
                 continue
 
-            # same-day exact EOD square-off → THIS bar OPEN
+            # Same-day EOD square-off at THIS bar OPEN
             if eod_mask.iat[i]:
                 exit_px, reason = float(row["open"]), "EOD"
                 pnl = (exit_px - entry_px) * qty if position == LONG else (entry_px - exit_px) * qty
@@ -173,7 +175,7 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
                 eq.iat[i] = last
                 continue
 
-            # normal SL/TP after min-hold
+            # Normal SL/TP after min-hold
             exit_px = None; reason = None
             if hold >= min_hold:
                 if position == LONG:
@@ -181,7 +183,7 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
                 else:
                     exit_px, reason = _first_hit_short(row, stop, target)
 
-            # trailing after min-hold (ATR 1.0x)
+            # Simple ATR trailing after min-hold (if ATR available)
             if (exit_px is None) and allow_trail and (hold >= min_hold):
                 atr_val = row.get("atr", np.nan)
                 if np.isfinite(atr_val):
@@ -199,9 +201,10 @@ def run_backtest(df_in: pd.DataFrame, cfg: Dict, use_block: str = "backtest_loos
 
         eq.iat[i] = last
 
+    # Trades dataframe
     tdf = pd.DataFrame([t.__dict__ for t in trades]); tdf.index.name = "trade_id"
 
-    # metrics
+    # Metrics
     gross_profit = tdf.loc[tdf["pnl"] > 0, "pnl"].sum() if not tdf.empty else 0.0
     gross_loss = -tdf.loc[tdf["pnl"] < 0, "pnl"].sum() if not tdf.empty else 0.0
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (np.inf if gross_profit > 0 else 0.0)
