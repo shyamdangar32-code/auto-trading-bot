@@ -11,7 +11,7 @@ TELEGRAM_CHAT_ID: ""
 capital_rs: 100000
 order_qty: 1
 
-# ---- Global params ----
+# ---- Global defaults (used if no profile overrides) ----
 ema_fast: 21
 ema_slow: 50
 rsi_len: 14
@@ -47,7 +47,7 @@ send_only_signals: true
 paper_trading: true
 live_trading: false
 
-# ---- Backtest block ----
+# ---- Backtest baseline (legacy mode ignores most of this) ----
 backtest:
   session_start: "09:20"
   session_end:   "15:20"
@@ -56,38 +56,37 @@ backtest:
   brokerage_flat: 20.0
   brokerage_pct: 0.0003
 
-  # === STRATEGY SWITCH ===
-  strategy: intraday_rsi        # or: ema_rsi_adx
+  # Strategy (respected only in --profile_mode full)
+  strategy: ema_rsi_adx         # or intraday_rsi
 
-  # --- RSI params ---
+  # RSI params (safe for signals)
   rsi_len: 14
   rsi_overbought: 70
   rsi_oversold: 30
 
-  # --- EMA (for HTF filter) ---
+  # EMA (HTF filter)
   ema_fast: 21
   ema_slow: 50
 
-  # --- ATR / SL-TP ---
+  # ATR / SL-TP
   atr_len: 14
   atr_mult_sl: 1.8
   atr_mult_tp: 2.5
 
-  # --- Risk & Capital ---
+  # Risk & Capital
   risk_perc: 0.002
   order_qty: 1
   capital_rs: 100000
 
-  # --- Behaviour controls ---
+  # Behaviour controls (only if profile_mode full)
   allow_shorts: false
   trend_filter: true
   htf_minutes: 5
-
-  min_hold_bars: 5
-  cooldown_bars: 3
+  min_hold_bars: 0
+  cooldown_bars: 0
   trail_after_hold: true
 
-# ---- Profile overrides ----
+# ---- Profile overrides (only applied if you set --profile_mode safe/full) ----
 backtest_loose:
   atr_mult_sl: 1.8
   atr_mult_tp: 2.6
