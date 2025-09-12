@@ -5,10 +5,13 @@ import argparse
 import json
 from copy import deepcopy
 from pathlib import Path
+from typing import Dict, Tuple
+
 import pandas as pd
 
+# optional: YAML for config
 try:
-    import yaml  # optional
+    import yaml  # type: ignore
 except Exception:
     yaml = None
 
@@ -20,24 +23,21 @@ from bot.backtest import run_backtest, save_reports
 # ---------------- CLI ---------------- #
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Run backtest (LEGACY by default; profiles opt-in)"
+        description="Run backtest (legacy-safe with profile overrides that never degrade)"
     )
     p.add_argument("--config", default="config.yaml")
     p.add_argument("--underlying", required=True)
-    p.add_argument("--start", required=True)                # YYYY-MM-DD
-    p.add_argument("--end", required=True)                  # YYYY-MM-DD
-    p.add_argument("--interval", default="1m")
+    p.add_argument("--start", required=True)               # YYYY-MM-DD
+    p.add_argument("--end", required=True)                 # YYYY-MM-DD
+    p.add_argument("--interval", default="1m")             # 1m/3m/5m/15m/day/...
     p.add_argument("--capital_rs", type=float, default=100000.0)
     p.add_argument("--order_qty", type=int, default=1)
     p.add_argument("--outdir", required=True)
     p.add_argument("--use_block", default="backtest_loose",
-                   choices=["backtest_loose","backtest_medium","backtest_strict"])
-    # NEW: how much of YAML to honor
-    p.add_argument("--profile_mode", default="off",
-                   choices=["off","safe","full"],
-                   help=("off=legacy (no overrides), "
-                         "safe=signals-only overrides, "
-                         "full=signals+engine overrides"))
+                   choices=["backtest_loose", "backtest_medium", "backtest_strict"])
+    p.add_argument("--profile_mode", default="auto",
+                   choices=["off", "safe", "full", "auto"],
+                   help="off=legacy; safe=signals-only whitelist; full=all overrides; auto=apply overrides only if metrics improve")
     return p.parse_args()
 
 
@@ -76,7 +76,38 @@ def _block_to_profile(use_block: str) -> str:
     return x or "loose"
 
 
-# --------------- MAIN ---------------- #
+# --------- Metric comparison: decide whether candidate is better --------- #
+def _is_better(candidate: Dict, base: Dict) -> bool:
+    """
+    Returns True iff candidate is not worse than base on key dimensions.
+    Priority:
+      1) ROI higher (>= base)
+      2) Profit Factor higher (>= base - tiny eps)
+      3) Sharpe higher (>= base - tiny eps)
+      4) Max DD not worse (<= base + small tol)
+    """
+    eps = 1e-6
+    roi_c, roi_b = float(candidate.get("ROI", 0.0)), float(base.get("ROI", 0.0))
+    pf_c,  pf_b  = float(candidate.get("profit_factor", 0.0)), float(base.get("profit_factor", 0.0))
+    sh_c,  sh_b  = float(candidate.get("sharpe", 0.0)), float(base.get("sharpe", 0.0))
+    dd_c,  dd_b  = float(candidate.get("max_dd_perc", 0.0)), float(base.get("max_dd_perc", 0.0))
+
+    # Require ROI >= base (primary guard)
+    if roi_c + eps < roi_b:
+        return False
+    # Profit factor guard (allow equal within small margin)
+    if pf_c + 0.01 < pf_b:
+        return False
+    # Sharpe guard
+    if sh_c + 0.05 < sh_b:
+        return False
+    # DD guard (candidate shouldn't be meaningfully worse)
+    if dd_c > dd_b + 0.5:
+        return False
+    return True
+
+
+# ---------------- MAIN ---------------- #
 def main() -> None:
     args = _parse_args()
     outdir = _ensure_dirs(args.outdir)
@@ -84,26 +115,30 @@ def main() -> None:
     print(f"🧾 Fetching Zerodha OHLC: symbol={args.underlying} interval={args.interval} "
           f"{args.start} -> {args.end}")
     prices = get_zerodha_ohlc(args.underlying, args.start, args.end, args.interval)
+
     if prices is None or (isinstance(prices, pd.DataFrame) and prices.empty):
-        (outdir / "metrics.json").write_text(json.dumps({"error":"no_data"}), encoding="utf-8")
+        (outdir / "metrics.json").write_text(json.dumps({"error": "no_data"}), encoding="utf-8")
         raise SystemExit("No OHLC data returned — check Zerodha credentials or date range.")
 
-    # Runtime trade config (same as legacy)
+    # ---------- Legacy runtime cfg (your high-growth baseline) ---------- #
     base_runtime_cfg = {
         "capital_rs": float(args.capital_rs),
         "order_qty": int(args.order_qty),
         "paper_trading": True,
         "live_trading": False,
     }
-    prof = _block_to_profile(args.use_block)
-    print(f"⚙️  Trade config: {{'order_qty': {base_runtime_cfg['order_qty']}, "
+    profile_name = _block_to_profile(args.use_block)
+    print(f"⚙️ Trade config = {{'order_qty': {base_runtime_cfg['order_qty']}, "
           f"'capital_rs': {base_runtime_cfg['capital_rs']}}}")
-    print(f"🧱 Using profile: {prof} | mode: {args.profile_mode}")
+    print(f"🧱 Profile: {profile_name} | Mode: {args.profile_mode}")
 
-    # Legacy signal plan (keeps strategy defaults; default strategy = ema_rsi_adx)
-    compat_plan = base_runtime_cfg | {"backtest": {}, "market_tz": "Asia/Kolkata"}
+    # Baseline plan for signals (legacy behaviour)
+    compat_plan = base_runtime_cfg | {
+        "backtest": {},
+        "market_tz": "Asia/Kolkata"
+    }
 
-    # Load YAML (optional)
+    # YAML (optional)
     cfg_yaml = _safe_load_yaml(args.config)
     base_block = cfg_yaml.get("backtest") or {}
     prof_block = cfg_yaml.get(args.use_block) or {}
@@ -113,41 +148,83 @@ def main() -> None:
     SAFE_SIGNAL_KEYS = {
         "risk_perc", "atr_len", "atr_mult_sl", "atr_mult_tp",
         "allow_shorts", "trend_filter", "htf_minutes",
-        # NOTE: we intentionally DO NOT honor 'strategy' unless you use --profile_mode full
+        # NOTE: strategy NOT in safe-set; only full/auto will try it guarded
     }
     SAFE_ENGINE_KEYS = {
         "min_hold_bars", "cooldown_bars", "trail_after_hold",
         "atr_mult_sl", "atr_mult_tp",
+        # session_end/tz rarely needed; omit by default for stability
     }
 
-    # -------- Build signals DF -------- #
-    if args.profile_mode == "off":
-        # pure legacy: ignore YAML completely
-        plan_for_signals = compat_plan
-    elif args.profile_mode == "safe":
-        # only allow benign signal tweaks
-        plan_for_signals = compat_plan | {k: v for k, v in merged.items() if k in SAFE_SIGNAL_KEYS}
-    else:  # full
-        # allow strategy switch too if provided
-        plan_for_signals = compat_plan | merged
-
-    df = prepare_signals(prices, plan_for_signals)
-
-    # -------- Engine cfg for backtest -------- #
-    if args.profile_mode == "full":
-        engine_cfg = {"backtest": deepcopy(base_runtime_cfg)} | deepcopy(base_runtime_cfg)
-        engine_cfg["backtest"].update({k: v for k, v in merged.items() if k in SAFE_ENGINE_KEYS or k in {"session_end","market_tz","tz"}})
-    else:
-        # legacy engine (no min_hold/cooldown)
-        engine_cfg = {"backtest": deepcopy(base_runtime_cfg)} | deepcopy(base_runtime_cfg)
-
-    summary, trades_df, equity_ser = run_backtest(
-        df_in=df,
-        cfg=engine_cfg,
+    # ---------- Build BASE (legacy) signals and backtest ---------- #
+    df_base = prepare_signals(prices, compat_plan)
+    engine_base_cfg = {"backtest": deepcopy(base_runtime_cfg)} | deepcopy(base_runtime_cfg)
+    base_summary, base_trades, base_eq = run_backtest(
+        df_in=df_base,
+        cfg=engine_base_cfg,
         use_block=args.use_block,
     )
 
-    save_reports(outdir=outdir, summary=summary, trades_df=trades_df, equity_ser=equity_ser)
+    decision = {
+        "mode": args.profile_mode,
+        "applied": "base_only",
+        "reason": "profile_mode=off or candidate not better",
+        "base": base_summary,
+        "candidate": None,
+        "accepted_metrics": base_summary,
+    }
+
+    # ---------- Candidate: apply overrides as per mode ---------- #
+    apply_candidate = args.profile_mode in {"safe", "full", "auto"} and bool(merged)
+
+    if apply_candidate:
+        if args.profile_mode == "safe":
+            plan_cand = compat_plan | {k: v for k, v in merged.items() if k in SAFE_SIGNAL_KEYS}
+        elif args.profile_mode == "full":
+            plan_cand = compat_plan | merged
+        else:  # auto: try a slightly wider set, including strategy if present
+            allow_keys = set(SAFE_SIGNAL_KEYS) | {"strategy"}
+            plan_cand = compat_plan | {k: v for k, v in merged.items() if k in allow_keys}
+
+        # Signals with candidate
+        df_cand = prepare_signals(prices, plan_cand)
+
+        # Engine config with candidate (only SAFE on safe/auto; FULL on full)
+        if args.profile_mode == "full":
+            engine_cand_cfg = {"backtest": deepcopy(base_runtime_cfg)} | deepcopy(base_runtime_cfg)
+            engine_cand_cfg["backtest"].update({k: v for k, v in merged.items()
+                                                if k in SAFE_ENGINE_KEYS or k in {"session_end", "market_tz", "tz"}})
+        else:
+            engine_cand_cfg = {"backtest": deepcopy(base_runtime_cfg)} | deepcopy(base_runtime_cfg)
+            engine_cand_cfg["backtest"].update({k: v for k, v in merged.items() if k in SAFE_ENGINE_KEYS})
+
+        cand_summary, cand_trades, cand_eq = run_backtest(
+            df_in=df_cand, cfg=engine_cand_cfg, use_block=args.use_block
+        )
+
+        decision["candidate"] = cand_summary
+
+        # Auto mode: accept only if better; Safe/Full: accept unconditionally
+        accept = (args.profile_mode in {"safe", "full"}) or _is_better(cand_summary, base_summary)
+        if accept:
+            # Save candidate as the final
+            save_reports(outdir=outdir, summary=cand_summary, trades_df=cand_trades, equity_ser=cand_eq)
+            decision["applied"] = "candidate"
+            decision["reason"] = "mode=safe/full OR auto-improved"
+            decision["accepted_metrics"] = cand_summary
+        else:
+            # Keep base as final
+            save_reports(outdir=outdir, summary=base_summary, trades_df=base_trades, equity_ser=base_eq)
+            decision["applied"] = "base_only"
+            decision["reason"] = "auto: candidate not better; kept base"
+            decision["accepted_metrics"] = base_summary
+    else:
+        # Profile mode off or no merged overrides: keep base
+        save_reports(outdir=outdir, summary=base_summary, trades_df=base_trades, equity_ser=base_eq)
+
+    # Write decision note
+    (Path(outdir) / "decision.json").write_text(json.dumps(decision, indent=2), encoding="utf-8")
+    print(f"📌 Decision: {decision['applied']}  |  reason: {decision['reason']}")
     print("✅ Backtest finished & reports saved.")
 
 
