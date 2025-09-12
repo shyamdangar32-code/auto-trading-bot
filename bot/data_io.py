@@ -1,4 +1,4 @@
-# bot/data_io.py
+# bot/data_io.py  (with robust retries + backoff for Zerodha historicals)
 from __future__ import annotations
 
 import os
@@ -20,6 +20,11 @@ _INSTRUMENT_TOKENS: dict[str, int] = {
     "BANKNIFTY": 260105,
     "NIFTYBANK": 260105,
 }
+
+# --- Retry config (can be tuned via env in Actions secrets) ---
+_MAX_RETRIES = int(os.getenv("ZERODHA_MAX_RETRIES", "4"))     # total attempts per chunk
+_BACKOFF_SEC = float(os.getenv("ZERODHA_BACKOFF_SEC", "2.0")) # base backoff seconds
+_SLEEP_BETWEEN_CHUNKS = float(os.getenv("ZERODHA_CHUNK_SLEEP", "0.20"))  # polite delay
 
 
 def _normalize_symbol(s: str) -> str:
@@ -100,22 +105,53 @@ def _build_kite() -> "KiteConnect":
     return kite
 
 
+def _historical_with_retry(
+    kite: "KiteConnect",
+    token: int,
+    from_ts: pd.Timestamp,
+    to_ts: pd.Timestamp,
+    interval: str,
+    attempt_label: str = "",
+) -> list[dict]:
+    """
+    Call kite.historical_data with retries + exponential backoff.
+    Raises the last exception if all attempts fail.
+    """
+    last_err: Exception | None = None
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            return kite.historical_data(
+                instrument_token=token,
+                from_date=from_ts.to_pydatetime(),
+                to_date=to_ts.to_pydatetime(),
+                interval=interval,
+                continuous=False,
+                oi=False,
+            )
+        except Exception as e:  # network/timeouts, throttling, etc.
+            last_err = e
+            # exponential backoff: 2, 4, 8, ...
+            wait = _BACKOFF_SEC * (2 ** (attempt - 1))
+            print(
+                f"⚠️ Zerodha historical_data error (attempt {attempt}/{_MAX_RETRIES}) "
+                f"{attempt_label}: {e}. Retrying in {wait:.1f}s…"
+            )
+            time.sleep(wait)
+    # All attempts failed
+    raise RuntimeError(
+        f"Failed fetching OHLC after {_MAX_RETRIES} retries {attempt_label}: {last_err}"
+    ) from last_err
+
+
 def get_zerodha_ohlc(symbol: str, start: str, end: str, interval: str = "day") -> pd.DataFrame:
     """
     Fetch OHLC from Zerodha Historical API.
 
     - Handles Zerodha's minute-data limit (max 60 days per request) by
       chunking the requested period automatically.
+    - Retries each chunk with exponential backoff to mitigate transient timeouts.
     - Returns a DataFrame indexed by Date with columns:
       ['Open', 'High', 'Low', 'Close', 'Volume'].
-
-    Parameters
-    ----------
-    symbol : str
-        e.g. 'NIFTY' or 'BANKNIFTY'
-    start, end : 'YYYY-MM-DD' (or any pandas-parsable date)
-    interval : str
-        '1m','3m','5m','15m','30m','60m','day','week','month' supported.
     """
     sym = _normalize_symbol(symbol)
     token = _INSTRUMENT_TOKENS.get(sym)
@@ -132,38 +168,29 @@ def get_zerodha_ohlc(symbol: str, start: str, end: str, interval: str = "day") -
 
     # Zerodha minute endpoints limit: 60 days per request
     per_request_days = 60 if "minute" in itv else 5000  # practically no limit for day/week/month
-    sleep_between = 0.20  # small delay to be nice to the API
 
     chunks: list[pd.DataFrame] = []
     cur = st
 
     while cur < en:
         nxt = min(cur + pd.Timedelta(days=per_request_days), en)
-        # Perform one chunked request
+        label = f"[{sym} {itv} {cur.date()}→{nxt.date()}]"
         try:
-            data = kite.historical_data(
-                instrument_token=token,
-                from_date=cur.to_pydatetime(),
-                to_date=nxt.to_pydatetime(),
-                interval=itv,
-                continuous=False,
-                oi=False,
-            )
+            data = _historical_with_retry(kite, token, cur, nxt, itv, attempt_label=label)
         except Exception as e:
-            # surface a clear message with the attempted dates
+            # surface a clear message with the attempted dates (keeps prior behaviour)
             raise RuntimeError(
-                f"Failed fetching OHLC for {sym} ({itv}) "
-                f"{cur.date()} → {nxt.date()}: {e}"
+                f"Failed fetching OHLC for {sym} ({itv}) {cur.date()} → {nxt.date()}: {e}"
             ) from e
 
         if data:
             chunks.append(pd.DataFrame(data))
+
         cur = nxt
         if cur < en:
-            time.sleep(sleep_between)
+            time.sleep(__SLEEP_BETWEEN_CHUNKS)
 
     if not chunks:
-        # Return empty-but-shaped DataFrame
         empty = pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
         empty.index.name = "Date"
         return empty
