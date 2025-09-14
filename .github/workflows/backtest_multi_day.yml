@@ -48,7 +48,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # extras used in merge step
           python -m pip install pandas
 
       - name: Compute date list
@@ -64,14 +63,14 @@ jobs:
           days = []
           d = s
           while d < e:
-            # optional: skip weekends (GitHub runner UTC; market closed Sat/Sun)
+            # Mon=0 ... Sun=6 (skip Sat/Sun)
             if d.weekday() < 5:
               days.append(d.isoformat())
             d += dt.timedelta(days=1)
           out = ",".join(days)
-          print("days="+out)
+          print("days=" + out)
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-            f.write("days="+out+"\n")
+            f.write("days=" + out + "\n")
           PY
 
       - name: Add repo to PYTHONPATH
@@ -88,7 +87,7 @@ jobs:
             nxt=$(python - <<PY
 import datetime as dt, sys
 d = dt.date.fromisoformat(sys.argv[1])
-print((d+dt.timedelta(days=1)).isoformat())
+print((d + dt.timedelta(days=1)).isoformat())
 PY
 "$d")
             outdir="reports/${{ matrix.profile }}/$d"
@@ -97,7 +96,7 @@ PY
             python tools/run_backtest.py \
               --underlying "${{ inputs.underlying }}" \
               --start "$d" \
-              --end   "$nxt" \
+              --end "$nxt" \
               --interval "${{ inputs.interval }}" \
               --capital_rs "${{ inputs.capital_rs }}" \
               --order_qty "${{ inputs.order_qty }}" \
@@ -106,30 +105,34 @@ PY
           done
 
       - name: Merge all days • ${{ matrix.profile }}
+        env:
+          PROFILE: ${{ matrix.profile }}
+          RANGE_START: ${{ inputs.start }}
+          RANGE_END: ${{ inputs.end }}
         shell: bash
         run: |
           python - <<'PY'
-          import os, json, glob, pandas as pd
-          base = f"reports/${{ matrix.profile }}"
-          days = sorted([d for d in os.listdir(base) if d[:4].isdigit()])
-          merged_dir = f"reports/${{ matrix.profile }}_merged"
+          import os, json, pandas as pd
+          profile = os.environ["PROFILE"]
+          base = f"reports/{profile}"
+          days = sorted([d for d in os.listdir(base) if len(d) == 10 and d[4] == '-' and d[7] == '-'])
+          merged_dir = f"reports/{profile}_merged"
           os.makedirs(merged_dir, exist_ok=True)
 
-          rows = []
-          trades_all = []
-          equity_all = []
+          rows, trades_all, equity_all = [], [], []
 
           for d in days:
             daydir = os.path.join(base, d)
-            # metrics
-            mpath = os.path.join(daydir, "metrics.json")
+
             m = {}
+            mpath = os.path.join(daydir, "metrics.json")
             if os.path.exists(mpath):
               try:
-                m = json.load(open(mpath))
+                with open(mpath) as fh:
+                  m = json.load(fh)
               except Exception:
                 m = {}
-            m_row = {
+            rows.append({
               "date": d,
               "trades": m.get("trades"),
               "win_rate_%": m.get("win_rate"),
@@ -137,39 +140,38 @@ PY
               "profit_factor": m.get("profit_factor"),
               "max_dd_%": m.get("max_dd_perc"),
               "sharpe": m.get("sharpe"),
-            }
-            rows.append(m_row)
+            })
 
-            # trades.csv
             tpath = os.path.join(daydir, "trades.csv")
             if os.path.exists(tpath):
               try:
                 df = pd.read_csv(tpath)
                 df["date"] = d
                 trades_all.append(df)
-              except Exception: pass
+              except Exception:
+                pass
 
-            # equity.csv
             epath = os.path.join(daydir, "equity.csv")
             if os.path.exists(epath):
               try:
                 ef = pd.read_csv(epath)
                 ef["date"] = d
                 equity_all.append(ef)
-              except Exception: pass
+              except Exception:
+                pass
 
-          # per-day table
           table = pd.DataFrame(rows)
           table.to_csv(os.path.join(merged_dir, "per_day_metrics.csv"), index=False)
 
-          # concat trades & equity
           if trades_all:
-            pd.concat(trades_all, ignore_index=True).to_csv(os.path.join(merged_dir, "merged_trades.csv"), index=False)
+            pd.concat(trades_all, ignore_index=True).to_csv(
+              os.path.join(merged_dir, "merged_trades.csv"), index=False
+            )
           if equity_all:
-            eq = pd.concat(equity_all, ignore_index=True)
-            eq.to_csv(os.path.join(merged_dir, "merged_equity.csv"), index=False)
+            pd.concat(equity_all, ignore_index=True).to_csv(
+              os.path.join(merged_dir, "merged_equity.csv"), index=False
+            )
 
-          # simple summary from metrics (trades sum, ROI approximate avg)
           summary = {}
           if not table.empty:
             summary["days"] = len(days)
@@ -179,17 +181,28 @@ PY
             summary["avg_ROI_%"] = float(pd.to_numeric(table["ROI_%"], errors="coerce").mean())
             summary["min_max_dd_%"] = float(pd.to_numeric(table["max_dd_%"], errors="coerce").min())
             summary["avg_sharpe"] = float(pd.to_numeric(table["sharpe"], errors="coerce").mean())
+
           with open(os.path.join(merged_dir, "summary.json"), "w") as f:
             json.dump(summary, f, indent=2)
 
-          # README-style report
-          lines = ["# Multi-day Backtest (merged)",
-                   f"**Profile:** ${{ matrix.profile }}",
-                   f"**Range:** ${{ inputs.start }} → ${{ inputs.end }}",
-                   "", "## Summary", "```json",
-                   json.dumps(summary, indent=2),
-                   "```", "", "## Per-day metrics (preview)", table.head(10).to_markdown(index=False)]
-          open(os.path.join(merged_dir, "REPORT.md"), "w").write("\n".join(lines))
+          report_lines = [
+            "# Multi-day Backtest (merged)",
+            f"**Profile:** {profile}",
+            f"**Range:** {os.environ['RANGE_START']} → {os.environ['RANGE_END']}",
+            "",
+            "## Summary",
+            "```json",
+            json.dumps(summary, indent=2),
+            "```",
+          ]
+          # small preview table (up to 10 rows)
+          try:
+            report_lines += ["", "## Per-day metrics (preview)", table.head(10).to_markdown(index=False)]
+          except Exception:
+            pass
+
+          with open(os.path.join(merged_dir, "REPORT.md"), "w") as f:
+            f.write("\n".join(report_lines))
           PY
 
       - name: Upload merged artifact
