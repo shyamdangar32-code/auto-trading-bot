@@ -1,30 +1,26 @@
-name: Backtest (Single Day, On-Demand)
+name: Backtest (single day)
 
 on:
   workflow_dispatch:
     inputs:
       underlying:
-        description: "Symbol (e.g. BANKNIFTY or NIFTY)"
+        description: "Symbol (NIFTY / BANKNIFTY)"
         required: true
-        default: "BANKNIFTY"
+        default: "NIFTY"
       date:
-        description: "Trading date (YYYY-MM-DD) — end will be next day"
+        description: "Trading date (YYYY-MM-DD) — single day backtest"
         required: true
         default: "2025-09-12"
       interval:
-        description: "Bar interval"
+        description: "Interval (1m/3m/5m/15m/day)"
         required: true
         default: "1m"
-        type: choice
-        options: ["1m","3m","5m","15m"]
       profile:
-        description: "Backtest profile"
+        description: "Profile (loose / medium / strict)"
         required: true
-        default: "backtest_loose"
-        type: choice
-        options: ["backtest_loose", "backtest_medium", "backtest_strict"]
+        default: "loose"
       capital_rs:
-        description: "Starting capital (Rs)"
+        description: "Starting capital (₹)"
         required: true
         default: "100000"
       order_qty:
@@ -33,15 +29,14 @@ on:
         default: "1"
 
 jobs:
-  run:
+  single-day:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
 
     env:
-      PYTHONUNBUFFERED: "1"
-      TZ: "Asia/Kolkata"
+      # Zerodha creds from repo → Settings → Secrets and variables → Actions
       ZERODHA_API_KEY: ${{ secrets.ZERODHA_API_KEY }}
       ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+      ZERODHA_API_SECRET: ${{ secrets.ZERODHA_API_SECRET }}
 
     steps:
       - name: Checkout
@@ -55,43 +50,50 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -r requirements.txt
 
-      - name: Compute next day (end date)
+      - name: Compute start/end dates (single day window)
         id: dates
+        shell: bash
         run: |
-          START="${{ github.event.inputs.date }}"
-          END=$(python - << 'PY'
-from datetime import datetime, timedelta
-import os
-s = os.environ["START"]
-d = datetime.strptime(s, "%Y-%m-%d") + timedelta(days=1)
-print(d.strftime("%Y-%m-%d"))
-PY
-)
-          echo "start=$START" >> $GITHUB_OUTPUT
-          echo "end=$END" >> $GITHUB_OUTPUT
+          PYCODE=$(cat << 'PY'
+          import os, datetime as dt
+          d = os.environ["INPUT_DATE"]
+          start = dt.datetime.strptime(d, "%Y-%m-%d").date()
+          end = start + dt.timedelta(days=1)   # Zerodha API expects start < end
+          print(f"start={start}")
+          print(f"end={end}")
+          PY
+          )
+          INPUT_DATE='${{ github.event.inputs.date }}' INPUT_DATE="$INPUT_DATE" python - <<'PY' "$PYCODE" > dates.out
+          # Export to GITHUB_OUTPUT
+          START=$(grep '^start=' dates.out | cut -d= -f2)
+          END=$(grep '^end=' dates.out | cut -d= -f2)
+          echo "start=$START" >> "$GITHUB_OUTPUT"
+          echo "end=$END"     >> "$GITHUB_OUTPUT"
         env:
-          START: ${{ github.event.inputs.date }}
+          INPUT_DATE: ${{ github.event.inputs.date }}
 
-      - name: Run single-day backtest
+      - name: Run backtest (single day)
+        env:
+          # pass through to the script via args; env kept for libs if needed
+          TZ: Asia/Kolkata
         run: |
-          OUTDIR="reports/single-day/${{ github.event.inputs.underlying }}/${{ steps.dates.outputs.start }}/${{ github.event.inputs.profile }}"
-          mkdir -p "$OUTDIR"
-          python tools/run_backtest.py \
+          PROFILE="backtest_${{ github.event.inputs.profile }}"
+          python -m tools.run_backtest \
             --underlying "${{ github.event.inputs.underlying }}" \
             --start "${{ steps.dates.outputs.start }}" \
-            --end   "${{ steps.dates.outputs.end }}" \
+            --end "${{ steps.dates.outputs.end }}" \
             --interval "${{ github.event.inputs.interval }}" \
-            --use_block "${{ github.event.inputs.profile }}" \
             --capital_rs "${{ github.event.inputs.capital_rs }}" \
             --order_qty "${{ github.event.inputs.order_qty }}" \
-            --outdir "$OUTDIR"
+            --outdir "reports/single-day" \
+            --use_block "$PROFILE"
 
-      - name: Upload artifacts
+      - name: Upload artifacts (single day)
         uses: actions/upload-artifact@v4
         with:
-          name: single-day-${{ github.event.inputs.underlying }}-${{ steps.dates.outputs.start }}-${{ github.event.inputs.profile }}
+          name: single-day-${{ github.event.inputs.underlying }}-${{ github.event.inputs.date }}-${{ github.event.inputs.profile }}
           path: |
             reports/single-day/**
             !**/__pycache__/**
