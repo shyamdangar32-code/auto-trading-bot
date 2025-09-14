@@ -1,4 +1,4 @@
-name: Multi-day Backtest
+name: Multi-day Backtest (no-merge)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: true
         default: "2025-09-08"
       end:
-        description: "End date (YYYY-MM-DD) — exclusive (next day)"
+        description: "End date (YYYY-MM-DD) — exclusive (next day). Example: 2025-09-13"
         required: true
         default: "2025-09-13"
       underlying:
@@ -29,7 +29,7 @@ on:
         default: "1"
 
 jobs:
-  run-multiday:
+  run-multi-day:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -49,7 +49,7 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Compute date list
+      - name: Compute trading days list
         id: daterange
         shell: bash
         run: |
@@ -62,7 +62,8 @@ jobs:
           days = []
           d = s
           while d < e:
-            if d.weekday() < 5:  # skip Sat/Sun
+            # Mon=0 ... Sun=6; market open Mon-Fri
+            if d.weekday() < 5:
               days.append(d.isoformat())
             d += dt.timedelta(days=1)
           out = ",".join(days)
@@ -106,5 +107,6 @@ PY
         uses: actions/upload-artifact@v4
         with:
           name: multi-day-${{ matrix.profile }}-${{ inputs.start }}-to-${{ inputs.end }}
-          path: reports/${{ matrix.profile }}/*
+          path: |
+            reports/${{ matrix.profile }}/**
           if-no-files-found: error
