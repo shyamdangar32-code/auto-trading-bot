@@ -1,0 +1,98 @@
+name: Backtest (Single Day, On-Demand)
+
+on:
+  workflow_dispatch:
+    inputs:
+      underlying:
+        description: "Symbol (e.g. BANKNIFTY or NIFTY)"
+        required: true
+        default: "BANKNIFTY"
+      date:
+        description: "Trading date (YYYY-MM-DD) — end will be next day"
+        required: true
+        default: "2025-09-12"
+      interval:
+        description: "Bar interval"
+        required: true
+        default: "1m"
+        type: choice
+        options: ["1m","3m","5m","15m"]
+      profile:
+        description: "Backtest profile"
+        required: true
+        default: "backtest_loose"
+        type: choice
+        options: ["backtest_loose", "backtest_medium", "backtest_strict"]
+      capital_rs:
+        description: "Starting capital (Rs)"
+        required: true
+        default: "100000"
+      order_qty:
+        description: "Fallback order qty"
+        required: true
+        default: "1"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      TZ: "Asia/Kolkata"
+      ZERODHA_API_KEY: ${{ secrets.ZERODHA_API_KEY }}
+      ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Compute next day (end date)
+        id: dates
+        run: |
+          START="${{ github.event.inputs.date }}"
+          END=$(python - << 'PY'
+from datetime import datetime, timedelta
+import os
+s = os.environ["START"]
+d = datetime.strptime(s, "%Y-%m-%d") + timedelta(days=1)
+print(d.strftime("%Y-%m-%d"))
+PY
+)
+          echo "start=$START" >> $GITHUB_OUTPUT
+          echo "end=$END" >> $GITHUB_OUTPUT
+        env:
+          START: ${{ github.event.inputs.date }}
+
+      - name: Run single-day backtest
+        run: |
+          OUTDIR="reports/single-day/${{ github.event.inputs.underlying }}/${{ steps.dates.outputs.start }}/${{ github.event.inputs.profile }}"
+          mkdir -p "$OUTDIR"
+          python tools/run_backtest.py \
+            --underlying "${{ github.event.inputs.underlying }}" \
+            --start "${{ steps.dates.outputs.start }}" \
+            --end   "${{ steps.dates.outputs.end }}" \
+            --interval "${{ github.event.inputs.interval }}" \
+            --use_block "${{ github.event.inputs.profile }}" \
+            --capital_rs "${{ github.event.inputs.capital_rs }}" \
+            --order_qty "${{ github.event.inputs.order_qty }}" \
+            --outdir "$OUTDIR"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: single-day-${{ github.event.inputs.underlying }}-${{ steps.dates.outputs.start }}-${{ github.event.inputs.profile }}
+          path: |
+            reports/single-day/**
+            !**/__pycache__/**
+          if-no-files-found: warn
