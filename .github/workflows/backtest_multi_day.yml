@@ -3,18 +3,20 @@ name: Multi-day Backtest
 on:
   workflow_dispatch:
     inputs:
-      start_date:
+      start:
         description: "Start date (YYYY-MM-DD)"
         required: true
-      end_date:
-        description: "End date (YYYY-MM-DD) — inclusive"
+        default: "2025-09-08"
+      end:
+        description: "End date (YYYY-MM-DD) inclusive"
         required: true
+        default: "2025-09-12"
       underlying:
-        description: "Symbol (NIFTY or BANKNIFTY)"
+        description: "Symbol (NIFTY / BANKNIFTY)"
         required: true
         default: "NIFTY"
       interval:
-        description: "Interval (e.g., 1m, 3m, 5m, 15m)"
+        description: "Interval (1m, 3m, 5m, 15m)"
         required: true
         default: "1m"
       capital_rs:
@@ -47,45 +49,59 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # make `from bot...` imports work
-      - name: Add repo to PYTHONPATH
+      - name: Export PYTHONPATH
         run: echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
 
-      - name: Run backtest for each day (profile = ${{ matrix.profile }})
+      - name: Run per-day backtests and merge
         env:
           ZERODHA_API_KEY: ${{ secrets.ZERODHA_API_KEY }}
           ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
         run: |
-          python - <<'PY'
-          import os, subprocess, datetime as dt
+          set -euo pipefail
+          START="${{ inputs.start }}"
+          END="${{ inputs.end }}"
 
-          start = dt.date.fromisoformat("${{ inputs.start_date }}")
-          end   = dt.date.fromisoformat("${{ inputs.end_date }}")
+          # temp output for per-day reports
+          OUTROOT="tmp_reports"
+          mkdir -p "$OUTROOT"
 
-          # loop inclusive of end_date
-          d = start
-          while d <= end:
-              next_d = d + dt.timedelta(days=1)
-              outdir = f"reports/${{ matrix.profile }}/{d.isoformat()}"
-              cmd = [
-                  "python", "tools/run_backtest.py",
-                  "--underlying", "${{ inputs.underlying }}",
-                  "--start", d.isoformat(),
-                  "--end", next_d.isoformat(),
-                  "--interval", "${{ inputs.interval }}",
-                  "--capital_rs", "${{ inputs.capital_rs }}",
-                  "--order_qty", "${{ inputs.order_qty }}",
-                  "--outdir", outdir,
-                  "--use_block", "backtest_${{ matrix.profile }}"
-              ]
-              print("▶", " ".join(cmd), flush=True)
-              subprocess.run(cmd, check=True)
-              d = next_d
-          PY
+          # generate date list (inclusive)
+          python - <<'PY' > days.txt
+import sys, datetime as dt, os
+s = dt.date.fromisoformat(os.environ["START"])
+e = dt.date.fromisoformat(os.environ["END"])
+d = s
+while d <= e:
+    print(d.isoformat())
+    d += dt.timedelta(days=1)
+PY
 
-      - name: Upload artifacts (multi-day • ${{ matrix.profile }})
+          while read D; do
+            echo "▶ Backtesting $D ..."
+            python tools/run_backtest.py \
+              --underlying "${{ inputs.underlying }}" \
+              --start "$D" \
+              --end   "$(python - <<PY
+import datetime as dt,sys,os
+d = dt.date.fromisoformat(sys.argv[1]) + dt.timedelta(days=1)
+print(d.isoformat())
+PY "$D")" \
+              --interval "${{ inputs.interval }}" \
+              --capital_rs "${{ inputs.capital_rs }}" \
+              --order_qty "${{ inputs.order_qty }}" \
+              --outdir   "$OUTROOT/$D" \
+              --use_block "backtest_${{ matrix.profile }}"
+          done < days.txt
+
+          # merge all days into a single folder
+          python tools/merge_reports.py \
+            --root "$OUTROOT" \
+            --out "reports/${{ matrix.profile }}" \
+            --capital_rs "${{ inputs.capital_rs }}"
+
+      - name: Upload merged artifact
         uses: actions/upload-artifact@v4
         with:
-          name: multi-day-${{ matrix.profile }}-${{ inputs.start_date }}-to-${{ inputs.end_date }}
-          path: reports/${{ matrix.profile }}/**
-          if-no-files-found: warn
+          name: multi-day-${{ matrix.profile }}-${{ inputs.start }}-to-${{ inputs.end }}
+          path: reports/${{ matrix.profile }}/*
+          if-no-files-found: error
