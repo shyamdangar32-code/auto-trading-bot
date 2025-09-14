@@ -1,40 +1,35 @@
-name: Backtest (single day)
+name: Single-day Backtest
 
 on:
   workflow_dispatch:
     inputs:
       date:
-        description: "Trading date (YYYY-MM-DD) — single day window start"
-        required: true
-        default: "2025-09-12"
+        description: "Backtest date (YYYY-MM-DD). ખાલી રાખો તો auto=છેલ્લો શુક્રવાર"
+        required: false
+        default: ""
       underlying:
-        description: "Symbol (NIFTY or BANKNIFTY)"
+        description: "Symbol (NIFTY / BANKNIFTY)"
         required: true
         default: "NIFTY"
       interval:
-        description: "Bar interval (1m/3m/5m/15m/…)"
+        description: "Interval (e.g., 1m, 3m, 5m, 15m)"
         required: true
         default: "1m"
       capital_rs:
-        description: "Starting capital (₹)"
-        required: false
+        description: "Capital (₹)"
+        required: true
         default: "100000"
       order_qty:
-        description: "Fallback order quantity"
-        required: false
+        description: "Fallback order qty"
+        required: true
         default: "1"
 
 jobs:
   single-day:
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
       matrix:
-        profile: [loose, medium, strict]   # runs 3 variants
-    env:
-      # Zerodha creds must be set in repo: Settings → Secrets and variables → Actions
-      ZERODHA_API_KEY: ${{ secrets.ZERODHA_API_KEY }}
-      ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+        profile: [loose, medium, strict]
 
     steps:
       - name: Checkout
@@ -47,40 +42,58 @@ jobs:
 
       - name: Install deps
         run: |
-          python -m pip install -U pip
+          python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Compute start/end dates (single day window)
         id: dates
+        shell: bash
         run: |
           python - <<'PY'
-          import os, datetime as dt
-          d = os.environ["INPUT_DATE"]
-          start = dt.datetime.strptime(d, "%Y-%m-%d").date()
-          end = start + dt.timedelta(days=1)   # Zerodha API requires end > start
-          # write to GITHUB_OUTPUT
+          import os, sys, datetime as dt
+          inp = os.getenv("INPUT_DATE","").strip()
+          # જો date ન હોય તો છેલ્લો શુક્રવાર
+          if not inp:
+            today = dt.date.today()
+            # weekday(): Mon=0 ... Sun=6 ; Fri=4
+            delta = (today.weekday() - 4) % 7
+            if delta == 0: delta = 7
+            d = today - dt.timedelta(days=delta)
+          else:
+            d = dt.date.fromisoformat(inp)
+          start = d.isoformat()
+          end   = (d + dt.timedelta(days=1)).isoformat()
+          # GitHub outputs
+          print(f"start={start}")
+          print(f"end={end}")
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"start={start}\n")
-              f.write(f"end={end}\n")
+            f.write(f"start={start}\n")
+            f.write(f"end={end}\n")
           PY
-        env:
-          INPUT_DATE: ${{ github.event.inputs.date }}
+
+      # ---- 💡 PYTHONPATH fix so `from bot...` works ----
+      - name: Add repo to PYTHONPATH
+        run: |
+          echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
 
       - name: Run backtest (single day • ${{ matrix.profile }})
+        env:
+          ZERODHA_API_KEY: ${{ secrets.ZERODHA_API_KEY }}
+          ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
         run: |
           python tools/run_backtest.py \
-            --underlying "${{ github.event.inputs.underlying }}" \
+            --underlying "${{ inputs.underlying }}" \
             --start "${{ steps.dates.outputs.start }}" \
             --end   "${{ steps.dates.outputs.end }}" \
-            --interval "${{ github.event.inputs.interval }}" \
-            --capital_rs "${{ github.event.inputs.capital_rs }}" \
-            --order_qty "${{ github.event.inputs.order_qty }}" \
+            --interval "${{ inputs.interval }}" \
+            --capital_rs "${{ inputs.capital_rs }}" \
+            --order_qty "${{ inputs.order_qty }}" \
             --outdir "reports/${{ matrix.profile }}" \
             --use_block "backtest_${{ matrix.profile }}"
 
       - name: Upload artifacts (single day • ${{ matrix.profile }})
         uses: actions/upload-artifact@v4
         with:
-          name: single-day-${{ matrix.profile }}
-          path: reports/${{ matrix.profile }}/
-          if-no-files-found: error
+          name: single-day-${{ matrix.profile }}-${{ steps.dates.outputs.start }}
+          path: reports/${{ matrix.profile }}/*
+          if-no-files-found: warn
