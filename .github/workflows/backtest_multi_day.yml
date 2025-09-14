@@ -8,7 +8,7 @@ on:
         required: true
         default: "2025-09-08"
       end:
-        description: "End date (YYYY-MM-DD) — exclusive (next day). Example: 2025-09-13"
+        description: "End date (YYYY-MM-DD) — exclusive (next day)"
         required: true
         default: "2025-09-13"
       underlying:
@@ -62,8 +62,7 @@ jobs:
           days = []
           d = s
           while d < e:
-            # skip Sat(5)/Sun(6)
-            if d.weekday() < 5:
+            if d.weekday() < 5:  # skip Sat/Sun
               days.append(d.isoformat())
             d += dt.timedelta(days=1)
           out = ",".join(days)
