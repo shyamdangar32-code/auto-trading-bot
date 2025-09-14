@@ -8,15 +8,15 @@ on:
         required: true
         default: "2025-09-08"
       end:
-        description: "End date (YYYY-MM-DD) inclusive"
+        description: "End date (YYYY-MM-DD) — exclusive (next day). Example: 2025-09-13"
         required: true
-        default: "2025-09-12"
+        default: "2025-09-13"
       underlying:
         description: "Symbol (NIFTY / BANKNIFTY)"
         required: true
         default: "NIFTY"
       interval:
-        description: "Interval (1m, 3m, 5m, 15m)"
+        description: "Interval (e.g., 1m, 3m, 5m, 15m)"
         required: true
         default: "1m"
       capital_rs:
@@ -29,7 +29,7 @@ on:
         default: "1"
 
 jobs:
-  multi-day:
+  run-and-merge:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -48,60 +48,155 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # extras used in merge step
+          python -m pip install pandas
 
-      - name: Export PYTHONPATH
+      - name: Compute date list
+        id: daterange
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, datetime as dt
+          s = dt.date.fromisoformat(os.environ["INPUT_START"])
+          e = dt.date.fromisoformat(os.environ["INPUT_END"])
+          if not s < e:
+            raise SystemExit("start must be < end")
+          days = []
+          d = s
+          while d < e:
+            # optional: skip weekends (GitHub runner UTC; market closed Sat/Sun)
+            if d.weekday() < 5:
+              days.append(d.isoformat())
+            d += dt.timedelta(days=1)
+          out = ",".join(days)
+          print("days="+out)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+            f.write("days="+out+"\n")
+          PY
+
+      - name: Add repo to PYTHONPATH
         run: echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
 
-      - name: Run per-day backtests and merge
+      - name: Run backtest for each day • ${{ matrix.profile }}
         env:
           ZERODHA_API_KEY: ${{ secrets.ZERODHA_API_KEY }}
           ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+        shell: bash
         run: |
-          set -euo pipefail
-          START="${{ inputs.start }}"
-          END="${{ inputs.end }}"
-
-          # temp output for per-day reports
-          OUTROOT="tmp_reports"
-          mkdir -p "$OUTROOT"
-
-          # generate date list (inclusive)
-          python - <<'PY' > days.txt
-import sys, datetime as dt, os
-s = dt.date.fromisoformat(os.environ["START"])
-e = dt.date.fromisoformat(os.environ["END"])
-d = s
-while d <= e:
-    print(d.isoformat())
-    d += dt.timedelta(days=1)
+          IFS=',' read -ra DAYS <<< "${{ steps.daterange.outputs.days }}"
+          for d in "${DAYS[@]}"; do
+            nxt=$(python - <<PY
+import datetime as dt, sys
+d = dt.date.fromisoformat(sys.argv[1])
+print((d+dt.timedelta(days=1)).isoformat())
 PY
-
-          while read D; do
-            echo "▶ Backtesting $D ..."
+"$d")
+            outdir="reports/${{ matrix.profile }}/$d"
+            mkdir -p "$outdir"
+            echo "▶ ${d} → ${nxt}  →  $outdir"
             python tools/run_backtest.py \
               --underlying "${{ inputs.underlying }}" \
-              --start "$D" \
-              --end   "$(python - <<PY
-import datetime as dt,sys,os
-d = dt.date.fromisoformat(sys.argv[1]) + dt.timedelta(days=1)
-print(d.isoformat())
-PY "$D")" \
+              --start "$d" \
+              --end   "$nxt" \
               --interval "${{ inputs.interval }}" \
               --capital_rs "${{ inputs.capital_rs }}" \
               --order_qty "${{ inputs.order_qty }}" \
-              --outdir   "$OUTROOT/$D" \
+              --outdir "$outdir" \
               --use_block "backtest_${{ matrix.profile }}"
-          done < days.txt
+          done
 
-          # merge all days into a single folder
-          python tools/merge_reports.py \
-            --root "$OUTROOT" \
-            --out "reports/${{ matrix.profile }}" \
-            --capital_rs "${{ inputs.capital_rs }}"
+      - name: Merge all days • ${{ matrix.profile }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, json, glob, pandas as pd
+          base = f"reports/${{ matrix.profile }}"
+          days = sorted([d for d in os.listdir(base) if d[:4].isdigit()])
+          merged_dir = f"reports/${{ matrix.profile }}_merged"
+          os.makedirs(merged_dir, exist_ok=True)
+
+          rows = []
+          trades_all = []
+          equity_all = []
+
+          for d in days:
+            daydir = os.path.join(base, d)
+            # metrics
+            mpath = os.path.join(daydir, "metrics.json")
+            m = {}
+            if os.path.exists(mpath):
+              try:
+                m = json.load(open(mpath))
+              except Exception:
+                m = {}
+            m_row = {
+              "date": d,
+              "trades": m.get("trades"),
+              "win_rate_%": m.get("win_rate"),
+              "ROI_%": m.get("ROI"),
+              "profit_factor": m.get("profit_factor"),
+              "max_dd_%": m.get("max_dd_perc"),
+              "sharpe": m.get("sharpe"),
+            }
+            rows.append(m_row)
+
+            # trades.csv
+            tpath = os.path.join(daydir, "trades.csv")
+            if os.path.exists(tpath):
+              try:
+                df = pd.read_csv(tpath)
+                df["date"] = d
+                trades_all.append(df)
+              except Exception: pass
+
+            # equity.csv
+            epath = os.path.join(daydir, "equity.csv")
+            if os.path.exists(epath):
+              try:
+                ef = pd.read_csv(epath)
+                ef["date"] = d
+                equity_all.append(ef)
+              except Exception: pass
+
+          # per-day table
+          table = pd.DataFrame(rows)
+          table.to_csv(os.path.join(merged_dir, "per_day_metrics.csv"), index=False)
+
+          # concat trades & equity
+          if trades_all:
+            pd.concat(trades_all, ignore_index=True).to_csv(os.path.join(merged_dir, "merged_trades.csv"), index=False)
+          if equity_all:
+            eq = pd.concat(equity_all, ignore_index=True)
+            eq.to_csv(os.path.join(merged_dir, "merged_equity.csv"), index=False)
+
+          # simple summary from metrics (trades sum, ROI approximate avg)
+          summary = {}
+          if not table.empty:
+            summary["days"] = len(days)
+            summary["trades"] = int(pd.to_numeric(table["trades"], errors="coerce").fillna(0).sum())
+            summary["avg_win_rate_%"] = float(pd.to_numeric(table["win_rate_%"], errors="coerce").mean())
+            summary["avg_profit_factor"] = float(pd.to_numeric(table["profit_factor"], errors="coerce").mean())
+            summary["avg_ROI_%"] = float(pd.to_numeric(table["ROI_%"], errors="coerce").mean())
+            summary["min_max_dd_%"] = float(pd.to_numeric(table["max_dd_%"], errors="coerce").min())
+            summary["avg_sharpe"] = float(pd.to_numeric(table["sharpe"], errors="coerce").mean())
+          with open(os.path.join(merged_dir, "summary.json"), "w") as f:
+            json.dump(summary, f, indent=2)
+
+          # README-style report
+          lines = ["# Multi-day Backtest (merged)",
+                   f"**Profile:** ${{ matrix.profile }}",
+                   f"**Range:** ${{ inputs.start }} → ${{ inputs.end }}",
+                   "", "## Summary", "```json",
+                   json.dumps(summary, indent=2),
+                   "```", "", "## Per-day metrics (preview)", table.head(10).to_markdown(index=False)]
+          open(os.path.join(merged_dir, "REPORT.md"), "w").write("\n".join(lines))
+          PY
 
       - name: Upload merged artifact
         uses: actions/upload-artifact@v4
         with:
           name: multi-day-${{ matrix.profile }}-${{ inputs.start }}-to-${{ inputs.end }}
-          path: reports/${{ matrix.profile }}/*
+          path: |
+            reports/${{ matrix.profile }}/*
+            reports/${{ matrix.profile }}_merged/*
           if-no-files-found: error
