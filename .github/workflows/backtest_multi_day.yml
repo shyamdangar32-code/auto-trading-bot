@@ -1,18 +1,16 @@
-name: Multi-day Backtest (no-merge)
+name: Multi-day Backtest
 
 on:
   workflow_dispatch:
     inputs:
-      start:
+      start_date:
         description: "Start date (YYYY-MM-DD)"
         required: true
-        default: "2025-09-08"
-      end:
-        description: "End date (YYYY-MM-DD) — exclusive (next day). Example: 2025-09-13"
+      end_date:
+        description: "End date (YYYY-MM-DD) — inclusive"
         required: true
-        default: "2025-09-13"
       underlying:
-        description: "Symbol (NIFTY / BANKNIFTY)"
+        description: "Symbol (NIFTY or BANKNIFTY)"
         required: true
         default: "NIFTY"
       interval:
@@ -29,7 +27,7 @@ on:
         default: "1"
 
 jobs:
-  run-multi-day:
+  multi-day:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -48,65 +46,42 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-
-      - name: Compute trading days list
-        id: daterange
-        shell: bash
-        run: |
-          python - <<'PY'
-          import os, datetime as dt
-          s = dt.date.fromisoformat(os.environ["INPUT_START"])
-          e = dt.date.fromisoformat(os.environ["INPUT_END"])
-          if not s < e:
-            raise SystemExit("start must be < end")
-          days = []
-          d = s
-          while d < e:
-            # Mon=0 ... Sun=6; market open Mon-Fri
-            if d.weekday() < 5:
-              days.append(d.isoformat())
-            d += dt.timedelta(days=1)
-          out = ",".join(days)
-          print("days="+out)
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-            f.write("days="+out+"\n")
-          PY
-
+      # make `from bot...` imports work
       - name: Add repo to PYTHONPATH
         run: echo "PYTHONPATH=$PYTHONPATH:$(pwd)" >> $GITHUB_ENV
 
-      - name: Run backtest for each day • ${{ matrix.profile }}
+      - name: Run backtest for each day (profile = ${{ matrix.profile }})
         env:
           ZERODHA_API_KEY: ${{ secrets.ZERODHA_API_KEY }}
           ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
-        shell: bash
         run: |
-          IFS=',' read -ra DAYS <<< "${{ steps.daterange.outputs.days }}"
-          for d in "${DAYS[@]}"; do
-            nxt=$(python - <<PY
-import datetime as dt, sys
-d = dt.date.fromisoformat(sys.argv[1])
-print((d+dt.timedelta(days=1)).isoformat())
-PY
-"$d")
-            outdir="reports/${{ matrix.profile }}/$d"
-            mkdir -p "$outdir"
-            echo "▶ ${d} → ${nxt}  →  $outdir"
-            python tools/run_backtest.py \
-              --underlying "${{ inputs.underlying }}" \
-              --start "$d" \
-              --end   "$nxt" \
-              --interval "${{ inputs.interval }}" \
-              --capital_rs "${{ inputs.capital_rs }}" \
-              --order_qty "${{ inputs.order_qty }}" \
-              --outdir "$outdir" \
-              --use_block "backtest_${{ matrix.profile }}"
-          done
-
-      - name: Upload artifacts (all days • ${{ matrix.profile }})
+          python - <<'PY'
+          import os, subprocess, datetime as dt
+          start = dt.date.fromisoformat("${{ inputs.start_date }}")
+          end   = dt.date.fromisoformat("${{ inputs.end_date }}")
+          # loop inclusive of end_date
+          d = start
+          while d <= end:
+              next_d = d + dt.timedelta(days=1)
+              outdir = f"reports/${{ matrix.profile }}/{d.isoformat()}"
+              cmd = [
+                  "python", "tools/run_backtest.py",
+                  "--underlying", "${{ inputs.underlying }}",
+                  "--start", d.isoformat(),
+                  "--end", next_d.isoformat(),
+                  "--interval", "${{ inputs.interval }}",
+                  "--capital_rs", "${{ inputs.capital_rs }}",
+                  "--order_qty", "${{ inputs.order_qty }}",
+                  "--outdir", outdir,
+                  "--use_block", "backtest_${{ matrix.profile }}"
+              ]
+              print("▶", " ".join(cmd), flush=True)
+              subprocess.run(cmd, check=True)
+              d = next_d
+          PY
+      - name: Upload artifacts (multi-day • ${{ matrix.profile }})
         uses: actions/upload-artifact@v4
         with:
-          name: multi-day-${{ matrix.profile }}-${{ inputs.start }}-to-${{ inputs.end }}
-          path: |
-            reports/${{ matrix.profile }}/**
-          if-no-files-found: error
+          name: multi-day-${{ matrix.profile }}-${{ inputs.start_date }}-to-${{ inputs.end_date }}
+          path: reports/${{ matrix.profile }}/**
+          if-no-files-found: warn
