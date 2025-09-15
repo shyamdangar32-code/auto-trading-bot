@@ -1,7 +1,32 @@
 name: Backtest
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "Start date (YYYY-MM-DD) — ખાલી રાખો તો auto=last 365 days"
+        required: false
+        default: ""
+      end:
+        description: "End date (YYYY-MM-DD) — ખાલી રાખો તો today (UTC)"
+        required: false
+        default: ""
+      underlying:
+        description: "Symbol (NIFTY / BANKNIFTY)"
+        required: true
+        default: "NIFTY"
+      interval:
+        description: "Interval (e.g., 1m, 3m, 5m, 15m)"
+        required: true
+        default: "1m"
+      capital_rs:
+        description: "Capital (₹)"
+        required: true
+        default: "100000"
+      order_qty:
+        description: "Fallback order qty"
+        required: true
+        default: "1"
 
 jobs:
   run-backtest:
@@ -22,9 +47,12 @@ jobs:
       TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      # --- Defaults ---
-      UNDERLYING: NIFTY
-      INTERVAL: "1m"
+      # --- From inputs (fallback to old defaults) ---
+      UNDERLYING: ${{ inputs.underlying || 'NIFTY' }}
+      INTERVAL:   ${{ inputs.interval   || '1m' }}
+      CAPITAL_RS: ${{ inputs.capital_rs || 100000 }}
+      ORDER_QTY:  ${{ inputs.order_qty  || 1 }}
+
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
     steps:
@@ -46,14 +74,24 @@ jobs:
       - name: Make repo importable
         run: echo "PYTHONPATH=$GITHUB_WORKSPACE" >> $GITHUB_ENV
 
-      - name: Compute date range (last 365 days)
+      - name: Compute date range (inputs → fallback last 365 days)
         id: dates
         shell: bash
         run: |
-          END=$(date -u +%F)
-          START=$(date -u -d "$END -365 days" +%F)
-          echo "start=$START" >> "$GITHUB_OUTPUT"
-          echo "end=$END"   >> "$GITHUB_OUTPUT"
+          python - <<'PY'
+          import os, datetime as dt
+          s_in = os.getenv('INPUT_START','').strip()
+          e_in = os.getenv('INPUT_END','').strip()
+          if s_in and e_in:
+              s = dt.date.fromisoformat(s_in)
+              e = dt.date.fromisoformat(e_in)
+          else:
+              e = dt.datetime.utcnow().date()
+              s = e - dt.timedelta(days=365)
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              f.write(f"start={s.isoformat()}\n")
+              f.write(f"end={e.isoformat()}\n")
+          PY
 
       - name: Run backtest (${{ matrix.profile }})
         run: |
@@ -63,8 +101,8 @@ jobs:
             --start "${{ steps.dates.outputs.start }}" \
             --end   "${{ steps.dates.outputs.end }}" \
             --interval "${INTERVAL}" \
-            --capital_rs 100000 \
-            --order_qty 1 \
+            --capital_rs "${CAPITAL_RS}" \
+            --order_qty "${ORDER_QTY}" \
             --outdir "./reports/${{ matrix.profile }}" \
             --use_block "backtest_${{ matrix.profile }}"
 
