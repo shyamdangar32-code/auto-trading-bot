@@ -47,11 +47,15 @@ jobs:
       TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      # --- From inputs (fallback to old defaults) ---
+      # --- Inputs (with safe defaults) ---
       UNDERLYING: ${{ inputs.underlying || 'NIFTY' }}
       INTERVAL:   ${{ inputs.interval   || '1m' }}
       CAPITAL_RS: ${{ inputs.capital_rs || 100000 }}
       ORDER_QTY:  ${{ inputs.order_qty  || 1 }}
+
+      # bind raw inputs to env explicitly (avoid INPUT_* surprises)
+      START_IN:   ${{ inputs.start || '' }}
+      END_IN:     ${{ inputs.end   || '' }}
 
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
@@ -69,29 +73,31 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          python -c "import sys, pandas, numpy; print('✅ Versions:', sys.version.split()[0], 'pandas', pandas.__version__, 'numpy', numpy.__version__)"
+          python - <<'PY'
+          import sys, pandas, numpy
+          print("✅ Versions:", sys.version.split()[0], "pandas", pandas.__version__, "numpy", numpy.__version__)
+          PY
 
       - name: Make repo importable
         run: echo "PYTHONPATH=$GITHUB_WORKSPACE" >> $GITHUB_ENV
 
-      - name: Compute date range (inputs → fallback last 365 days)
+      - name: Compute date range (respect UI inputs)
         id: dates
         shell: bash
         run: |
           python - <<'PY'
           import os, datetime as dt
-          s_in = os.getenv('INPUT_START','').strip()
-          e_in = os.getenv('INPUT_END','').strip()
+          s_in = os.getenv('START_IN','').strip()
+          e_in = os.getenv('END_IN','').strip()
           if s_in and e_in:
               s = dt.date.fromisoformat(s_in)
               e = dt.date.fromisoformat(e_in)
+              mode = "UI inputs"
           else:
               e = dt.datetime.utcnow().date()
               s = e - dt.timedelta(days=365)
-
-          # 👇 Confirmation print
-          print(f"✅ Using backtest range: {s} → {e}")
-
+              mode = "fallback 365d"
+          print(f"📅 Using range ({mode}): {s} → {e}")
           with open(os.environ['GITHUB_OUTPUT'],'a') as f:
               f.write(f"start={s.isoformat()}\n")
               f.write(f"end={e.isoformat()}\n")
@@ -100,6 +106,7 @@ jobs:
       - name: Run backtest (${{ matrix.profile }})
         run: |
           mkdir -p reports logs
+          echo "▶ Running ${UNDERLYING} ${INTERVAL} from ${{ steps.dates.outputs.start }} to ${{ steps.dates.outputs.end }}"
           python -m tools.run_backtest \
             --underlying "${UNDERLYING}" \
             --start "${{ steps.dates.outputs.start }}" \
@@ -146,7 +153,7 @@ jobs:
           rows=[]
           for prof in ['loose','medium','strict']:
               p = glob.glob(f"artifacts/backtest-artifacts-{prof}/**/metrics.json", recursive=True)
-              if not p: 
+              if not p:
                   rows.append(f"{prof}: (no metrics)")
                   continue
               m = json.load(open(p[0],'r',encoding='utf-8'))
