@@ -53,7 +53,7 @@ jobs:
       CAPITAL_RS: ${{ inputs.capital_rs || 100000 }}
       ORDER_QTY:  ${{ inputs.order_qty  || 1 }}
 
-      # bind raw inputs to env explicitly (avoid INPUT_* surprises)
+      # bind raw inputs to env explicitly
       START_IN:   ${{ inputs.start || '' }}
       END_IN:     ${{ inputs.end   || '' }}
 
@@ -87,8 +87,10 @@ jobs:
         run: |
           python - <<'PY'
           import os, datetime as dt
-          s_in = os.getenv('START_IN','').strip()
-          e_in = os.getenv('END_IN','').strip()
+          # Read from both our explicit envs and GitHub's implicit INPUT_* envs
+          s_in = (os.getenv('START_IN') or os.getenv('INPUT_START') or '').strip()
+          e_in = (os.getenv('END_IN')   or os.getenv('INPUT_END')   or '').strip()
+
           if s_in and e_in:
               s = dt.date.fromisoformat(s_in)
               e = dt.date.fromisoformat(e_in)
@@ -97,7 +99,10 @@ jobs:
               e = dt.datetime.utcnow().date()
               s = e - dt.timedelta(days=365)
               mode = "fallback 365d"
+
+          print(f"📥 RAW inputs: START='{s_in}'  END='{e_in}'")
           print(f"📅 Using range ({mode}): {s} → {e}")
+
           with open(os.environ['GITHUB_OUTPUT'],'a') as f:
               f.write(f"start={s.isoformat()}\n")
               f.write(f"end={e.isoformat()}\n")
