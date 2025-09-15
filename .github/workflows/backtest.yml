@@ -47,7 +47,7 @@ jobs:
       TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
 
-      # --- From inputs (fallbacks) ---
+      # --- From inputs (fallback to old defaults) ---
       UNDERLYING: ${{ inputs.underlying || 'NIFTY' }}
       INTERVAL:   ${{ inputs.interval   || '1m' }}
       CAPITAL_RS: ${{ inputs.capital_rs || 100000 }}
@@ -82,20 +82,19 @@ jobs:
           import os, datetime as dt
           s_in = os.getenv('INPUT_START','').strip()
           e_in = os.getenv('INPUT_END','').strip()
+          if s_in and e_in:
+              s = dt.date.fromisoformat(s_in)
+              e = dt.date.fromisoformat(e_in)
+          else:
+              e = dt.datetime.utcnow().date()
+              s = e - dt.timedelta(days=365)
 
-          # end = today if not provided
-          end = dt.datetime.utcnow().date() if not e_in else dt.date.fromisoformat(e_in)
-          # start = provided or (end - 365d)
-          start = dt.date.fromisoformat(s_in) if s_in else (end - dt.timedelta(days=365))
-
-          if start >= end:
-            raise SystemExit(f"start must be < end (got {start} .. {end})")
+          # 👇 Confirmation print
+          print(f"✅ Using backtest range: {s} → {e}")
 
           with open(os.environ['GITHUB_OUTPUT'],'a') as f:
-            f.write(f"start={start.isoformat()}\n")
-            f.write(f"end={end.isoformat()}\n")
-
-          print(f"Using range: {start} -> {end}")
+              f.write(f"start={s.isoformat()}\n")
+              f.write(f"end={e.isoformat()}\n")
           PY
 
       - name: Run backtest (${{ matrix.profile }})
@@ -147,16 +146,12 @@ jobs:
           rows=[]
           for prof in ['loose','medium','strict']:
               p = glob.glob(f"artifacts/backtest-artifacts-{prof}/**/metrics.json", recursive=True)
-              if not p:
+              if not p: 
                   rows.append(f"{prof}: (no metrics)")
                   continue
               m = json.load(open(p[0],'r',encoding='utf-8'))
-              rows.append(
-                f"{prof}: trades={m.get('n_trades',0)} | "
-                f"win%={m.get('win_rate',0)} | PF={m.get('profit_factor',0)} | "
-                f"R:R={m.get('rr',0)} | ROI%={m.get('roi_pct',0)} | DD%={m.get('max_dd_pct',0)}"
-              )
-          txt = "Backtest Comparison (loose | medium | strict)\n" + "\n".join(rows)
+              rows.append(f"{prof}: trades={m.get('n_trades',0)} | win%={m.get('win_rate',0)} | PF={m.get('profit_factor',0)} | R:R={m.get('rr',0)} | ROI%={m.get('roi_pct',0)} | DD%={m.get('max_dd_pct',0)}")
+          txt="Backtest Comparison (loose | medium | strict)\n" + "\n".join(rows)
           pathlib.Path("comparison.txt").write_text(txt, encoding="utf-8")
           PY
 
