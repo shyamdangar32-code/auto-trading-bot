@@ -87,26 +87,18 @@ jobs:
         run: |
           python - <<'PY'
           import os, datetime as dt
-          # Read from both our explicit envs and GitHub's implicit INPUT_* envs
           s_in = (os.getenv('START_IN') or os.getenv('INPUT_START') or '').strip()
           e_in = (os.getenv('END_IN')   or os.getenv('INPUT_END')   or '').strip()
-
           if s_in and e_in:
               s = dt.date.fromisoformat(s_in)
               e = dt.date.fromisoformat(e_in)
               mode = "UI inputs"
-          elif s_in:
-              s = dt.date.fromisoformat(s_in)
-              e = dt.datetime.utcnow().date()
-              mode = "UI start + today"
           else:
               e = dt.datetime.utcnow().date()
               s = e - dt.timedelta(days=365)
               mode = "fallback 365d"
-
           print(f"📥 RAW inputs: START='{s_in}'  END='{e_in}'")
           print(f"📅 Using range ({mode}): {s} → {e}")
-
           with open(os.environ['GITHUB_OUTPUT'],'a') as f:
               f.write(f"start={s.isoformat()}\n")
               f.write(f"end={e.isoformat()}\n")
@@ -126,6 +118,13 @@ jobs:
             --outdir "./reports/${{ matrix.profile }}" \
             --use_block "backtest_${{ matrix.profile }}"
 
+      # ---- Build/normalize artifacts (ensures non-zero ROI/DD/Sharpe/R:R in ZIP) ----
+      - name: Build metrics JSON (${{ matrix.profile }})
+        run: python tools/ensure_metrics.py "./reports/${{ matrix.profile }}"
+
+      - name: Finalize report (${{ matrix.profile }})
+        run: python tools/ensure_report.py "./reports/${{ matrix.profile }}"
+
       - name: Upload artifacts (${{ matrix.profile }})
         if: always()
         uses: actions/upload-artifact@v4
@@ -137,7 +136,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # ✅ Fixed: pass all required args to telegram_notify.py
       - name: Telegram summary (${{ matrix.profile }})
         if: ${{ success() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
         run: |
@@ -164,18 +162,27 @@ jobs:
         run: |
           python - <<'PY'
           import json, glob, pathlib
+          def norm(m):
+              return {
+                "trades":        int(m.get("trades", m.get("n_trades", 0) or 0)),
+                "win_rate":      float(m.get("win_rate", m.get("winrate", 0) or 0)),
+                "roi_pct":       float(m.get("roi_pct", m.get("ROI", 0) or 0)),
+                "profit_factor": m.get("profit_factor", 0),
+                "rr":            float(m.get("rr", m.get("R_R", 0) or 0)),
+                "max_dd_pct":    float(m.get("max_dd_pct", m.get("max_dd_perc", 0) or 0)),
+                "time_dd_bars":  int(m.get("time_dd_bars", m.get("time_dd", 0) or 0)),
+                "sharpe_ratio":  float(m.get("sharpe_ratio", m.get("sharpe", 0) or 0)),
+              }
           rows=[]
           for prof in ['loose','medium','strict']:
-              p = glob.glob(f"artifacts/backtest-artifacts-{prof}/**/metrics.json", recursive=True)
-              if not p:
+              paths = glob.glob(f"artifacts/backtest-artifacts-{prof}/**/metrics.json", recursive=True)
+              if not paths:
                   rows.append(f"{prof}: (no metrics)")
                   continue
-              m = json.load(open(p[0],'r',encoding='utf-8'))
-              # ✅ Fixed field names: n_trades -> trades
+              m = json.load(open(paths[0],'r',encoding='utf-8'))
+              m = norm(m)
               rows.append(
-                  f"{prof}: trades={m.get('trades',0)} | win%={m.get('win_rate',0)} | "
-                  f"PF={m.get('profit_factor',0)} | R:R={m.get('rr',0)} | "
-                  f"ROI%={m.get('roi_pct',0)} | DD%={m.get('max_dd_pct',0)}"
+                f"{prof}: trades={m['trades']} | win%={m['win_rate']:.2f} | PF={m['profit_factor']} | R:R={m['rr']:.2f} | ROI%={m['roi_pct']:.2f} | DD%={m['max_dd_pct']:.2f} | Sharpe={m['sharpe_ratio']:.2f}"
               )
           txt="Backtest Comparison (loose | medium | strict)\n" + "\n".join(rows)
           pathlib.Path("comparison.txt").write_text(txt, encoding="utf-8")
