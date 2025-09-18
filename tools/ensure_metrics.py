@@ -4,12 +4,13 @@
 """
 Build/refresh metrics.json for a backtest reports directory.
 
-Reads trades.csv (and optionally equity curve) to compute:
+Reads trades.csv to compute:
 - trades, win_rate, roi_pct, final_capital
 - max_dd_pct, time_dd_bars
 - profit_factor, rr (avg win / avg loss)
-- sharpe_ratio  (per-trade; sqrt(N) scaled)
-Also preserves any extra keys already present in metrics.json.
+- sharpe_ratio (per-trade; sqrt(N) scaled)
+
+Writes/updates `metrics.json` in the same reports dir.
 """
 
 import os, sys, json, math
@@ -36,8 +37,9 @@ def compute_from_trades(trades_csv, initial_capital=INITIAL_CAPITAL):
     if df.empty:
         return {}
 
-    # pick PnL column
-    pnl_col = next((c for c in df.columns if "pnl" in c.lower() or "profit" in c.lower()), None)
+    # robust PnL column detection
+    candidates = ["pnl", "netpnl", "net_pnl", "pnl_rs", "profit", "pl", "p&l"]
+    pnl_col = next((c for c in df.columns if any(k in c.lower() for k in candidates)), None)
     if pnl_col is None:
         eprint("WARN: PnL column not found in trades.csv")
         return {}
@@ -57,7 +59,7 @@ def compute_from_trades(trades_csv, initial_capital=INITIAL_CAPITAL):
     losses = int((closed[pnl_col] < 0).sum())
     win_rate = 100.0 * wins / trades if trades else 0.0
 
-    # equity curve (per trade cum PnL)
+    # equity curve
     equity = initial_capital + closed[pnl_col].cumsum()
     final_capital = float(equity.iloc[-1]) if trades else float(initial_capital)
     roi_pct = 100.0 * (final_capital - initial_capital) / initial_capital
@@ -76,14 +78,17 @@ def compute_from_trades(trades_csv, initial_capital=INITIAL_CAPITAL):
     else:
         profit_factor = float("inf") if gross_profit > 0 else 0.0
 
-    # R:R
-    avg_win = float(closed.loc[closed[pnl_col] > 0, pnl_col].mean()) if wins else 0.0
-    avg_loss = float(-closed.loc[closed[pnl_col] < 0, pnl_col].mean()) if losses else 0.0
+    # ----- R:R (FIXED) -----
+    # Use absolute loss magnitude to avoid sign/NaN issues
+    wins_series  = closed.loc[closed[pnl_col] > 0, pnl_col]
+    loss_series  = closed.loc[closed[pnl_col] < 0, pnl_col].abs()
+    avg_win  = float(wins_series.mean())  if wins_series.size  > 0 else 0.0
+    avg_loss = float(loss_series.mean())  if loss_series.size > 0 else 0.0
     rr = (avg_win / avg_loss) if avg_loss > 0 else 0.0
 
-    # Sharpe (per-trade). You can annualize differently if needed.
+    # Sharpe (per-trade). Annualization as sqrt(N) over trade count.
     rets = closed[pnl_col] / float(initial_capital)
-    sharpe_ratio = float((rets.mean() / rets.std()) * math.sqrt(len(rets))) if trades and rets.std() != 0 else 0.0
+    sharpe_ratio = float((rets.mean() / (rets.std() or 1.0)) * math.sqrt(len(rets))) if trades else 0.0
 
     return {
         "trades": trades,
@@ -108,20 +113,15 @@ def main():
     metrics_path = os.path.join(rep_dir, "metrics.json")
     trades_csv = os.path.join(rep_dir, "trades.csv")
 
-    # start from any existing metrics and augment with fresh calcs
     out = load_existing(metrics_path)
     fresh = compute_from_trades(trades_csv, INITIAL_CAPITAL)
     out.update(fresh)
 
-    # sanity fields
-    if "trades" not in out:
-        out["trades"] = 0
-    if "win_rate" not in out:
-        out["win_rate"] = 0.0
-    if "roi_pct" not in out:
-        out["roi_pct"] = 0.0
-    if "final_capital" not in out:
-        out["final_capital"] = INITIAL_CAPITAL
+    # sanity defaults
+    out.setdefault("trades", 0)
+    out.setdefault("win_rate", 0.0)
+    out.setdefault("roi_pct", 0.0)
+    out.setdefault("final_capital", INITIAL_CAPITAL)
 
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
