@@ -95,6 +95,10 @@ jobs:
               s = dt.date.fromisoformat(s_in)
               e = dt.date.fromisoformat(e_in)
               mode = "UI inputs"
+          elif s_in:
+              s = dt.date.fromisoformat(s_in)
+              e = dt.datetime.utcnow().date()
+              mode = "UI start + today"
           else:
               e = dt.datetime.utcnow().date()
               s = e - dt.timedelta(days=365)
@@ -133,12 +137,17 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      # ✅ Fixed: pass all required args to telegram_notify.py
       - name: Telegram summary (${{ matrix.profile }})
         if: ${{ success() && env.TELEGRAM_BOT_TOKEN != '' && env.TELEGRAM_CHAT_ID != '' }}
         run: |
           python tools/telegram_notify.py \
-            --dir "./reports/${{ matrix.profile }}" \
-            --title "Backtest ${{ matrix.profile }} • ${UNDERLYING} • ${INTERVAL}"
+            --reports "./reports/${{ matrix.profile }}" \
+            --token   "${{ env.TELEGRAM_BOT_TOKEN }}" \
+            --chat    "${{ env.TELEGRAM_CHAT_ID }}" \
+            --title   "Backtest ${{ matrix.profile }}" \
+            --symbol  "${{ env.UNDERLYING }}" \
+            --interval "${{ env.INTERVAL }}"
 
   compare:
     name: Compare (loose vs medium vs strict)
@@ -162,7 +171,12 @@ jobs:
                   rows.append(f"{prof}: (no metrics)")
                   continue
               m = json.load(open(p[0],'r',encoding='utf-8'))
-              rows.append(f"{prof}: trades={m.get('n_trades',0)} | win%={m.get('win_rate',0)} | PF={m.get('profit_factor',0)} | R:R={m.get('rr',0)} | ROI%={m.get('roi_pct',0)} | DD%={m.get('max_dd_pct',0)}")
+              # ✅ Fixed field names: n_trades -> trades
+              rows.append(
+                  f"{prof}: trades={m.get('trades',0)} | win%={m.get('win_rate',0)} | "
+                  f"PF={m.get('profit_factor',0)} | R:R={m.get('rr',0)} | "
+                  f"ROI%={m.get('roi_pct',0)} | DD%={m.get('max_dd_pct',0)}"
+              )
           txt="Backtest Comparison (loose | medium | strict)\n" + "\n".join(rows)
           pathlib.Path("comparison.txt").write_text(txt, encoding="utf-8")
           PY
