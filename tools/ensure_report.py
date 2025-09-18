@@ -1,72 +1,203 @@
-# tools/ensure_report.py
-# -----------------------------------------------------------
-# Minimal-report helper used by GitHub Actions steps.
-# Ensures that downstream steps (artifacts upload, telegram)
-# never fail even when real backtest produces no data.
-# -----------------------------------------------------------
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-from __future__ import annotations
+"""
+Ensure report artifacts:
+- Normalize & augment metrics (including R:R) from metrics.json and/or trades.csv
+- Rewrite metrics.json (adds both 'rr' and legacy 'R_R')
+- Rewrite REPORT.md with all metrics incl. R:R
+- Rewrite decision.json with accepted_metrics
 
-import json
-from pathlib import Path
-from datetime import datetime
+Usage:
+  python tools/ensure_report.py <reports_dir>
+"""
 
+import os, sys, json, math
+import pandas as pd
+import numpy as np
 
-__all__ = ["ensure_report"]
+INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100000"))
 
+def eprint(*a): print(*a, file=sys.stderr)
 
-def _safe_write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+# ---------- Core helpers ----------
 
+def _detect_pnl_col(df):
+    cands = ["pnl","netpnl","net_pnl","pnl_rs","profit","pl","p&l"]
+    for c in df.columns:
+        cl = c.lower()
+        if any(k in cl for k in cands):
+            return c
+    return None
 
-def _safe_write_json(path: Path, obj: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
+def compute_from_trades(trades_csv, initial_capital=INITIAL_CAPITAL):
+    """Compute full metric set from trades.csv."""
+    if not os.path.isfile(trades_csv):
+        return {}
+    df = pd.read_csv(trades_csv)
+    if df.empty:
+        return {}
 
+    pnl_col = _detect_pnl_col(df)
+    if pnl_col is None:
+        eprint("WARN: PnL column not found in trades.csv")
+        return {}
 
-def ensure_report(outdir: str = "./reports", note: str = "No summary") -> None:
-    """
-    Create a minimal set of report files expected by the workflow:
+    if "status" in df.columns:
+        closed = df[df["status"].astype(str).str.lower().isin(
+            ["closed","filled","exit","complete"]
+        )].copy()
+        if closed.empty:
+            closed = df.copy()
+    else:
+        closed = df.copy()
 
-      - reports/metrics.json
-      - reports/trades.csv
-      - logs/summary.txt
+    trades = int(len(closed))
+    wins = int((closed[pnl_col] > 0).sum())
+    losses = int((closed[pnl_col] < 0).sum())
+    win_rate = 100.0 * wins / trades if trades else 0.0
 
-    Safe to call multiple times. Does NOT overwrite real files
-    if they already exist with content.
-    """
-    out_dir = Path(outdir)
-    logs_dir = Path("./logs")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    logs_dir.mkdir(parents=True, exist_ok=True)
+    equity = initial_capital + closed[pnl_col].cumsum()
+    final_capital = float(equity.iloc[-1]) if trades else float(initial_capital)
+    roi_pct = 100.0 * (final_capital - initial_capital) / initial_capital
 
-    # 1) metrics.json (only create if missing/empty)
-    metrics_path = out_dir / "metrics.json"
-    if not metrics_path.exists() or metrics_path.stat().st_size == 0:
-        metrics = {
-            "trades": 0,
-            "win_rate": 0.0,
-            "roi": 0.0,
-            "profit_factor": 0.0,
-            "rr": 0.0,
-            "max_dd_pct": 0.0,
-            "time_dd_bars": 0,
-            "sharpe": 0.0,
-            "note": note,
-            "generated_at": datetime.utcnow().isoformat() + "Z",
-        }
-        _safe_write_json(metrics_path, metrics)
+    peak = equity.cummax()
+    dd = (equity - peak) / peak
+    max_dd_pct = 100.0 * float(dd.min()) if trades else 0.0
+    time_dd_bars = int((dd < 0).sum()) if trades else 0
 
-    # 2) trades.csv header (only if file missing/empty)
-    trades_path = out_dir / "trades.csv"
-    if not trades_path.exists() or trades_path.stat().st_size == 0:
-        _safe_write_text(trades_path, "time,signal,price,qty,pnl\n")
+    total_profit = float(closed.loc[closed[pnl_col] > 0, pnl_col].sum())
+    total_loss = float(-closed.loc[closed[pnl_col] < 0, pnl_col].sum())
+    profit_factor = (total_profit / total_loss) if total_loss > 0 else (float("inf") if total_profit > 0 else 0.0)
 
-    # 3) logs/summary.txt (always refresh with latest note)
-    summary_path = logs_dir / "summary.txt"
-    _safe_write_text(summary_path, f"Backtest Summary: {note}\n")
+    # R:R (robust)
+    wins_series  = closed.loc[closed[pnl_col] > 0, pnl_col]
+    loss_series  = closed.loc[closed[pnl_col] < 0, pnl_col].abs()
+    avg_win  = float(wins_series.mean())  if wins_series.size  > 0 else 0.0
+    avg_loss = float(loss_series.mean())  if loss_series.size > 0 else 0.0
+    rr = (avg_win / avg_loss) if avg_loss > 0 else 0.0
 
-    print(
-        f"ensure_report: ready → {metrics_path}, {trades_path}, {summary_path}"
+    rets = closed[pnl_col] / float(initial_capital)
+    sharpe_ratio = float((rets.mean() / (rets.std() or 1.0)) * np.sqrt(len(rets))) if trades else 0.0
+
+    return {
+        "trades": trades,
+        "win_rate": round(win_rate, 2),
+        "roi_pct": round(roi_pct, 2),
+        "final_capital": round(final_capital, 2),
+        "profit_factor": (round(profit_factor, 2) if np.isfinite(profit_factor) else "Inf"),
+        "rr": round(rr, 2),
+        "max_dd_pct": round(max_dd_pct, 2),
+        "time_dd_bars": time_dd_bars,
+        "sharpe_ratio": round(sharpe_ratio, 2),
+    }
+
+def normalize_keys(m):
+    """Map any legacy keys to our canonical names."""
+    return {
+        "trades":        int(m.get("trades", m.get("n_trades", 0) or 0)),
+        "win_rate":      float(m.get("win_rate", m.get("winrate", 0) or 0)),
+        "roi_pct":       float(m.get("roi_pct", m.get("ROI", 0) or 0)),
+        "profit_factor": m.get("profit_factor", 0),
+        "rr":            float(m.get("rr", m.get("R_R", 0) or 0)),
+        "max_dd_pct":    float(m.get("max_dd_pct", m.get("max_dd_perc", 0) or 0)),
+        "time_dd_bars":  int(m.get("time_dd_bars", m.get("time_dd", 0) or 0)),
+        "sharpe_ratio":  float(m.get("sharpe_ratio", m.get("sharpe", 0) or 0)),
+        "final_capital": float(m.get("final_capital", m.get("FinalCapital", 0) or 0)),
+    }
+
+def format_report(m):
+    return (
+        "# Backtest Summary\n\n"
+        f"- **Trades**: {m['trades']}\n"
+        f"- **Win-rate**: {m['win_rate']:.2f}%\n"
+        f"- **ROI**: {m['roi_pct']:.2f}%\n"
+        f"- **Profit Factor**: {m['profit_factor']}\n"
+        f"- **R:R**: {m['rr']:.2f}\n"
+        f"- **Max DD**: {m['max_dd_pct']:.2f}%\n"
+        f"- **Time DD (bars)**: {m['time_dd_bars']}\n"
+        f"- **Sharpe**: {m['sharpe_ratio']:.2f}\n\n"
+        "![Equity](equity_curve.png)\n"
+        "![Drawdown](drawdown.png)\n"
     )
+
+# ---------- Main ----------
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: python tools/ensure_report.py <reports_dir>")
+        return 0
+
+    rep = sys.argv[1]
+    os.makedirs(rep, exist_ok=True)
+
+    metrics_path  = os.path.join(rep, "metrics.json")
+    trades_csv    = os.path.join(rep, "trades.csv")
+    report_md     = os.path.join(rep, "REPORT.md")
+    decision_json = os.path.join(rep, "decision.json")
+
+    # 1) load + normalize existing metrics (optional)
+    m = {}
+    if os.path.isfile(metrics_path):
+        try:
+            m = json.load(open(metrics_path, "r", encoding="utf-8"))
+        except Exception as ex:
+            eprint("WARN: metrics.json read failed:", ex)
+            m = {}
+
+    nm = normalize_keys(m)
+
+    # 2) if critical fields missing/zero -> augment from trades.csv
+    need_aug = (
+        nm["trades"] == 0
+        or nm["rr"] == 0
+        or nm["roi_pct"] == 0
+        or nm["max_dd_pct"] == 0
+        or nm["sharpe_ratio"] == 0
+    )
+    if need_aug:
+        aug = compute_from_trades(trades_csv)
+        if aug:
+            nm.update(aug)
+
+    # 3) write back a *consistent* metrics.json (include legacy aliases too)
+    write_metrics = dict(nm)
+    write_metrics["R_R"] = nm["rr"]                 # legacy alias
+    write_metrics["ROI"] = nm["roi_pct"]            # legacy alias
+    write_metrics["max_dd_perc"] = nm["max_dd_pct"] # legacy alias
+    write_metrics["FinalCapital"] = nm["final_capital"]  # legacy alias
+
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(write_metrics, f, indent=2, ensure_ascii=False)
+
+    # 4) REPORT.md
+    with open(report_md, "w", encoding="utf-8") as f:
+        f.write(format_report(nm))
+
+    # 5) decision.json (simple, consistent payload)
+    decision = {
+        "mode": "auto",
+        "applied": "accepted",
+        "reason": "normalized & augmented from metrics/trades",
+        "accepted_metrics": {
+            "trades": nm["trades"],
+            "win_rate": nm["win_rate"],
+            "ROI": nm["roi_pct"],
+            "profit_factor": nm["profit_factor"],
+            "R_R": nm["rr"],
+            "max_dd_perc": nm["max_dd_pct"],
+            "time_dd_bars": nm["time_dd_bars"],
+            "sharpe": nm["sharpe_ratio"]
+        }
+    }
+    with open(decision_json, "w", encoding="utf-8") as f:
+        json.dump(decision, f, indent=2, ensure_ascii=False)
+
+    print("✅ report artifacts refreshed:",
+          os.path.basename(metrics_path),
+          os.path.basename(report_md),
+          os.path.basename(decision_json))
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
