@@ -79,7 +79,7 @@ def _metrics_from_trades(trades_csv, initial_capital=INITIAL_CAPITAL):
         profit_factor = (total_profit / total_loss) if total_loss > 0 else (float("inf") if total_profit > 0 else 0.0)
 
         avg_win = float(closed.loc[closed[pnl_col] > 0, pnl_col].mean()) if wins else 0.0
-        avg_loss = float(-closed.loc[closed[pnl_col] < 0, pnl_col].mean()) if losses else 0.0
+        avg_loss = float(closed.loc[closed[pnl_col] < 0, pnl_col].abs().mean()) if losses else 0.0
         rr = (avg_win / avg_loss) if avg_loss > 0 else 0.0
 
         return {
@@ -128,12 +128,12 @@ def build_summary(rep_dir: str) -> str:
                 or norm["roi_pct"] == 0
                 or norm["max_dd_pct"] == 0
                 or norm["sharpe_ratio"] == 0
+                or norm["rr"] == 0
             )
             if need_aug:
                 tcsv = os.path.join(rep_dir, "trades.csv")
                 m2 = _metrics_from_trades(tcsv)
                 if m2:
-                    # overlay only important fields
                     for k in ["trades","win_rate","roi_pct","final_capital","profit_factor","rr","max_dd_pct","time_dd_bars","sharpe_ratio"]:
                         norm[k] = m2.get(k, norm.get(k, 0))
 
@@ -173,7 +173,6 @@ def build_summary(rep_dir: str) -> str:
     if os.path.isfile(js_path):
         try:
             data = json.load(open(js_path, "r", encoding="utf-8"))
-            # normalize legacy names as well
             norm = _normalize_metrics_keys(data)
             return (
                 "📊 <b>Backtest Summary</b>\n"
