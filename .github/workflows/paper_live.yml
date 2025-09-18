@@ -1,0 +1,106 @@
+name: Paper Live
+
+on:
+  workflow_dispatch:
+    inputs:
+      underlying:
+        description: "Symbol (NIFTY / BANKNIFTY)"
+        required: true
+        default: "NIFTY"
+      interval:
+        description: "Interval (e.g., 1m, 3m, 5m, 15m)"
+        required: true
+        default: "1m"
+      profile:
+        description: "Profile (loose / medium / strict)"
+        required: true
+        default: "loose"
+      capital_rs:
+        description: "Paper capital (₹)"
+        required: true
+        default: "100000"
+      order_qty:
+        description: "Fallback order qty (used by your backtest block only)"
+        required: true
+        default: "1"
+      lookback_days:
+        description: "Backtest window days each poll"
+        required: true
+        default: "5"
+      poll_seconds:
+        description: "Polling interval (seconds)"
+        required: true
+        default: "60"
+
+jobs:
+  paper-live:
+    name: Paper live • ${{ inputs.underlying }} • ${{ inputs.interval }} • ${{ inputs.profile }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 390   # market hours upper bound
+
+    env:
+      # --- Secrets for Zerodha & Telegram ---
+      ZERODHA_API_KEY:       ${{ secrets.ZERODHA_API_KEY }}
+      ZERODHA_API_SECRET:    ${{ secrets.ZERODHA_API_SECRET }}
+      ZERODHA_ACCESS_TOKEN:  ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+      TELEGRAM_BOT_TOKEN:    ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID:      ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      # --- Inputs ---
+      UNDERLYING:   ${{ inputs.underlying }}
+      INTERVAL:     ${{ inputs.interval }}
+      PROFILE:      ${{ inputs.profile }}
+      CAPITAL_RS:   ${{ inputs.capital_rs }}
+      ORDER_QTY:    ${{ inputs.order_qty }}
+      LOOKBACK_D:   ${{ inputs.lookback_days }}
+      POLL_SECS:    ${{ inputs.poll_seconds }}
+
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          echo "PYTHONPATH=$GITHUB_WORKSPACE" >> $GITHUB_ENV
+          python - <<'PY'
+          import sys, pandas, numpy
+          print("✅ Versions:", sys.version.split()[0], "pandas", pandas.__version__, "numpy", numpy.__version__)
+          PY
+
+      - name: Start paper-live loop
+        env:
+          TZ: Asia/Kolkata
+        run: |
+          mkdir -p live/reports live/logs
+          python tools/live_runner.py \
+            --mode paper \
+            --underlying "${UNDERLYING}" \
+            --interval  "${INTERVAL}" \
+            --profile   "${PROFILE}" \
+            --capital_rs "${CAPITAL_RS}" \
+            --order_qty  "${ORDER_QTY}" \
+            --lookback_days "${LOOKBACK_D}" \
+            --poll_seconds "${POLL_SECS}" \
+            --outdir "./live/reports/${PROFILE}" \
+            --telegram_token "${TELEGRAM_BOT_TOKEN}" \
+            --telegram_chat  "${TELEGRAM_CHAT_ID}"
+
+      - name: Upload live artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper-live-${{ inputs.underlying }}-${{ inputs.interval }}-${{ inputs.profile }}
+          path: |
+            live/**
+          if-no-files-found: warn
+          retention-days: 7
