@@ -1,72 +1,131 @@
-# tools/ensure_metrics.py
-from __future__ import annotations
-import json, pathlib, csv, argparse, datetime as dt, os
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-def is_nonempty(p: pathlib.Path) -> bool:
-    try:
-        return p.exists() and p.stat().st_size > 10
-    except Exception:
-        return False
+"""
+Build/refresh metrics.json for a backtest reports directory.
 
-def write_json(p: pathlib.Path, data: dict) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+Reads trades.csv (and optionally equity curve) to compute:
+- trades, win_rate, roi_pct, final_capital
+- max_dd_pct, time_dd_bars
+- profit_factor, rr (avg win / avg loss)
+- sharpe_ratio  (per-trade; sqrt(N) scaled)
+Also preserves any extra keys already present in metrics.json.
+"""
 
-def write_empty_signals_csv(p: pathlib.Path) -> None:
-    p.parent.mkdir(parents=True, exist_ok=True)
-    headers = ["timestamp","action","symbol","price","qty","pnl"]
-    with open(p, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow(headers)
+import os, sys, json, math
+import pandas as pd
+import numpy as np
+
+INITIAL_CAPITAL = float(os.getenv("INITIAL_CAPITAL", "100000"))
+
+def eprint(*a): print(*a, file=sys.stderr)
+
+def load_existing(path):
+    if os.path.isfile(path):
+        try:
+            return json.load(open(path, "r", encoding="utf-8"))
+        except Exception as ex:
+            eprint("WARN: failed to read existing metrics.json:", ex)
+    return {}
+
+def compute_from_trades(trades_csv, initial_capital=INITIAL_CAPITAL):
+    if not os.path.isfile(trades_csv):
+        return {}
+
+    df = pd.read_csv(trades_csv)
+    if df.empty:
+        return {}
+
+    # pick PnL column
+    pnl_col = next((c for c in df.columns if "pnl" in c.lower() or "profit" in c.lower()), None)
+    if pnl_col is None:
+        eprint("WARN: PnL column not found in trades.csv")
+        return {}
+
+    # keep only closed/filled trades if a status column exists
+    if "status" in df.columns:
+        closed = df[df["status"].astype(str).str.lower().isin(
+            ["closed", "filled", "exit", "complete"]
+        )].copy()
+        if closed.empty:
+            closed = df.copy()
+    else:
+        closed = df.copy()
+
+    trades = int(len(closed))
+    wins = int((closed[pnl_col] > 0).sum())
+    losses = int((closed[pnl_col] < 0).sum())
+    win_rate = 100.0 * wins / trades if trades else 0.0
+
+    # equity curve (per trade cum PnL)
+    equity = initial_capital + closed[pnl_col].cumsum()
+    final_capital = float(equity.iloc[-1]) if trades else float(initial_capital)
+    roi_pct = 100.0 * (final_capital - initial_capital) / initial_capital
+
+    # drawdown
+    peak = equity.cummax()
+    dd = (equity - peak) / peak
+    max_dd_pct = 100.0 * float(dd.min()) if trades else 0.0
+    time_dd_bars = int((dd < 0).sum()) if trades else 0
+
+    # profit factor
+    gross_profit = float(closed.loc[closed[pnl_col] > 0, pnl_col].sum())
+    gross_loss = float(-closed.loc[closed[pnl_col] < 0, pnl_col].sum())
+    if gross_loss > 0:
+        profit_factor = gross_profit / gross_loss
+    else:
+        profit_factor = float("inf") if gross_profit > 0 else 0.0
+
+    # R:R
+    avg_win = float(closed.loc[closed[pnl_col] > 0, pnl_col].mean()) if wins else 0.0
+    avg_loss = float(-closed.loc[closed[pnl_col] < 0, pnl_col].mean()) if losses else 0.0
+    rr = (avg_win / avg_loss) if avg_loss > 0 else 0.0
+
+    # Sharpe (per-trade). You can annualize differently if needed.
+    rets = closed[pnl_col] / float(initial_capital)
+    sharpe_ratio = float((rets.mean() / rets.std()) * math.sqrt(len(rets))) if trades and rets.std() != 0 else 0.0
+
+    return {
+        "trades": trades,
+        "win_rate": round(win_rate, 2),
+        "roi_pct": round(roi_pct, 2),
+        "final_capital": round(final_capital, 2),
+        "max_dd_pct": round(max_dd_pct, 2),
+        "time_dd_bars": time_dd_bars,
+        "profit_factor": (round(profit_factor, 2) if np.isfinite(profit_factor) else "Inf"),
+        "rr": round(rr, 2),
+        "sharpe_ratio": round(sharpe_ratio, 2),
+    }
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dir", default="reports")
-    ap.add_argument("--note", default="No signals generated today.")
-    ap.add_argument("--title", default=None)
-    args = ap.parse_args()
+    if len(sys.argv) < 2:
+        print("usage: python tools/ensure_metrics.py <reports_dir>")
+        sys.exit(0)
 
-    rdir = pathlib.Path(args.dir)
-    rdir.mkdir(parents=True, exist_ok=True)
+    rep_dir = sys.argv[1]
+    os.makedirs(rep_dir, exist_ok=True)
 
-    metrics_p = rdir / "metrics.json"
-    latest_p  = rdir / "latest.json"
-    signals_p = rdir / "latest_signals.csv"
+    metrics_path = os.path.join(rep_dir, "metrics.json")
+    trades_csv = os.path.join(rep_dir, "trades.csv")
 
-    need_fallback = not any(map(is_nonempty, [metrics_p, latest_p, signals_p]))
+    # start from any existing metrics and augment with fresh calcs
+    out = load_existing(metrics_path)
+    fresh = compute_from_trades(trades_csv, INITIAL_CAPITAL)
+    out.update(fresh)
 
-    if not is_nonempty(signals_p):
-        write_empty_signals_csv(signals_p)
+    # sanity fields
+    if "trades" not in out:
+        out["trades"] = 0
+    if "win_rate" not in out:
+        out["win_rate"] = 0.0
+    if "roi_pct" not in out:
+        out["roi_pct"] = 0.0
+    if "final_capital" not in out:
+        out["final_capital"] = INITIAL_CAPITAL
 
-    report_title = args.title or os.getenv("REPORT_TITLE") or None
-
-    if not is_nonempty(metrics_p):
-        metrics = {
-            "ts": dt.datetime.utcnow().isoformat() + "Z",
-            "n_trades": 0,
-            "win_rate": 0.0,
-            "roi_pct": 0.0,
-            "profit_factor": 0.0,
-            "rr": 0.0,
-            "max_dd_pct": 0.0,
-            "time_dd_bars": 0,
-            "sharpe_ratio": 0.0,
-            "note": args.note,
-        }
-        if report_title:
-            metrics["report_title"] = report_title
-        write_json(metrics_p, metrics)
-
-    if not is_nonempty(latest_p):
-        latest = {
-            "timestamp": dt.datetime.utcnow().isoformat() + "Z",
-            "summary": args.note,
-            "config": {},
-        }
-        write_json(latest_p, latest)
-
-    print("✅ ensure_metrics: reports are present.",
-          f"(fallback created: {need_fallback})")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
+    print(f"✅ metrics.json written → {metrics_path}")
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
