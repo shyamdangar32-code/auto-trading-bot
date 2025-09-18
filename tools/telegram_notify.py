@@ -2,43 +2,103 @@
 # -*- coding: utf-8 -*-
 
 """
-Send Telegram summary + charts for backtest/intraday runs.
-
-Reads from a reports directory:
-- Prefers metrics.json (our backtest writer)
-- Falls back to summary.json / summary.txt
-- Attaches equity_curve.png and drawdown.png
-Fails loudly with clear logs if Telegram API returns an error.
+Patched: compute metrics from trades.csv when metrics.json is missing/incomplete,
+so Telegram never shows 0 trades / 0 ROI with a rising equity curve.
 """
 
 import os, sys, argparse, json, time, glob
 import requests
+import pandas as pd
+import numpy as np
 
-def eprint(*a):
-    print(*a, file=sys.stderr, flush=True)
+def eprint(*a): print(*a, file=sys.stderr)
 
-def read_textfile(path):
+def read_textfile(p):
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(p, "r", encoding="utf-8") as f:
             return f.read().strip()
     except Exception:
         return ""
 
-def discover_summary(rep_dir):
-    """
-    Try in this order:
-      1) metrics.json  (keys from our backtest.py)
-      2) summary.json  (older format)
-      3) summary.txt   (plain text)
-    """
-    # 1) metrics.json
-    mpath = os.path.join(rep_dir, "metrics.json")
-    if os.path.isfile(mpath):
+def _metrics_from_trades(trades_csv, initial_capital=100000.0):
+    try:
+        df = pd.read_csv(trades_csv)
+        if df.empty:
+            return {}
+        # Find PnL column
+        pnl_col = next((c for c in df.columns if "pnl" in c.lower() or "profit" in c.lower()), None)
+        if pnl_col is None:
+            return {}
+        # Closed trades only (if status exists)
+        if "status" in df.columns:
+            closed = df[df["status"].astype(str).str.lower().isin(["closed","filled","exit","complete"])].copy()
+            if closed.empty:
+                closed = df.copy()
+        else:
+            closed = df.copy()
+
+        trades = int(len(closed))
+        wins = int((closed[pnl_col] > 0).sum())
+        losses = int((closed[pnl_col] < 0).sum())
+        winrate = 100 * wins / trades if trades else 0.0
+
+        equity = initial_capital + closed[pnl_col].cumsum()
+        if trades:
+            final_capital = float(equity.iloc[-1])
+        else:
+            final_capital = float(initial_capital)
+        roi_pct = 100 * (final_capital - initial_capital) / initial_capital
+
+        peak = equity.cummax()
+        dd = (equity - peak) / peak
+        maxdd_pct = 100 * float(dd.min()) if trades else 0.0
+        time_dd_bars = int((dd < 0).sum()) if trades else 0
+
+        rets = closed[pnl_col] / float(initial_capital)
+        sharpe = float((rets.mean() / rets.std()) * np.sqrt(len(rets))) if trades and rets.std() != 0 else 0.0
+
+        total_profit = float(closed.loc[closed[pnl_col] > 0, pnl_col].sum())
+        total_loss = float(-closed.loc[closed[pnl_col] < 0, pnl_col].sum())
+        if total_loss > 0:
+            profit_factor = total_profit / total_loss
+        else:
+            profit_factor = float("inf") if total_profit > 0 else 0.0
+
+        avg_win = float(closed.loc[closed[pnl_col] > 0, pnl_col].mean()) if wins else 0.0
+        avg_loss = float(-closed.loc[closed[pnl_col] < 0, pnl_col].mean()) if losses else 0.0
+        rr = (avg_win / avg_loss) if avg_loss > 0 else 0.0
+
+        return {
+            "trades": trades,
+            "win_rate": round(winrate, 2),
+            "roi_pct": round(roi_pct, 2),
+            "profit_factor": round(profit_factor, 2) if np.isfinite(profit_factor) else "Inf",
+            "rr": round(rr, 2),
+            "max_dd_pct": round(maxdd_pct, 2),
+            "time_dd_bars": time_dd_bars,
+            "sharpe_ratio": round(sharpe, 2),
+            "final_capital": round(final_capital, 2),
+        }
+    except Exception as ex:
+        eprint("WARN: _metrics_from_trades failed:", ex)
+        return {}
+
+def build_summary(rep_dir: str) -> str:
+    # 0) Try metrics.json
+    metrics_path = os.path.join(rep_dir, "metrics.json")
+    if os.path.isfile(metrics_path):
         try:
-            m = json.load(open(mpath, "r", encoding="utf-8"))
+            m = json.load(open(metrics_path, "r", encoding="utf-8"))
+            # If trades missing/zero → try to augment from trades.csv
+            if int(m.get("trades", 0) or 0) == 0:
+                trades_csv = os.path.join(rep_dir, "trades.csv")
+                if os.path.isfile(trades_csv):
+                    m2 = _metrics_from_trades(trades_csv)
+                    if m2:
+                        m.update(m2)
             return (
-                f"📊 <b>Backtest Summary</b>\n"
-                f"• Trades: <b>{m.get('n_trades', 0)}</b>\n"
+                "📊 <b>Backtest Summary</b>\n"
+                f"• Trades: <b>{m.get('trades', 0)}</b>\n"
                 f"• Win-rate: <b>{m.get('win_rate', 0)}%</b>\n"
                 f"• ROI: <b>{m.get('roi_pct', 0)}%</b>\n"
                 f"• Profit Factor: <b>{m.get('profit_factor', 0)}</b>\n"
@@ -49,6 +109,23 @@ def discover_summary(rep_dir):
             )
         except Exception as ex:
             eprint("WARN: metrics.json parse failed:", ex)
+
+    # 1) Try trades.csv directly (strong fallback)
+    trades_csv = os.path.join(rep_dir, "trades.csv")
+    if os.path.isfile(trades_csv):
+        m = _metrics_from_trades(trades_csv)
+        if m:
+            return (
+                "📊 <b>Backtest Summary</b>\n"
+                f"• Trades: <b>{m.get('trades', 0)}</b>\n"
+                f"• Win-rate: <b>{m.get('win_rate', 0)}%</b>\n"
+                f"• ROI: <b>{m.get('roi_pct', 0)}%</b>\n"
+                f"• Profit Factor: <b>{m.get('profit_factor', 0)}</b>\n"
+                f"• R:R: <b>{m.get('rr', 0)}</b>\n"
+                f"• Max DD: <b>{m.get('max_dd_pct', 0)}%</b>\n"
+                f"• Time DD (bars): <b>{m.get('time_dd_bars', 0)}</b>\n"
+                f"• Sharpe: <b>{m.get('sharpe_ratio', 0)}</b>"
+            )
 
     # 2) summary.json (legacy)
     js_path = os.path.join(rep_dir, "summary.json")
@@ -71,13 +148,13 @@ def discover_summary(rep_dir):
                 f"• Profit Factor: <b>{round(float(pf),2)}</b>\n"
                 f"• R:R: <b>{round(float(rr),2)}</b>\n"
                 f"• Max DD: <b>{round(float(maxdd),2)}%</b>\n"
-                f"• Time DD (bars): <b>{tdd}</b>\n"
+                f"• Time DD (bars): <b>{int(tdd)}</b>\n"
                 f"• Sharpe: <b>{round(float(sharpe),2)}</b>"
             )
         except Exception as ex:
             eprint("WARN: summary.json parse failed:", ex)
 
-    # 3) summary.txt (legacy)
+    # 3) summary.txt
     txt_path = os.path.join(rep_dir, "summary.txt")
     if os.path.isfile(txt_path):
         txt = read_textfile(txt_path)
@@ -109,53 +186,40 @@ def send_message(token, chat_id, text):
 
 def send_photo(token, chat_id, path, caption=None):
     with open(path, "rb") as f:
-        return tg_send(
-            token,
-            "sendPhoto",
-            payload={"chat_id": chat_id, "caption": caption or ""},
-            files={"photo": (os.path.basename(path), f, "image/png")}
-        )
+        files = {"photo": (os.path.basename(path), f)}
+        payload = {"chat_id": chat_id}
+        if caption:
+            payload["caption"] = caption
+    return tg_send(token, "sendPhoto", payload=payload, files=files)
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dir", "--outdir", dest="rep_dir", default="./reports")
-    ap.add_argument("--title", default="")
+    ap.add_argument("--reports", required=True, help="path to reports dir")
+    ap.add_argument("--token", required=True)
+    ap.add_argument("--chat", required=True)
+    ap.add_argument("--title", default="Backtest")
+    ap.add_argument("--symbol", required=True)
+    ap.add_argument("--interval", required=True)
     args = ap.parse_args()
 
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-    if not token or not chat_id:
-        eprint("❌ Missing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in environment.")
-        sys.exit(1)
+    rep_dir = args.reports
+    title = f"{args.title} • {args.symbol} • {args.interval}"
 
-    rep_dir = os.path.abspath(args.rep_dir)
-    if not os.path.isdir(rep_dir):
-        eprint(f"❌ Reports directory not found: {rep_dir}")
-        sys.exit(1)
+    # 0) message
+    msg = build_summary(rep_dir)
+    msg = f"<b>{title}</b>\n\n{msg}"
 
-    headline = discover_summary(rep_dir)
-    title = args.title.strip()
-    if title:
-        headline = f"<b>{title}</b>\n" + headline
+    # 1) send message
+    send_message(args.token, args.chat, msg)
 
-    print("ℹ️ Using reports dir:", rep_dir)
-    print("ℹ️ Headline to send:\n", headline)
-
-    # 1) message
-    send_message(token, chat_id, headline)
-
-    # 2) optional charts
-    pics = []
-    for name in ["equity_curve.png", "drawdown.png"]:
-        p = os.path.join(rep_dir, name)
-        if os.path.isfile(p):
-            pics.append(p)
+    # 2) send images
+    pics = sorted(glob.glob(os.path.join(rep_dir, "*.png")))
     if not pics:
-        pics = sorted(glob.glob(os.path.join(rep_dir, "*.png")))
+        pics = sorted(glob.glob(os.path.join(rep_dir, "*.jpg")))
 
     for p in pics:
         try:
-            send_photo(token, chat_id, p, caption=os.path.basename(p))
+            send_photo(args.token, args.chat, p, caption=os.path.basename(p))
             time.sleep(0.4)
         except Exception as ex:
             eprint("WARN: sending photo failed for", p, ex)
