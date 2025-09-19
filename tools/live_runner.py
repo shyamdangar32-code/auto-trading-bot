@@ -3,15 +3,15 @@
 
 """
 Paper-Live runner (NO real orders).
-
-- Strategy UNCHANGED: we re-use tools.run_backtest on a rolling window.
-- Detect new closed trades → Telegram + append live CSV.
-- Detect Zerodha token expiry → Telegram warning + retry/backoff.
+- Re-uses tools.run_backtest on a rolling window.
+- Detects new closed trades → Telegram + append live CSV.
+- Detects Zerodha token expiry → Telegram warning + retry/backoff.
 - At market close (~15:30 IST) → send Daily Summary, write summary file, exit.
 """
 
 import os, sys, time, json, csv, argparse, shutil, subprocess, datetime as dt
 from pathlib import Path
+import requests
 
 # ---------------- Utilities ----------------
 
@@ -27,11 +27,10 @@ def market_open(now_ist: dt.datetime):
     return (dt.time(9,15) <= t <= dt.time(15,30))
 
 def after_close(now_ist: dt.datetime):
-    # small buffer to ensure last candle settled
     return now_ist.time() >= dt.time(15,31)
 
 def run_backtest_once(args, start_date: str, end_date: str, outdir: str):
-    """Invoke your existing backtest; return (Path, err_tag)"""
+    """Invoke backtest; return (Path, err_tag)"""
     if os.path.exists(outdir):
         shutil.rmtree(outdir, ignore_errors=True)
     os.makedirs(outdir, exist_ok=True)
@@ -45,8 +44,11 @@ def run_backtest_once(args, start_date: str, end_date: str, outdir: str):
         "--capital_rs", str(args.capital_rs),
         "--order_qty",  str(args.order_qty),
         "--outdir", outdir,
-        "--use_block", f"backtest_{args.profile}"
+        "--use_block", f"backtest_{args.profile}",
+        "--live_mode",
+        "--warmup_days", str(args.lookback_days),
     ]
+    eprint("▶ Running backtest:", " ".join(cmd))
     proc = subprocess.run(cmd, capture_output=True, text=True)
     err_tag = None
     if proc.returncode != 0:
@@ -54,7 +56,8 @@ def run_backtest_once(args, start_date: str, end_date: str, outdir: str):
         eprint("❌ backtest failed")
         eprint(out[:2000])
         low = out.lower()
-        if ("token" in low and "expire" in low) or ("tokene" in low) or ("tokenexception" in low) or ("401" in low) or ("unauthorized" in low) or ("forbidden" in low) or ("403" in low):
+        if ("token" in low and "expire" in low) or ("tokenexception" in low) or ("401" in low) \
+           or ("unauthorized" in low) or ("forbidden" in low) or ("403" in low):
             err_tag = "TOKEN"
         else:
             err_tag = "OTHER"
@@ -68,11 +71,11 @@ def read_trades_count(trades_csv: Path) -> int:
 
 def tg_send(token, chat, text):
     if not token or not chat: return
-    import requests
     try:
         requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            data={"chat_id": chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
+            data={"chat_id": chat, "text": text,
+                  "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=20
         )
     except Exception as ex:
@@ -91,7 +94,6 @@ def read_metrics(rep: Path):
     if p.exists():
         try: m = json.loads(p.read_text(encoding="utf-8"))
         except Exception as ex: eprint("WARN: metrics read:", ex)
-    # normalize keys
     return {
         "trades":        int(m.get("trades", m.get("n_trades", 0) or 0)),
         "win_rate":      float(m.get("win_rate", m.get("winrate", 0) or 0)),
@@ -143,6 +145,7 @@ def main():
     args = ap.parse_args()
 
     outdir = Path(args.outdir).resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
     logs_dir = outdir.parent.parent / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -158,25 +161,21 @@ def main():
             f"{tg_prefix}\nStarted at {ist_now():%Y-%m-%d %H:%M IST}\n"
             f"Polling every {args.poll_seconds}s, lookback {args.lookback_days}d")
 
-    backoff = args.poll_seconds
-
     while True:
         now = ist_now()
 
         # End-of-day summary & exit
         if after_close(now) and not state.get("summary_sent", False):
-            # try to read last metrics from current outdir
             metrics = read_metrics(outdir)
             msg = (f"{tg_prefix}\n"
                    f"📊 <b>Daily Summary</b>\n"
                    f"Trades {metrics['trades']}, Win% {metrics['win_rate']:.2f}, ROI% {metrics['roi_pct']:.2f}\n"
                    f"PF {metrics['profit_factor']}, R:R {metrics['rr']:.2f}, MaxDD {metrics['max_dd_pct']:.2f}%, Sharpe {metrics['sharpe_ratio']:.2f}")
             tg_send(args.telegram_token, args.telegram_chat, msg)
-            # write file
             write_summary_file(outdir.parent, metrics, args)
             state["summary_sent"] = True
             state_path.write_text(json.dumps(state), encoding="utf-8")
-            break  # exit loop so artifacts upload
+            break
 
         if not market_open(now):
             time.sleep(max(args.poll_seconds, 60))
@@ -189,25 +188,22 @@ def main():
         if err == "TOKEN":
             if not state.get("token_warned", False):
                 tg_send(args.telegram_token, args.telegram_chat,
-                        f"{tg_prefix}\n⚠️ Zerodha access token seems <b>expired</b> (or unauthorized).\n"
-                        f"Please refresh the token in GitHub Secrets.\nRetrying…")
+                        f"{tg_prefix}\n⚠️ Zerodha access token seems <b>expired</b>. Update token in GitHub Secrets and restart.\nRetrying…")
                 state["token_warned"] = True
                 state_path.write_text(json.dumps(state), encoding="utf-8")
-            time.sleep(min(300, max(backoff, 60)))  # backoff up to 5min
+            time.sleep(max(60, args.poll_seconds))
             continue
         elif err == "OTHER":
-            # soft retry (don’t spam)
             time.sleep(max(30, args.poll_seconds))
             continue
         else:
-            # success → clear token warning
             if state.get("token_warned", False):
                 tg_send(args.telegram_token, args.telegram_chat,
                         f"{tg_prefix}\n✅ Token OK again. Resumed.")
                 state["token_warned"] = False
                 state_path.write_text(json.dumps(state), encoding="utf-8")
 
-        trades_csv = rep / "trades.csv"
+        trades_csv = Path(outdir) / "trades.csv"
         new_count = read_trades_count(trades_csv)
         if new_count > state.get("last_trades_count", 0):
             delta = new_count - state.get("last_trades_count", 0)
