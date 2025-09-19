@@ -68,25 +68,32 @@ def compute_from_trades(trades_csv, initial_capital=INITIAL_CAPITAL):
 
     total_profit = float(closed.loc[closed[pnl_col] > 0, pnl_col].sum())
     total_loss = float(-closed.loc[closed[pnl_col] < 0, pnl_col].sum())
-    profit_factor = (total_profit / total_loss) if total_loss > 0 else (float("inf") if total_profit > 0 else 0.0)
+    profit_factor_val = (total_profit / total_loss) if total_loss > 0 else (float("inf") if total_profit > 0 else 0.0)
 
-    # R:R (robust)
+    # --- R:R (robust & aligned with ensure_metrics.py) ---
     wins_series  = closed.loc[closed[pnl_col] > 0, pnl_col]
     loss_series  = closed.loc[closed[pnl_col] < 0, pnl_col].abs()
     avg_win  = float(wins_series.mean())  if wins_series.size  > 0 else 0.0
     avg_loss = float(loss_series.mean())  if loss_series.size > 0 else 0.0
-    rr = (avg_win / avg_loss) if avg_loss > 0 else 0.0
+    if avg_loss > 0:
+        rr_val = avg_win / avg_loss
+    else:
+        rr_val = float("inf") if avg_win > 0 else 0.0  # <-- CHANGED: keep Inf when no losses but wins exist
 
     rets = closed[pnl_col] / float(initial_capital)
     sharpe_ratio = float((rets.mean() / (rets.std() or 1.0)) * np.sqrt(len(rets))) if trades else 0.0
+
+    # presentational rounding (keep Inf as "Inf")
+    profit_factor = ("Inf" if not np.isfinite(profit_factor_val) else round(profit_factor_val, 2))
+    rr = ("Inf" if not np.isfinite(rr_val) else round(rr_val, 2))
 
     return {
         "trades": trades,
         "win_rate": round(win_rate, 2),
         "roi_pct": round(roi_pct, 2),
         "final_capital": round(final_capital, 2),
-        "profit_factor": (round(profit_factor, 2) if np.isfinite(profit_factor) else "Inf"),
-        "rr": round(rr, 2),
+        "profit_factor": profit_factor,
+        "rr": rr,
         "max_dd_pct": round(max_dd_pct, 2),
         "time_dd_bars": time_dd_bars,
         "sharpe_ratio": round(sharpe_ratio, 2),
@@ -99,7 +106,7 @@ def normalize_keys(m):
         "win_rate":      float(m.get("win_rate", m.get("winrate", 0) or 0)),
         "roi_pct":       float(m.get("roi_pct", m.get("ROI", 0) or 0)),
         "profit_factor": m.get("profit_factor", 0),
-        "rr":            float(m.get("rr", m.get("R_R", 0) or 0)),
+        "rr":            (m.get("rr", m.get("R_R", 0) or 0)),  # may be "Inf" string
         "max_dd_pct":    float(m.get("max_dd_pct", m.get("max_dd_perc", 0) or 0)),
         "time_dd_bars":  int(m.get("time_dd_bars", m.get("time_dd", 0) or 0)),
         "sharpe_ratio":  float(m.get("sharpe_ratio", m.get("sharpe", 0) or 0)),
@@ -107,13 +114,20 @@ def normalize_keys(m):
     }
 
 def format_report(m):
+    # tolerate "Inf" string for PF/RR
+    pf = m['profit_factor']
+    rr = m['rr']
+    if isinstance(pf, (int, float)) and not np.isfinite(pf): pf = "Inf"
+    if isinstance(rr, (int, float)) and not np.isfinite(rr): rr = "Inf"
+    try_rr = f"{rr:.2f}" if isinstance(rr, (int,float)) else str(rr)
+    try_pf = f"{pf:.2f}" if isinstance(pf, (int,float)) else str(pf)
     return (
         "# Backtest Summary\n\n"
         f"- **Trades**: {m['trades']}\n"
         f"- **Win-rate**: {m['win_rate']:.2f}%\n"
         f"- **ROI**: {m['roi_pct']:.2f}%\n"
-        f"- **Profit Factor**: {m['profit_factor']}\n"
-        f"- **R:R**: {m['rr']:.2f}\n"
+        f"- **Profit Factor**: {try_pf}\n"
+        f"- **R:R**: {try_rr}\n"
         f"- **Max DD**: {m['max_dd_pct']:.2f}%\n"
         f"- **Time DD (bars)**: {m['time_dd_bars']}\n"
         f"- **Sharpe**: {m['sharpe_ratio']:.2f}\n\n"
@@ -148,12 +162,20 @@ def main():
     nm = normalize_keys(m)
 
     # 2) if critical fields missing/zero -> augment from trades.csv
+    def _is_zero_or_missing(x):
+        # treat "Inf" as non-zero
+        if isinstance(x, str) and x.strip().lower() == "inf": return False
+        try:
+            return float(x) == 0.0
+        except Exception:
+            return True
+
     need_aug = (
         nm["trades"] == 0
-        or nm["rr"] == 0
-        or nm["roi_pct"] == 0
-        or nm["max_dd_pct"] == 0
-        or nm["sharpe_ratio"] == 0
+        or _is_zero_or_missing(nm["rr"])
+        or _is_zero_or_missing(nm["roi_pct"])
+        or _is_zero_or_missing(nm["max_dd_pct"])
+        or _is_zero_or_missing(nm["sharpe_ratio"])
     )
     if need_aug:
         aug = compute_from_trades(trades_csv)
